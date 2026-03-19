@@ -3,6 +3,7 @@
 import json
 import logging
 import os
+import threading
 
 from fastmcp import FastMCP
 
@@ -22,31 +23,50 @@ mcp = FastMCP(
 
 _local: LocalClient | None = None
 _web: WebClient | None = None
+_init_lock = threading.Lock()
 
 
 def _get_local() -> LocalClient:
-    """Lazy-initialize the local client."""
+    """Lazy-initialize the local client (thread-safe)."""
     global _local
     if _local is None:
-        _local = LocalClient()
+        with _init_lock:
+            if _local is None:
+                _local = LocalClient()
     return _local
 
 
 def _get_web() -> WebClient:
-    """Lazy-initialize the web client."""
+    """Lazy-initialize the web client (thread-safe)."""
     global _web
     if _web is not None:
         return _web
 
-    api_key = os.environ.get("ZOTERO_API_KEY", "")
-    user_id = os.environ.get("ZOTERO_USER_ID", "")
-    if not api_key or not user_id:
-        raise RuntimeError(
-            "ZOTERO_API_KEY and ZOTERO_USER_ID are required for write operations. "
-            "Get your API key at https://www.zotero.org/settings/keys"
-        )
-    _web = WebClient(api_key=api_key, user_id=user_id, local_client=_get_local())
-    return _web
+    with _init_lock:
+        if _web is not None:
+            return _web
+        api_key = os.environ.get("ZOTERO_API_KEY", "")
+        user_id = os.environ.get("ZOTERO_USER_ID", "")
+        if not api_key or not user_id:
+            raise RuntimeError(
+                "ZOTERO_API_KEY and ZOTERO_USER_ID are required for write operations. "
+                "Get your API key at https://www.zotero.org/settings/keys"
+            )
+        _web = WebClient(api_key=api_key, user_id=user_id, local_client=_get_local())
+        return _web
+
+
+def _parse_list_param(value: str | list | None) -> list | None:
+    """Parse a parameter that may be a JSON string, list, or None."""
+    if value is None:
+        return None
+    if isinstance(value, list):
+        return value
+    try:
+        parsed = json.loads(value)
+        return parsed if isinstance(parsed, list) else [value]
+    except (json.JSONDecodeError, TypeError):
+        return [value]  # Treat bare string as single-item list
 
 
 # -- Read tools (local API) --
@@ -97,11 +117,8 @@ def create_item_from_identifier(
     tags: str | list[str] | None = None,
 ) -> str:
     """Look up identifier, create item in Zotero. Returns {key, title}."""
-    # Handle JSON strings from MCP clients that serialize lists as strings
-    if isinstance(collection_keys, str):
-        collection_keys = json.loads(collection_keys)
-    if isinstance(tags, str):
-        tags = json.loads(tags)
+    collection_keys = _parse_list_param(collection_keys)
+    tags = _parse_list_param(tags)
     result = _get_web().create_item_from_identifier(identifier, collection_keys, tags)
     return json.dumps(result, ensure_ascii=False)
 
@@ -155,8 +172,7 @@ def create_item_manual(
     tags: str | list[str] | None = None,
 ) -> str:
     """Create a Zotero item with manual metadata."""
-    if isinstance(creators, str):
-        creators = json.loads(creators)
+    creators = _parse_list_param(creators)
     if isinstance(collection_keys, str):
         collection_keys = json.loads(collection_keys)
     if isinstance(tags, str):
@@ -181,6 +197,35 @@ def create_item_manual(
     return json.dumps(result, ensure_ascii=False)
 
 
+@mcp.tool(
+    description=(
+        "Add tags and/or a collection to multiple Zotero items at once. "
+        "Before calling this, use get_item on each item to read the abstract "
+        "and title, then suggest appropriate tags based on the content. "
+        "Ask the user to approve the suggested tags before applying."
+    )
+)
+def batch_organize(
+    item_keys: str | list[str],
+    tags: str | list[str] | None = None,
+    collection_key: str | None = None,
+) -> str:
+    """Bulk-add tags and/or collection to multiple items."""
+    item_keys = _parse_list_param(item_keys) or []
+    tags = _parse_list_param(tags)
+    result = _get_web().batch_organize(item_keys, tags, collection_key)
+    return json.dumps(result, ensure_ascii=False)
+
+
+@mcp.tool(
+    description="Create a new collection (folder) in Zotero. Optionally nest it under a parent collection."
+)
+def create_collection(name: str, parent_key: str | None = None) -> str:
+    """Create a collection. Returns the new collection key."""
+    result = _get_web().create_collection(name, parent_key)
+    return json.dumps(result, ensure_ascii=False)
+
+
 @mcp.tool(description="Add a Zotero item to a collection")
 def add_to_collection(item_key: str, collection_key: str) -> str:
     """Add an existing item to a collection."""
@@ -192,6 +237,33 @@ def add_to_collection(item_key: str, collection_key: str) -> str:
 def update_item(item_key: str, fields: dict) -> str:
     """Update item fields. Uses optimistic locking with version check."""
     result = _get_web().update_item(item_key, fields)
+    return json.dumps(result, ensure_ascii=False)
+
+
+@mcp.tool(
+    description=(
+        "Attach a PDF to a Zotero item. Automatically finds free PDFs via "
+        "Unpaywall, PubMed Central, or bioRxiv/medRxiv using the item's DOI. "
+        "If no free PDF is found, returns a message asking the user to provide "
+        "the file path. Use pdf_path to attach a user-provided local PDF."
+    )
+)
+def attach_pdf(
+    parent_key: str,
+    pdf_path: str | None = None,
+    doi: str | None = None,
+) -> str:
+    """Attach a PDF to a Zotero item.
+
+    Args:
+        parent_key: Zotero item key to attach the PDF to.
+        pdf_path: Local file path to a PDF. If None, tries auto-download.
+        doi: DOI to search for free PDF. If None, reads from the item.
+
+    Returns:
+        JSON with status, attachment_key, filename, source.
+    """
+    result = _get_web().attach_pdf(parent_key, pdf_path, doi)
     return json.dumps(result, ensure_ascii=False)
 
 

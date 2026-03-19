@@ -2,7 +2,7 @@
 
 MCP server for [Zotero](https://www.zotero.org/) that lets AI assistants search your library, add papers, and write Word documents with live Zotero citations.
 
-**Hybrid architecture:** reads from Zotero's local API (fast, no auth needed) and writes via the Zotero Web API (proper sync). Metadata resolution uses Zotero's translation server with PubMed fallback.
+**Hybrid architecture:** reads from Zotero's local API (fast, no auth needed) and writes via the Zotero Web API (proper sync). Metadata resolution uses Zotero's translation server with PubMed and CrossRef fallbacks for abstracts, correct item types, and broad DOI coverage.
 
 ## Features
 
@@ -15,6 +15,7 @@ MCP server for [Zotero](https://www.zotero.org/) that lets AI assistants search 
 | `create_item_from_identifier` | Add a paper by DOI, PMID, or PubMed URL             |
 | `create_item_from_url`        | Add an item from any URL (FDA, preprints, datasets) |
 | `create_item_manual`          | Create an item with manually provided metadata      |
+| `create_collection`           | Create a new collection (folder), optionally nested |
 | `add_to_collection`           | Add an item to a collection                         |
 | `update_item`                 | Update metadata fields on an item                   |
 | `write_cited_document`        | Write a Word doc with live Zotero citations         |
@@ -22,7 +23,7 @@ MCP server for [Zotero](https://www.zotero.org/) that lets AI assistants search 
 Key behaviors:
 
 - Duplicate detection before creating items (checks DOI against local library)
-- PubMed fallback when Zotero's translation server is unavailable
+- PubMed efetch + CrossRef fallbacks when translation server is unavailable (abstracts, preprint/book/conference types)
 - Live Zotero field codes in Word documents (recognized by Zotero Word plugin)
 - Connection pooling and parallel fetching for performance
 - Optimistic locking on updates (version conflict detection)
@@ -142,13 +143,13 @@ With a PubMed MCP server configured alongside this one:
 │             │                │ api.zotero.org   │
 │             │   resolves     ├──────────────────┤
 │             │ ──────────────>│ Translation Srv  │
-│             │                │ + PubMed fallback│
+│             │                │ + PubMed/CrossRef│
 └─────────────┘                └──────────────────┘
 ```
 
 - **Reads** go to the local API (fast, no auth, works offline)
 - **Writes** go to the Web API (triggers proper sync to all your devices)
-- **Identifier resolution** tries the Zotero translation server first, falls back to PubMed E-utilities
+- **Identifier resolution** tries the Zotero translation server first, then PubMed efetch (with abstracts), then CrossRef (books, CS, arXiv)
 
 ## Development
 

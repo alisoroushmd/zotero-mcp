@@ -37,7 +37,7 @@ class LocalClient:
             params={
                 "q": query,
                 "limit": limit,
-                "itemType": "-attachment || note",
+                "itemType": "-attachment || -note",
             },
         )
         return [_format_summary(item) for item in resp.json()]
@@ -81,7 +81,7 @@ class LocalClient:
             f"/users/0/collections/{collection_key}/items",
             params={
                 "limit": limit,
-                "itemType": "-attachment || note",
+                "itemType": "-attachment || -note",
             },
         )
         return [_format_summary(item) for item in resp.json()]
