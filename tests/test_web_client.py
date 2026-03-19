@@ -238,7 +238,10 @@ def test_add_to_collection():
         return_value=httpx.Response(204)
     )
 
-    client = WebClient(api_key="test-key", user_id="12345")
+    from zotero_mcp.local_client import LocalClient
+
+    local = LocalClient()
+    client = WebClient(api_key="test-key", user_id="12345", local_client=local)
     result = client.add_to_collection("ITEM1", "COL2")
     assert "COL1" in result["collections"]
     assert "COL2" in result["collections"]
@@ -265,7 +268,10 @@ def test_update_item():
         return_value=httpx.Response(204)
     )
 
-    client = WebClient(api_key="test-key", user_id="12345")
+    from zotero_mcp.local_client import LocalClient
+
+    local = LocalClient()
+    client = WebClient(api_key="test-key", user_id="12345", local_client=local)
     result = client.update_item("ITEM1", {"title": "New Title"})
     assert result["key"] == "ITEM1"
 
@@ -290,7 +296,10 @@ def test_update_item_version_conflict():
         return_value=httpx.Response(412)
     )
 
-    client = WebClient(api_key="test-key", user_id="12345")
+    from zotero_mcp.local_client import LocalClient
+
+    local = LocalClient()
+    client = WebClient(api_key="test-key", user_id="12345", local_client=local)
     with pytest.raises(RuntimeError, match="Version conflict.*ITEM1.*retry"):
         client.update_item("ITEM1", {"title": "New"})
 

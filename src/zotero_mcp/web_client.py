@@ -42,28 +42,22 @@ class WebClient:
             timeout=TIMEOUT,
         )
         self._translate_client = httpx.Client(timeout=TIMEOUT)
-
-    def _headers(self) -> dict[str, str]:
-        return {
-            "Zotero-API-Key": self._api_key,
-            "Content-Type": "application/json",
-        }
+        self._pubmed_client = httpx.Client(
+            base_url="https://eutils.ncbi.nlm.nih.gov/entrez/eutils",
+            timeout=TIMEOUT,
+        )
 
     def _read_item_local(self, item_key: str) -> dict:
         """Read item from local API for read-modify-write operations."""
-        if self._local:
-            return self._local.get_item(item_key)
-        try:
-            resp = httpx.get(
-                f"http://localhost:23119/api/users/0/items/{item_key}",
-                timeout=2.0,
-            )
-            resp.raise_for_status()
-            return resp.json()
-        except httpx.ConnectError:
+        if not self._local:
             raise RuntimeError(
-                "Zotero desktop must be running to read item data before updating."
+                "LocalClient is required for read-modify-write operations. "
+                "Zotero desktop must be running."
             )
+        result = self._local.get_item(item_key)
+        if isinstance(result, str):
+            raise RuntimeError(f"Expected dict for item {item_key}, got BibTeX string")
+        return result
 
     def _check_duplicate_doi(self, doi: str) -> dict | None:
         """Check if a DOI already exists in the library. Returns item summary or None."""
@@ -147,34 +141,6 @@ class WebClient:
 
         raise RuntimeError(f"Failed to create item: {result.get('failed', result)}")
 
-    def _verify_item_web(self, item_key: str) -> dict:
-        """Read back a newly created item from the Web API to confirm it exists."""
-        try:
-            resp = httpx.get(
-                f"{self._base}/items/{item_key}",
-                headers=self._headers(),
-                timeout=TIMEOUT,
-            )
-            resp.raise_for_status()
-            data = resp.json().get("data", {})
-            creators = data.get("creators", [])
-            author_parts = []
-            for c in creators[:3]:
-                name = f"{c.get('firstName', '')} {c.get('lastName', '')}".strip()
-                if name:
-                    author_parts.append(name)
-            author_str = "; ".join(author_parts)
-            if len(creators) > 3:
-                author_str += " et al."
-            return {
-                "title": data.get("title", ""),
-                "creators": author_str,
-                "DOI": data.get("DOI", ""),
-                "date": data.get("date", ""),
-            }
-        except Exception:
-            return {}
-
     def _resolve_identifier(self, identifier: str) -> dict:
         """Resolve PMID/DOI/URL to Zotero item metadata.
 
@@ -232,10 +198,9 @@ class WebClient:
                 "http://doi.org/", ""
             )
             try:
-                search_resp = httpx.get(
-                    "https://eutils.ncbi.nlm.nih.gov/entrez/eutils/esearch.fcgi",
+                search_resp = self._pubmed_client.get(
+                    "/esearch.fcgi",
                     params={"db": "pubmed", "term": f"{doi}[doi]", "retmode": "json"},
-                    timeout=TIMEOUT,
                 )
                 search_resp.raise_for_status()
                 ids = search_resp.json().get("esearchresult", {}).get("idlist", [])
@@ -249,10 +214,9 @@ class WebClient:
 
         # Fetch full metadata from PubMed
         try:
-            resp = httpx.get(
-                "https://eutils.ncbi.nlm.nih.gov/entrez/eutils/esummary.fcgi",
+            resp = self._pubmed_client.get(
+                "/esummary.fcgi",
                 params={"db": "pubmed", "id": pmid, "retmode": "json"},
-                timeout=TIMEOUT,
             )
             resp.raise_for_status()
             data = resp.json().get("result", {}).get(pmid, {})
@@ -492,10 +456,8 @@ class WebClient:
             Dict with item_key and updated collections list.
         """
         item = self._read_item_local(item_key)
-        version = item.get("version", item.get("data", {}).get("version", 0))
-        collections = list(
-            set(item.get("data", {}).get("collections", []) + [collection_key])
-        )
+        version = item.get("version", 0)
+        collections = list(set(item.get("collections", []) + [collection_key]))
 
         resp = self._web_client.patch(
             f"/items/{item_key}",
@@ -522,7 +484,7 @@ class WebClient:
             RuntimeError: On 412 version conflict.
         """
         item = self._read_item_local(item_key)
-        version = item.get("version", item.get("data", {}).get("version", 0))
+        version = item.get("version", 0)
 
         resp = self._web_client.patch(
             f"/items/{item_key}",

@@ -121,9 +121,9 @@ def _parse_date(date_str: str) -> dict:
     """
     if not date_str:
         return {"date-parts": [[]]}
-    parts_str = re.split(r"[-/]", date_str)
-    parts = [int(p) for p in parts_str if p]
-    return {"date-parts": [parts]}
+    parts_str = re.split(r"[-/\s]", date_str)
+    parts = [int(p) for p in parts_str if p.isdigit()]
+    return {"date-parts": [parts]} if parts else {"date-parts": [[]]}
 
 
 def zotero_to_csl_json(item_data: dict, user_id: str) -> dict:
