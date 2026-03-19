@@ -106,6 +106,81 @@ def create_item_from_identifier(
     return json.dumps(result, ensure_ascii=False)
 
 
+@mcp.tool(
+    description=(
+        "Create a Zotero item from a URL (web page, FDA document, preprint, "
+        "dataset documentation, etc.). Scrapes metadata when possible, "
+        "falls back to a basic webpage item with the URL."
+    )
+)
+def create_item_from_url(
+    url: str,
+    title: str | None = None,
+    collection_keys: str | list[str] | None = None,
+    tags: str | list[str] | None = None,
+) -> str:
+    """Create a Zotero item from any URL."""
+    if isinstance(collection_keys, str):
+        collection_keys = json.loads(collection_keys)
+    if isinstance(tags, str):
+        tags = json.loads(tags)
+    result = _get_web().create_item_from_url(url, title, collection_keys, tags)
+    return json.dumps(result, ensure_ascii=False)
+
+
+@mcp.tool(
+    description=(
+        "Create a Zotero item with manually provided metadata. "
+        "Use when no DOI/PMID/URL can resolve the item. Claude populates "
+        "fields from context (web search results, user input, etc.). "
+        "Supports all Zotero item types: journalArticle, report, webpage, "
+        "document, statute, hearing, book, bookSection, etc."
+    )
+)
+def create_item_manual(
+    item_type: str,
+    title: str,
+    creators: str | list[dict] | None = None,
+    date: str = "",
+    url: str = "",
+    doi: str = "",
+    publication_title: str = "",
+    volume: str = "",
+    issue: str = "",
+    pages: str = "",
+    publisher: str = "",
+    abstract: str = "",
+    extra: str = "",
+    collection_keys: str | list[str] | None = None,
+    tags: str | list[str] | None = None,
+) -> str:
+    """Create a Zotero item with manual metadata."""
+    if isinstance(creators, str):
+        creators = json.loads(creators)
+    if isinstance(collection_keys, str):
+        collection_keys = json.loads(collection_keys)
+    if isinstance(tags, str):
+        tags = json.loads(tags)
+    result = _get_web().create_item_manual(
+        item_type=item_type,
+        title=title,
+        creators=creators,
+        date=date,
+        url=url,
+        doi=doi,
+        publication_title=publication_title,
+        volume=volume,
+        issue=issue,
+        pages=pages,
+        publisher=publisher,
+        abstract=abstract,
+        extra=extra,
+        collection_keys=collection_keys,
+        tags=tags,
+    )
+    return json.dumps(result, ensure_ascii=False)
+
+
 @mcp.tool(description="Add a Zotero item to a collection")
 def add_to_collection(item_key: str, collection_key: str) -> str:
     """Add an existing item to a collection."""

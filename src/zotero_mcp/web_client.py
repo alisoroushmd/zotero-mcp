@@ -14,6 +14,7 @@ logger = logging.getLogger(__name__)
 
 WEB_BASE = "https://api.zotero.org"
 TRANSLATE_URL = "https://translate.zotero.org/search"
+TRANSLATE_WEB_URL = "https://translate.zotero.org/web"
 TIMEOUT = 10.0
 
 
@@ -302,6 +303,181 @@ class WebClient:
             }
         except Exception:
             return None
+
+    def create_item_from_url(
+        self,
+        url: str,
+        title: str | None = None,
+        collection_keys: list[str] | None = None,
+        tags: list[str] | None = None,
+    ) -> dict:
+        """Create a Zotero item from a URL.
+
+        Tries Zotero's translation server /web endpoint to scrape metadata.
+        Falls back to creating a basic webpage item with the URL and title.
+
+        Args:
+            url: Web URL (FDA page, preprint, dataset documentation, etc.).
+            title: Optional title override. Used in fallback if scraping fails.
+            collection_keys: Optional collection keys to assign.
+            tags: Optional tag strings to add.
+
+        Returns:
+            Dict with "key" and "title".
+        """
+        from datetime import date
+
+        metadata = None
+
+        # Try translation server /web endpoint (scrapes the page)
+        try:
+            resp = self._translate_client.post(
+                TRANSLATE_WEB_URL,
+                content=url,
+                headers={"Content-Type": "text/plain"},
+            )
+            resp.raise_for_status()
+            items = resp.json()
+            if items and len(items) > 0:
+                metadata = items[0]
+        except Exception:
+            pass
+
+        # Fallback: create a basic webpage item
+        if not metadata:
+            metadata = {
+                "itemType": "webpage",
+                "title": title or url,
+                "url": url,
+                "accessDate": date.today().isoformat(),
+                "websiteTitle": "",
+            }
+
+        # Override title if provided
+        if title:
+            metadata["title"] = title
+
+        # Apply collections and tags
+        if collection_keys:
+            metadata["collections"] = collection_keys
+        if tags:
+            existing_tags = metadata.get("tags", [])
+            for t in tags:
+                existing_tags.append({"tag": t})
+            metadata["tags"] = existing_tags
+
+        # Create via Web API
+        resp = self._web_client.post("/items", json=[metadata])
+        resp.raise_for_status()
+
+        result = resp.json()
+        successful = result.get("successful", result.get("success", {}))
+        if successful:
+            val = list(successful.values())[0]
+            if isinstance(val, dict):
+                key = val.get("key", val.get("data", {}).get("key", ""))
+            else:
+                key = str(val)
+            return {
+                "key": key,
+                "title": metadata.get("title", ""),
+                "item_type": metadata.get("itemType", "webpage"),
+                "note": "Item created on Zotero web. Sync Zotero desktop to see it locally.",
+            }
+
+        raise RuntimeError(f"Failed to create item: {result.get('failed', result)}")
+
+    def create_item_manual(
+        self,
+        item_type: str,
+        title: str,
+        creators: list[dict] | None = None,
+        date: str = "",
+        url: str = "",
+        doi: str = "",
+        publication_title: str = "",
+        volume: str = "",
+        issue: str = "",
+        pages: str = "",
+        publisher: str = "",
+        abstract: str = "",
+        extra: str = "",
+        collection_keys: list[str] | None = None,
+        tags: list[str] | None = None,
+    ) -> dict:
+        """Create a Zotero item with manually provided metadata.
+
+        Use when no identifier or URL can resolve the item automatically.
+        Claude can populate fields from context (web search, chat, etc.).
+
+        Args:
+            item_type: Zotero item type (journalArticle, report, webpage,
+                       document, statute, hearing, etc.).
+            title: Item title.
+            creators: List of {"creatorType": "author", "firstName": "J", "lastName": "Doe"}.
+            date: Publication date (e.g. "2024", "2024-03-15", "March 2024").
+            url: URL if applicable.
+            doi: DOI if known.
+            publication_title: Journal name, report series, etc.
+            volume: Volume number.
+            issue: Issue number.
+            pages: Page range.
+            publisher: Publisher or issuing organization.
+            abstract: Abstract or summary.
+            extra: Extra field (for PMID, document numbers, etc.).
+            collection_keys: Optional collection keys to assign.
+            tags: Optional tag strings to add.
+
+        Returns:
+            Dict with "key" and "title".
+        """
+        metadata: dict = {
+            "itemType": item_type,
+            "title": title,
+            "creators": creators or [],
+            "date": date,
+        }
+
+        # Add optional fields only if provided
+        field_mapping = {
+            "url": url,
+            "DOI": doi,
+            "publicationTitle": publication_title,
+            "volume": volume,
+            "issue": issue,
+            "pages": pages,
+            "publisher": publisher,
+            "abstractNote": abstract,
+            "extra": extra,
+        }
+        for zotero_field, value in field_mapping.items():
+            if value:
+                metadata[zotero_field] = value
+
+        if collection_keys:
+            metadata["collections"] = collection_keys
+        if tags:
+            metadata["tags"] = [{"tag": t} for t in tags]
+
+        resp = self._web_client.post("/items", json=[metadata])
+        resp.raise_for_status()
+
+        result = resp.json()
+        successful = result.get("successful", result.get("success", {}))
+        if successful:
+            val = list(successful.values())[0]
+            if isinstance(val, dict):
+                key = val.get("key", val.get("data", {}).get("key", ""))
+            else:
+                key = str(val)
+            return {
+                "key": key,
+                "title": title,
+                "item_type": item_type,
+                "note": "Item created on Zotero web. Sync Zotero desktop to see it locally.",
+            }
+
+        raise RuntimeError(f"Failed to create item: {result.get('failed', result)}")
 
     def add_to_collection(self, item_key: str, collection_key: str) -> dict:
         """Add an existing item to a collection.
