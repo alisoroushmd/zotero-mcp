@@ -15,15 +15,12 @@ class LocalClient:
 
     def __init__(self, base_url: str = LOCAL_BASE) -> None:
         self._base = base_url
+        self._client = httpx.Client(base_url=base_url, timeout=TIMEOUT)
 
     def _get(self, path: str, params: dict | None = None) -> httpx.Response:
         """GET request to local API with connection error handling."""
         try:
-            resp = httpx.get(
-                f"{self._base}{path}",
-                params=params,
-                timeout=TIMEOUT,
-            )
+            resp = self._client.get(path, params=params)
             resp.raise_for_status()
             return resp
         except httpx.ConnectError:

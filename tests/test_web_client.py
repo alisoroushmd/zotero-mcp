@@ -96,13 +96,53 @@ def test_create_item_from_identifier_with_collections_and_tags():
 
 
 @respx.mock
-def test_create_item_translation_server_down():
-    """Raises clear error when translation server is unavailable."""
+def test_create_item_translation_server_down_falls_back():
+    """Falls back to PubMed when translation server is unavailable."""
     respx.post(TRANSLATE_URL).mock(side_effect=httpx.ConnectError("Connection refused"))
+    # Mock PubMed DOI search
+    respx.get("https://eutils.ncbi.nlm.nih.gov/entrez/eutils/esearch.fcgi").mock(
+        return_value=httpx.Response(
+            200, json={"esearchresult": {"idlist": ["12345678"]}}
+        )
+    )
+    # Mock PubMed summary
+    respx.get("https://eutils.ncbi.nlm.nih.gov/entrez/eutils/esummary.fcgi").mock(
+        return_value=httpx.Response(
+            200,
+            json={
+                "result": {
+                    "12345678": {
+                        "title": "Fallback Paper",
+                        "authors": [{"name": "Smith J"}],
+                        "pubdate": "2024",
+                        "fulljournalname": "Test Journal",
+                        "volume": "1",
+                        "issue": "2",
+                        "pages": "10-20",
+                        "issn": "",
+                        "articleids": [{"idtype": "doi", "value": "10.1234/test"}],
+                    }
+                }
+            },
+        )
+    )
+    # Mock Web API create
+    respx.post(f"{WEB_BASE}/users/12345/items").mock(
+        return_value=httpx.Response(
+            200,
+            json={
+                "successful": {"0": {"key": "FB123", "data": {"key": "FB123"}}},
+                "success": {"0": "FB123"},
+                "unchanged": {},
+                "failed": {},
+            },
+        )
+    )
 
     client = WebClient(api_key="test-key", user_id="12345")
-    with pytest.raises(RuntimeError, match="Translation server unavailable"):
-        client.create_item_from_identifier("10.1234/test")
+    result = client.create_item_from_identifier("10.1234/test")
+    assert result["key"] == "FB123"
+    assert result["title"] == "Fallback Paper"
 
 
 @respx.mock
