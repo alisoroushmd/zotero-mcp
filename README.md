@@ -6,20 +6,21 @@ MCP server for [Zotero](https://www.zotero.org/) that lets AI assistants search 
 
 ## Features
 
-| Tool | Description |
-|------|-------------|
-| `search_items` | Search your library by keyword |
-| `get_item` | Get full metadata or BibTeX for an item |
-| `get_collections` | List all collections |
-| `get_collection_items` | List items in a collection |
-| `create_item_from_identifier` | Add a paper by DOI, PMID, or PubMed URL |
-| `create_item_from_url` | Add an item from any URL (FDA, preprints, datasets) |
-| `create_item_manual` | Create an item with manually provided metadata |
-| `add_to_collection` | Add an item to a collection |
-| `update_item` | Update metadata fields on an item |
-| `write_cited_document` | Write a Word doc with live Zotero citations |
+| Tool                            | Description                                         |
+| ------------------------------- | --------------------------------------------------- |
+| `search_items`                | Search your library by keyword                      |
+| `get_item`                    | Get full metadata or BibTeX for an item             |
+| `get_collections`             | List all collections                                |
+| `get_collection_items`        | List items in a collection                          |
+| `create_item_from_identifier` | Add a paper by DOI, PMID, or PubMed URL             |
+| `create_item_from_url`        | Add an item from any URL (FDA, preprints, datasets) |
+| `create_item_manual`          | Create an item with manually provided metadata      |
+| `add_to_collection`           | Add an item to a collection                         |
+| `update_item`                 | Update metadata fields on an item                   |
+| `write_cited_document`        | Write a Word doc with live Zotero citations         |
 
 Key behaviors:
+
 - Duplicate detection before creating items (checks DOI against local library)
 - PubMed fallback when Zotero's translation server is unavailable
 - Live Zotero field codes in Word documents (recognized by Zotero Word plugin)
@@ -135,7 +136,7 @@ With a PubMed MCP server configured alongside this one:
 ```
 ┌─────────────┐     reads      ┌──────────────────┐
 │  AI Client  │ ──────────────>│ Zotero Desktop   │
-│  (Claude)   │                │ localhost:23119   │
+│  (Claude)   │                │ localhost:23119  │
 │             │     writes     ├──────────────────┤
 │             │ ──────────────>│ Zotero Web API   │
 │             │                │ api.zotero.org   │
