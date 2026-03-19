@@ -6,6 +6,7 @@ field codes that the Zotero Word plugin recognizes as live citations.
 
 from __future__ import annotations
 
+import hashlib
 import json
 import re
 import uuid
@@ -143,7 +144,7 @@ def zotero_to_csl_json(item_data: dict, user_id: str) -> dict:
 
     csl: dict = {
         "type": _ITEM_TYPE_MAP.get(item_type, "article"),
-        "id": abs(hash(item_key)) % (10**9),
+        "id": int(hashlib.md5(item_key.encode()).hexdigest()[:8], 16),
         "_uris": [f"http://zotero.org/users/{user_id}/items/{item_key}"],
     }
 
