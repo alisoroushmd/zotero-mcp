@@ -45,6 +45,50 @@ class LocalClient:
         )
         return [_format_summary(item) for item in resp.json()]
 
+    def get_item(self, item_key: str, fmt: str = "json") -> dict | str:
+        """Get full metadata for a single item by its key.
+
+        Args:
+            item_key: Zotero item key.
+            fmt: "json" for dict, "bibtex" for raw BibTeX string.
+                 Named 'fmt' to avoid shadowing Python's built-in 'format'.
+
+        Returns:
+            Dict of item data, or raw BibTeX string.
+        """
+        params = {}
+        if fmt == "bibtex":
+            params["format"] = "bibtex"
+        resp = self._get(f"/users/0/items/{item_key}", params=params)
+        if fmt == "bibtex":
+            return resp.text
+        data = resp.json()
+        return data.get("data", data)
+
+    def get_collections(self) -> list[dict]:
+        """List all collections with parent info and item counts."""
+        resp = self._get("/users/0/collections")
+        return [
+            {
+                "key": c["data"]["key"],
+                "name": c["data"]["name"],
+                "parent_key": c["data"].get("parentCollection") or "",
+                "num_items": c.get("meta", {}).get("numItems", 0),
+            }
+            for c in resp.json()
+        ]
+
+    def get_collection_items(self, collection_key: str, limit: int = 100) -> list[dict]:
+        """Get items in a specific collection."""
+        resp = self._get(
+            f"/users/0/collections/{collection_key}/items",
+            params={
+                "limit": limit,
+                "itemType": "-attachment || note",
+            },
+        )
+        return [_format_summary(item) for item in resp.json()]
+
 
 def _format_summary(item: dict) -> dict:
     """Extract key fields from a Zotero item for display."""
