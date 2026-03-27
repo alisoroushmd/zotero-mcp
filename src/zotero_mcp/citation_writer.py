@@ -409,3 +409,186 @@ def build_document(
     output = Path(output_path).resolve()
     doc.save(str(output))
     return str(output)
+
+
+# ---------------------------------------------------------------------------
+# 5. In-place Citation Insertion (preserves existing document formatting)
+# ---------------------------------------------------------------------------
+
+
+def _paragraph_full_text(paragraph) -> str:
+    """Extract full text from a paragraph including all runs.
+
+    Args:
+        paragraph: A python-docx Paragraph object.
+
+    Returns:
+        Concatenated text of all runs.
+    """
+    return "".join(run.text for run in paragraph.runs)
+
+
+def _has_citation_markers(text: str) -> bool:
+    """Check whether text contains [@KEY] citation markers.
+
+    Args:
+        text: Text to check.
+
+    Returns:
+        True if citation markers are found.
+    """
+    return bool(_CITATION_RE.search(text))
+
+
+def _rebuild_paragraph_with_citations(
+    paragraph,
+    blocks: list[TextBlock],
+    item_data: dict[str, dict],
+    user_id: str,
+) -> None:
+    """Replace a paragraph's content with citation field codes in-place.
+
+    Clears existing runs and rebuilds with text blocks and Zotero field codes.
+    Preserves the paragraph's style (heading level, alignment, spacing, etc.).
+
+    Args:
+        paragraph: A python-docx Paragraph object to modify.
+        blocks: Parsed TextBlocks from parse_citations.
+        item_data: Dict mapping item keys to Zotero metadata.
+        user_id: Zotero user ID for URI construction.
+    """
+    # Preserve paragraph style before clearing
+    style = paragraph.style
+
+    # Remove all existing runs from the paragraph XML
+    p_elem = paragraph._element
+    for child in list(p_elem):
+        if child.tag == qn("w:r"):
+            p_elem.remove(child)
+
+    # Restore style
+    paragraph.style = style
+
+    for block in blocks:
+        if block.kind == "text":
+            _add_formatted_text(paragraph, block.content)
+        elif block.kind == "citation":
+            citation_items = []
+            for key in block.keys:
+                if key in item_data:
+                    csl = zotero_to_csl_json(item_data[key], user_id)
+                    uris = csl.pop("_uris", [])
+                    citation_items.append(
+                        {
+                            "id": csl["id"],
+                            "uris": uris,
+                            "itemData": csl,
+                        }
+                    )
+
+            display = ",".join(str(n) for n in block.numbers)
+
+            citation_json = {
+                "citationID": f"cite_{uuid.uuid4().hex[:8]}",
+                "properties": {
+                    "formattedCitation": display,
+                    "plainCitation": display,
+                    "noteIndex": 0,
+                },
+                "citationItems": citation_items,
+                "schema": (
+                    "https://github.com/citation-style-language"
+                    "/schema/raw/master/csl-citation.json"
+                ),
+            }
+            add_citation_field(paragraph, citation_json, display)
+
+
+def insert_citations(
+    document_path: str,
+    item_data: dict[str, dict],
+    user_id: str,
+    output_path: str | None = None,
+) -> tuple[str, int]:
+    """Insert Zotero citation field codes into an existing Word document.
+
+    Opens the document, scans all paragraphs for [@KEY] markers, replaces
+    them with live Zotero field codes, and appends a bibliography if one
+    is not already present. All other document formatting (styles, headers,
+    footers, images, tables, page layout) is preserved.
+
+    Args:
+        document_path: Path to the existing .docx file.
+        item_data: Dict mapping item keys to their Zotero metadata.
+        user_id: Zotero user ID for URI construction.
+        output_path: Where to save. If None, overwrites the original.
+
+    Returns:
+        Tuple of (saved file path, number of citation markers replaced).
+    """
+    doc = Document(document_path)
+    save_to = Path(output_path or document_path).resolve()
+
+    # First pass: collect all citation keys across the entire document
+    # for consistent Vancouver numbering
+    all_text_parts: list[str] = []
+    for paragraph in doc.paragraphs:
+        text = _paragraph_full_text(paragraph)
+        if _has_citation_markers(text):
+            all_text_parts.append(text)
+
+    # Also scan tables
+    for table in doc.tables:
+        for row in table.rows:
+            for cell in row.cells:
+                for paragraph in cell.paragraphs:
+                    text = _paragraph_full_text(paragraph)
+                    if _has_citation_markers(text):
+                        all_text_parts.append(text)
+
+    if not all_text_parts:
+        doc.save(str(save_to))
+        return str(save_to), 0
+
+    # Build global numbering from concatenated text
+    combined = "\n\n".join(all_text_parts)
+    _, key_to_number = parse_citations(combined)
+    citation_count = len(key_to_number)
+
+    # Second pass: rebuild paragraphs that contain citation markers
+    def _process_paragraph(paragraph) -> None:
+        text = _paragraph_full_text(paragraph)
+        if not _has_citation_markers(text):
+            return
+        blocks, _ = parse_citations(text)
+        # Remap to global numbering
+        for block in blocks:
+            if block.kind == "citation":
+                block.numbers = [
+                    key_to_number[k] for k in block.keys if k in key_to_number
+                ]
+        _rebuild_paragraph_with_citations(paragraph, blocks, item_data, user_id)
+
+    for paragraph in doc.paragraphs:
+        _process_paragraph(paragraph)
+
+    for table in doc.tables:
+        for row in table.rows:
+            for cell in row.cells:
+                for paragraph in cell.paragraphs:
+                    _process_paragraph(paragraph)
+
+    # Add bibliography if not already present
+    has_bibliography = False
+    for paragraph in doc.paragraphs:
+        if "ADDIN ZOTERO_BIBL" in paragraph._element.xml:
+            has_bibliography = True
+            break
+
+    if not has_bibliography:
+        doc.add_heading("References", level=1)
+        bib_para = doc.add_paragraph()
+        add_bibliography_field(bib_para)
+
+    doc.save(str(save_to))
+    return str(save_to), citation_count

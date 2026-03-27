@@ -715,7 +715,7 @@ class WebClient:
 
         # Parallel read from local API
         items: dict[str, dict] = {}
-        with ThreadPoolExecutor(max_workers=10) as pool:
+        with ThreadPoolExecutor(max_workers=3) as pool:
             futures = {
                 pool.submit(self._read_item_local, key): key for key in item_keys
             }

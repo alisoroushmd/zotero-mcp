@@ -73,9 +73,9 @@ def _parse_list_param(value: str | list | None) -> list | None:
 
 
 @mcp.tool(description="Search items in Zotero library by keyword")
-def search_items(query: str, limit: int = 25) -> str:
+def search_items(query: str, limit: str | int = 25) -> str:
     """Search for items by keyword. Excludes attachments and notes."""
-    results = _get_local().search_items(query, limit)
+    results = _get_local().search_items(query, int(limit))
     return json.dumps(results, ensure_ascii=False)
 
 
@@ -96,9 +96,9 @@ def get_collections() -> str:
 
 
 @mcp.tool(description="List items in a specific Zotero collection")
-def get_collection_items(collection_key: str, limit: int = 100) -> str:
+def get_collection_items(collection_key: str, limit: str | int = 100) -> str:
     """Get items within a collection by its key."""
-    results = _get_local().get_collection_items(collection_key, limit)
+    results = _get_local().get_collection_items(collection_key, int(limit))
     return json.dumps(results, ensure_ascii=False)
 
 
@@ -272,6 +272,99 @@ def attach_pdf(
 
 @mcp.tool(
     description=(
+        "Insert live Zotero citations into an existing Word document (.docx). "
+        "Scans paragraphs and tables for [@ITEM_KEY] markers, replaces them "
+        "with Zotero field codes, and appends a bibliography. Preserves all "
+        "existing document formatting (styles, headers, images, page layout). "
+        "Use this instead of write_cited_document when you need to add "
+        "citations to a document that already has formatting you want to keep. "
+        "Zotero desktop must be running to fetch item metadata."
+    )
+)
+def insert_citations(document_path: str, output_path: str | None = None) -> str:
+    """Insert Zotero citation field codes into an existing Word document.
+
+    Args:
+        document_path: Path to existing .docx with [@ITEM_KEY] markers.
+        output_path: Where to save. If omitted, overwrites the original.
+
+    Returns:
+        JSON with output_path and citation_count.
+    """
+    from zotero_mcp.citation_writer import insert_citations as _insert_citations
+    from zotero_mcp.citation_writer import parse_citations
+
+    # Read the document to find all citation keys
+    from docx import Document as _Document
+
+    doc = _Document(document_path)
+    all_text: list[str] = []
+    for para in doc.paragraphs:
+        t = "".join(run.text for run in para.runs)
+        if t:
+            all_text.append(t)
+    for table in doc.tables:
+        for row in table.rows:
+            for cell in row.cells:
+                for para in cell.paragraphs:
+                    t = "".join(run.text for run in para.runs)
+                    if t:
+                        all_text.append(t)
+
+    combined = "\n\n".join(all_text)
+    _, key_to_number = parse_citations(combined)
+    item_keys = list(key_to_number.keys())
+
+    if not item_keys:
+        return json.dumps(
+            {
+                "output_path": document_path,
+                "citation_count": 0,
+                "message": "No [@KEY] citation markers found in the document.",
+            }
+        )
+
+    # Fetch metadata for each item from local Zotero (parallel)
+    from concurrent.futures import ThreadPoolExecutor, as_completed
+
+    local = _get_local()
+    item_data: dict[str, dict] = {}
+    missing_keys: list[str] = []
+
+    with ThreadPoolExecutor(max_workers=3) as pool:
+        futures = {pool.submit(local.get_item, key): key for key in item_keys}
+        for future in as_completed(futures):
+            key = futures[future]
+            try:
+                data = future.result()
+                if isinstance(data, dict):
+                    item_data[key] = data
+                else:
+                    missing_keys.append(key)
+            except Exception:
+                missing_keys.append(key)
+
+    user_id = os.environ.get("ZOTERO_USER_ID", "0")
+
+    result_path, citation_count = _insert_citations(
+        document_path, item_data, user_id, output_path
+    )
+
+    result = {
+        "output_path": result_path,
+        "citation_count": citation_count,
+    }
+    if missing_keys:
+        result["missing_keys"] = missing_keys
+        result["warning"] = (
+            f"Could not fetch metadata for {len(missing_keys)} item(s): "
+            f"{', '.join(missing_keys)}. These citations were skipped."
+        )
+    return json.dumps(result, ensure_ascii=False)
+
+
+@mcp.tool(
+    description=(
         "Write a Word document (.docx) with live Zotero citations. "
         "Use [@ITEM_KEY] markers in the content to insert citations. "
         "Supports grouped citations like [@KEY1, @KEY2]. "
@@ -308,7 +401,7 @@ def write_cited_document(content: str, output_path: str) -> str:
     item_data: dict[str, dict] = {}
     missing_keys: list[str] = []
 
-    with ThreadPoolExecutor(max_workers=10) as pool:
+    with ThreadPoolExecutor(max_workers=3) as pool:
         futures = {pool.submit(local.get_item, key): key for key in item_keys}
         for future in as_completed(futures):
             key = futures[future]

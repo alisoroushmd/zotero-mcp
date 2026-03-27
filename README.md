@@ -16,8 +16,11 @@ MCP server for [Zotero](https://www.zotero.org/) that lets AI assistants search 
 | `create_item_from_url`        | Add an item from any URL (FDA, preprints, datasets) |
 | `create_item_manual`          | Create an item with manually provided metadata      |
 | `create_collection`           | Create a new collection (folder), optionally nested |
+| `batch_organize_items`        | Tag, collect, or remove items in bulk               |
 | `add_to_collection`           | Add an item to a collection                         |
 | `update_item`                 | Update metadata fields on an item                   |
+| `attach_pdf`                  | Attach a local PDF file to an existing item         |
+| `insert_citations`            | Insert live citations into an existing Word document |
 | `write_cited_document`        | Write a Word doc with live Zotero citations         |
 
 Key behaviors:

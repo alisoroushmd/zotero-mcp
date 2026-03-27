@@ -7,7 +7,7 @@ import httpx
 logger = logging.getLogger(__name__)
 
 LOCAL_BASE = "http://localhost:23119/api"
-TIMEOUT = 2.0
+TIMEOUT = 5.0
 
 
 class LocalClient:
