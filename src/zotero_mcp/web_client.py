@@ -690,6 +690,39 @@ class WebClient:
             "note": "Item created on Zotero web. Sync Zotero desktop to see it locally.",
         }
 
+    def create_note(
+        self,
+        parent_key: str,
+        content: str,
+        tags: list[str] | None = None,
+    ) -> dict:
+        """Create a note attached to a parent item.
+
+        Args:
+            parent_key: Zotero item key to attach the note to.
+            content: Note content (HTML). Plain text is also accepted.
+            tags: Optional tag strings to add to the note.
+
+        Returns:
+            Dict with "key" and "parent_key".
+        """
+        note_data: dict = {
+            "itemType": "note",
+            "parentItem": parent_key,
+            "note": content,
+            "tags": [{"tag": t} for t in (tags or [])],
+        }
+
+        resp = self._web_client.post("/items", json=[note_data])
+        resp.raise_for_status()
+
+        key = self._extract_created_key(resp.json())
+        return {
+            "key": key,
+            "parent_key": parent_key,
+            "note": "Note created on Zotero web. Sync Zotero desktop to see it locally.",
+        }
+
     def batch_organize(
         self,
         item_keys: list[str],

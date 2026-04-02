@@ -86,6 +86,30 @@ class LocalClient:
         )
         return [_format_summary(item) for item in resp.json()]
 
+    def get_notes(self, parent_key: str) -> list[dict]:
+        """Get child notes for a parent item.
+
+        Args:
+            parent_key: Zotero item key of the parent item.
+
+        Returns:
+            List of dicts with key, note (HTML content), tags, and dateModified.
+        """
+        resp = self._get(
+            f"/users/0/items/{parent_key}/children",
+            params={"itemType": "note"},
+        )
+        notes = []
+        for item in resp.json():
+            data = item.get("data", item)
+            notes.append({
+                "key": data.get("key", ""),
+                "note": data.get("note", ""),
+                "tags": [t["tag"] for t in data.get("tags", [])],
+                "dateModified": data.get("dateModified", ""),
+            })
+        return notes
+
 
 def _format_summary(item: dict) -> dict:
     """Extract key fields from a Zotero item for display."""

@@ -95,6 +95,18 @@ def get_collections() -> str:
     return json.dumps(results, ensure_ascii=False)
 
 
+@mcp.tool(
+    description=(
+        "Get child notes attached to a Zotero item. Returns note content "
+        "(HTML), tags, and modification date for each note."
+    )
+)
+def get_notes(parent_key: str) -> str:
+    """Get all notes attached to a parent item."""
+    results = _get_local().get_notes(parent_key)
+    return json.dumps(results, ensure_ascii=False)
+
+
 @mcp.tool(description="List items in a specific Zotero collection")
 def get_collection_items(collection_key: str, limit: str | int = 100) -> str:
     """Get items within a collection by its key."""
@@ -194,6 +206,24 @@ def create_item_manual(
         collection_keys=collection_keys,
         tags=tags,
     )
+    return json.dumps(result, ensure_ascii=False)
+
+
+@mcp.tool(
+    description=(
+        "Create a note attached to a Zotero item. Use for annotations, "
+        "quality assessments, 'What's New' summaries, or any structured "
+        "commentary on a reference. Content can be HTML or plain text."
+    )
+)
+def create_note(
+    parent_key: str,
+    content: str,
+    tags: str | list[str] | None = None,
+) -> str:
+    """Create a child note on a Zotero item."""
+    tags = _parse_list_param(tags)
+    result = _get_web().create_note(parent_key, content, tags)
     return json.dumps(result, ensure_ascii=False)
 
 
