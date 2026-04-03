@@ -153,5 +153,5 @@ def test_connection_error_gives_clear_message():
         side_effect=httpx.ConnectError("Connection refused")
     )
     client = LocalClient()
-    with pytest.raises(RuntimeError, match="Zotero desktop must be running"):
+    with pytest.raises(RuntimeError, match="Local Read mode requires Zotero desktop"):
         client.search_items("test")

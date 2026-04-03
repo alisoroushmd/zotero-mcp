@@ -25,9 +25,10 @@ class LocalClient:
             return resp
         except httpx.ConnectError:
             raise RuntimeError(
-                "Zotero desktop must be running for read operations. "
-                "Enable 'Allow other applications on this computer to "
-                "communicate with Zotero' in Zotero settings > Advanced."
+                "Local Read mode requires Zotero desktop running at localhost:23119. "
+                "Start Zotero and enable: Settings > Advanced > General > "
+                "'Allow other applications on this computer to communicate with Zotero'. "
+                "Call server_status to check which modes are available."
             )
 
     def search_items(self, query: str, limit: int = 25) -> list[dict]:
@@ -86,6 +87,22 @@ class LocalClient:
         )
         return [_format_summary(item) for item in resp.json()]
 
+    def get_children(self, parent_key: str, item_type: str | None = None) -> list[dict]:
+        """Get child items for a parent item.
+
+        Args:
+            parent_key: Zotero item key of the parent item.
+            item_type: Optional filter (e.g. "note", "attachment").
+
+        Returns:
+            List of raw data dicts for each child item.
+        """
+        params = {}
+        if item_type:
+            params["itemType"] = item_type
+        resp = self._get(f"/users/0/items/{parent_key}/children", params=params or None)
+        return [item.get("data", item) for item in resp.json()]
+
     def get_notes(self, parent_key: str) -> list[dict]:
         """Get child notes for a parent item.
 
@@ -95,20 +112,16 @@ class LocalClient:
         Returns:
             List of dicts with key, note (HTML content), tags, and dateModified.
         """
-        resp = self._get(
-            f"/users/0/items/{parent_key}/children",
-            params={"itemType": "note"},
-        )
-        notes = []
-        for item in resp.json():
-            data = item.get("data", item)
-            notes.append({
+        children = self.get_children(parent_key, item_type="note")
+        return [
+            {
                 "key": data.get("key", ""),
                 "note": data.get("note", ""),
                 "tags": [t["tag"] for t in data.get("tags", [])],
                 "dateModified": data.get("dateModified", ""),
-            })
-        return notes
+            }
+            for data in children
+        ]
 
 
 def _format_summary(item: dict) -> dict:

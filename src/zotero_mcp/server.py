@@ -3,10 +3,12 @@
 import json
 import logging
 import os
+import re
 import threading
 
 from fastmcp import FastMCP
 
+from zotero_mcp.capabilities import check_capabilities, format_status
 from zotero_mcp.local_client import LocalClient
 from zotero_mcp.web_client import WebClient
 
@@ -15,15 +17,31 @@ logger = logging.getLogger(__name__)
 mcp = FastMCP(
     "zotero",
     instructions=(
-        "Zotero MCP server. Read operations use the local Zotero desktop API "
-        "(Zotero must be running). Write operations use the Zotero Web API "
-        "(requires ZOTERO_API_KEY and ZOTERO_USER_ID env vars)."
+        "Zotero MCP server. All tools work with just API credentials "
+        "(ZOTERO_API_KEY + ZOTERO_USER_ID). If Zotero desktop is also "
+        "running, reads are faster via the local API. "
+        "Call server_status to check available modes."
     ),
 )
 
 _local: LocalClient | None = None
 _web: WebClient | None = None
 _init_lock = threading.Lock()
+
+_ZOTERO_KEY_RE = re.compile(r"^[A-Za-z0-9]+$")
+
+
+def _validate_key(value: str, name: str = "key") -> None:
+    """Validate a Zotero item/collection key."""
+    if not value or not value.strip():
+        raise ValueError(f"{name} must not be empty")
+    if not _ZOTERO_KEY_RE.match(value.strip()):
+        raise ValueError(f"{name} must be alphanumeric, got: {value!r}")
+
+
+def _clamp_limit(value: str | int, lo: int = 1, hi: int = 100) -> int:
+    """Clamp a limit parameter to a safe range."""
+    return max(lo, min(hi, int(value)))
 
 
 def _get_local() -> LocalClient:
@@ -48,11 +66,22 @@ def _get_web() -> WebClient:
         api_key = os.environ.get("ZOTERO_API_KEY", "")
         user_id = os.environ.get("ZOTERO_USER_ID", "")
         if not api_key or not user_id:
+            missing = []
+            if not api_key:
+                missing.append("ZOTERO_API_KEY")
+            if not user_id:
+                missing.append("ZOTERO_USER_ID")
             raise RuntimeError(
-                "ZOTERO_API_KEY and ZOTERO_USER_ID are required for write operations. "
-                "Get your API key at https://www.zotero.org/settings/keys"
+                f"Cloud CRUD mode requires {', '.join(missing)}. "
+                f"Get your API key at https://www.zotero.org/settings/keys"
             )
-        _web = WebClient(api_key=api_key, user_id=user_id, local_client=_get_local())
+        # Try to attach local client for faster reads, but don't fail without it
+        local = None
+        try:
+            local = _get_local()
+        except RuntimeError:
+            pass  # Zotero desktop not running — web client will use web reads
+        _web = WebClient(api_key=api_key, user_id=user_id, local_client=local)
         return _web
 
 
@@ -69,20 +98,46 @@ def _parse_list_param(value: str | list | None) -> list | None:
         return [value]  # Treat bare string as single-item list
 
 
-# -- Read tools (local API) --
+# -- Status tool --
+
+
+@mcp.tool(
+    description=(
+        "Check which operating modes are available. Call this first to "
+        "understand what tools will work. Reports Local Read, Cloud CRUD, "
+        "and Live Citation mode status with fix instructions."
+    )
+)
+def server_status() -> str:
+    """Probe Zotero services and report available modes and tools."""
+    caps = check_capabilities()
+    return json.dumps(format_status(caps), ensure_ascii=False)
+
+
+# -- Read tools (web API primary, local API fallback) --
+
+
+def _read_local_or_web(local_method: str, *args, **kwargs):
+    """Try local API first (faster), fall back to web API for reads."""
+    try:
+        local = _get_local()
+        return getattr(local, local_method)(*args, **kwargs)
+    except RuntimeError:
+        return getattr(_get_web(), local_method)(*args, **kwargs)
 
 
 @mcp.tool(description="Search items in Zotero library by keyword")
 def search_items(query: str, limit: str | int = 25) -> str:
     """Search for items by keyword. Excludes attachments and notes."""
-    results = _get_local().search_items(query, int(limit))
+    results = _read_local_or_web("search_items", query, _clamp_limit(limit))
     return json.dumps(results, ensure_ascii=False)
 
 
 @mcp.tool(description="Get detailed metadata for a single Zotero item")
 def get_item(item_key: str, format: str = "json") -> str:
     """Get full metadata or BibTeX for one item by its key."""
-    result = _get_local().get_item(item_key, fmt=format)
+    _validate_key(item_key, "item_key")
+    result = _read_local_or_web("get_item", item_key.strip(), fmt=format)
     if isinstance(result, str):
         return result
     return json.dumps(result, ensure_ascii=False)
@@ -91,7 +146,7 @@ def get_item(item_key: str, format: str = "json") -> str:
 @mcp.tool(description="List all collections in the Zotero library")
 def get_collections() -> str:
     """Returns flat list of collections with key, name, parent, and item count."""
-    results = _get_local().get_collections()
+    results = _read_local_or_web("get_collections")
     return json.dumps(results, ensure_ascii=False)
 
 
@@ -103,14 +158,56 @@ def get_collections() -> str:
 )
 def get_notes(parent_key: str) -> str:
     """Get all notes attached to a parent item."""
-    results = _get_local().get_notes(parent_key)
+    _validate_key(parent_key, "parent_key")
+    results = _read_local_or_web("get_notes", parent_key.strip())
+    return json.dumps(results, ensure_ascii=False)
+
+
+@mcp.tool(
+    description=(
+        "List attachments on a Zotero item with availability status. "
+        "Returns filename, content type, link mode, and whether the "
+        "file is available locally, in cloud storage, or metadata-only."
+    )
+)
+def get_item_attachments(parent_key: str) -> str:
+    """Get attachments for a parent item with availability classification."""
+    _validate_key(parent_key, "parent_key")
+    attachments = _read_local_or_web(
+        "get_children", parent_key.strip(), item_type="attachment"
+    )
+
+    link_mode_map = {
+        "imported_url": "stored_remote_available",
+        "imported_file": "stored_local_available",
+        "linked_file": "linked_local_available",
+        "linked_url": "linked_local_available",
+    }
+
+    results = []
+    for att in attachments:
+        link_mode = att.get("linkMode", "")
+        results.append(
+            {
+                "key": att.get("key", ""),
+                "title": att.get("title", ""),
+                "filename": att.get("filename", ""),
+                "contentType": att.get("contentType", ""),
+                "linkMode": link_mode,
+                "availability": link_mode_map.get(link_mode, "metadata_only"),
+                "path": att.get("path", ""),
+            }
+        )
     return json.dumps(results, ensure_ascii=False)
 
 
 @mcp.tool(description="List items in a specific Zotero collection")
 def get_collection_items(collection_key: str, limit: str | int = 100) -> str:
     """Get items within a collection by its key."""
-    results = _get_local().get_collection_items(collection_key, int(limit))
+    _validate_key(collection_key, "collection_key")
+    results = _read_local_or_web(
+        "get_collection_items", collection_key.strip(), _clamp_limit(limit)
+    )
     return json.dumps(results, ensure_ascii=False)
 
 
@@ -129,9 +226,13 @@ def create_item_from_identifier(
     tags: str | list[str] | None = None,
 ) -> str:
     """Look up identifier, create item in Zotero. Returns {key, title}."""
+    if not identifier or not identifier.strip():
+        raise ValueError("identifier must not be empty")
     collection_keys = _parse_list_param(collection_keys)
     tags = _parse_list_param(tags)
-    result = _get_web().create_item_from_identifier(identifier, collection_keys, tags)
+    result = _get_web().create_item_from_identifier(
+        identifier.strip(), collection_keys, tags
+    )
     return json.dumps(result, ensure_ascii=False)
 
 
@@ -149,10 +250,8 @@ def create_item_from_url(
     tags: str | list[str] | None = None,
 ) -> str:
     """Create a Zotero item from any URL."""
-    if isinstance(collection_keys, str):
-        collection_keys = json.loads(collection_keys)
-    if isinstance(tags, str):
-        tags = json.loads(tags)
+    collection_keys = _parse_list_param(collection_keys)
+    tags = _parse_list_param(tags)
     result = _get_web().create_item_from_url(url, title, collection_keys, tags)
     return json.dumps(result, ensure_ascii=False)
 
@@ -185,10 +284,8 @@ def create_item_manual(
 ) -> str:
     """Create a Zotero item with manual metadata."""
     creators = _parse_list_param(creators)
-    if isinstance(collection_keys, str):
-        collection_keys = json.loads(collection_keys)
-    if isinstance(tags, str):
-        tags = json.loads(tags)
+    collection_keys = _parse_list_param(collection_keys)
+    tags = _parse_list_param(tags)
     result = _get_web().create_item_manual(
         item_type=item_type,
         title=title,
@@ -222,8 +319,9 @@ def create_note(
     tags: str | list[str] | None = None,
 ) -> str:
     """Create a child note on a Zotero item."""
+    _validate_key(parent_key, "parent_key")
     tags = _parse_list_param(tags)
-    result = _get_web().create_note(parent_key, content, tags)
+    result = _get_web().create_note(parent_key.strip(), content, tags)
     return json.dumps(result, ensure_ascii=False)
 
 
@@ -259,14 +357,17 @@ def create_collection(name: str, parent_key: str | None = None) -> str:
 @mcp.tool(description="Add a Zotero item to a collection")
 def add_to_collection(item_key: str, collection_key: str) -> str:
     """Add an existing item to a collection."""
-    result = _get_web().add_to_collection(item_key, collection_key)
+    _validate_key(item_key, "item_key")
+    _validate_key(collection_key, "collection_key")
+    result = _get_web().add_to_collection(item_key.strip(), collection_key.strip())
     return json.dumps(result, ensure_ascii=False)
 
 
 @mcp.tool(description="Update metadata fields on an existing Zotero item")
 def update_item(item_key: str, fields: dict) -> str:
     """Update item fields. Uses optimistic locking with version check."""
-    result = _get_web().update_item(item_key, fields)
+    _validate_key(item_key, "item_key")
+    result = _get_web().update_item(item_key.strip(), fields)
     return json.dumps(result, ensure_ascii=False)
 
 
@@ -293,11 +394,44 @@ def attach_pdf(
     Returns:
         JSON with status, attachment_key, filename, source.
     """
-    result = _get_web().attach_pdf(parent_key, pdf_path, doi)
+    _validate_key(parent_key, "parent_key")
+    if pdf_path and not pdf_path.lower().endswith(".pdf"):
+        raise ValueError("pdf_path must be a .pdf file")
+    result = _get_web().attach_pdf(parent_key.strip(), pdf_path, doi)
     return json.dumps(result, ensure_ascii=False)
 
 
 # -- Document tools --
+
+
+def _fetch_item_metadata(item_keys: list[str]) -> tuple[dict[str, dict], list[str]]:
+    """Fetch metadata for multiple items in parallel (local fast path, web fallback).
+
+    Returns:
+        Tuple of (item_data dict, missing_keys list).
+    """
+    from concurrent.futures import ThreadPoolExecutor, as_completed
+
+    def _get_one(key: str) -> dict | str:
+        return _read_local_or_web("get_item", key)
+
+    item_data: dict[str, dict] = {}
+    missing_keys: list[str] = []
+
+    with ThreadPoolExecutor(max_workers=3) as pool:
+        futures = {pool.submit(_get_one, key): key for key in item_keys}
+        for future in as_completed(futures):
+            key = futures[future]
+            try:
+                data = future.result()
+                if isinstance(data, dict):
+                    item_data[key] = data
+                else:
+                    missing_keys.append(key)
+            except Exception:
+                missing_keys.append(key)
+
+    return item_data, missing_keys
 
 
 @mcp.tool(
@@ -307,8 +441,7 @@ def attach_pdf(
         "with Zotero field codes, and appends a bibliography. Preserves all "
         "existing document formatting (styles, headers, images, page layout). "
         "Use this instead of write_cited_document when you need to add "
-        "citations to a document that already has formatting you want to keep. "
-        "Zotero desktop must be running to fetch item metadata."
+        "citations to a document that already has formatting you want to keep."
     )
 )
 def insert_citations(document_path: str, output_path: str | None = None) -> str:
@@ -321,6 +454,11 @@ def insert_citations(document_path: str, output_path: str | None = None) -> str:
     Returns:
         JSON with output_path and citation_count.
     """
+    if not document_path.lower().endswith(".docx"):
+        raise ValueError("document_path must be a .docx file")
+    if output_path and not output_path.lower().endswith(".docx"):
+        raise ValueError("output_path must be a .docx file")
+
     from zotero_mcp.citation_writer import insert_citations as _insert_citations
     from zotero_mcp.citation_writer import parse_citations
 
@@ -354,25 +492,8 @@ def insert_citations(document_path: str, output_path: str | None = None) -> str:
             }
         )
 
-    # Fetch metadata for each item from local Zotero (parallel)
-    from concurrent.futures import ThreadPoolExecutor, as_completed
-
-    local = _get_local()
-    item_data: dict[str, dict] = {}
-    missing_keys: list[str] = []
-
-    with ThreadPoolExecutor(max_workers=3) as pool:
-        futures = {pool.submit(local.get_item, key): key for key in item_keys}
-        for future in as_completed(futures):
-            key = futures[future]
-            try:
-                data = future.result()
-                if isinstance(data, dict):
-                    item_data[key] = data
-                else:
-                    missing_keys.append(key)
-            except Exception:
-                missing_keys.append(key)
+    # Fetch metadata for each item (local fast path, web fallback)
+    item_data, missing_keys = _fetch_item_metadata(item_keys)
 
     user_id = os.environ.get("ZOTERO_USER_ID", "0")
 
@@ -399,8 +520,7 @@ def insert_citations(document_path: str, output_path: str | None = None) -> str:
         "Use [@ITEM_KEY] markers in the content to insert citations. "
         "Supports grouped citations like [@KEY1, @KEY2]. "
         "Produces Vancouver-style superscript numbers and a bibliography. "
-        "The Zotero Word plugin will recognize these as live citations. "
-        "Zotero desktop must be running to fetch item metadata."
+        "The Zotero Word plugin will recognize these as live citations."
     )
 )
 def write_cited_document(content: str, output_path: str) -> str:
@@ -413,6 +533,9 @@ def write_cited_document(content: str, output_path: str) -> str:
     Returns:
         JSON with output_path and citation_count.
     """
+    if not output_path.lower().endswith(".docx"):
+        raise ValueError("output_path must be a .docx file")
+
     from zotero_mcp.citation_writer import build_document, parse_citations
 
     # Extract all unique item keys from the content
@@ -424,30 +547,10 @@ def write_cited_document(content: str, output_path: str) -> str:
         result_path = build_document(content, {}, "", output_path)
         return json.dumps({"output_path": result_path, "citation_count": 0})
 
-    # Fetch metadata for each item from local Zotero (parallel)
-    from concurrent.futures import ThreadPoolExecutor, as_completed
+    # Fetch metadata (local fast path, web fallback)
+    item_data, missing_keys = _fetch_item_metadata(item_keys)
 
-    local = _get_local()
-    item_data: dict[str, dict] = {}
-    missing_keys: list[str] = []
-
-    with ThreadPoolExecutor(max_workers=3) as pool:
-        futures = {pool.submit(local.get_item, key): key for key in item_keys}
-        for future in as_completed(futures):
-            key = futures[future]
-            try:
-                data = future.result()
-                if isinstance(data, dict):
-                    item_data[key] = data
-                else:
-                    missing_keys.append(key)
-            except Exception:
-                missing_keys.append(key)
-
-    # Get user ID for URI construction
     user_id = os.environ.get("ZOTERO_USER_ID", "0")
-
-    # Build the document
     result_path = build_document(content, item_data, user_id, output_path)
 
     result = {

@@ -1,0 +1,46 @@
+{
+  "manifest_version": "0.3",
+  "name": "zotero-mcp",
+  "display_name": "Zotero",
+  "version": "0.2.0",
+  "description": "Search, organize, and cite from your Zotero library",
+  "author": {
+    "name": "Ali Soroush",
+    "url": "https://github.com/alisoroushmd/zotero-mcp"
+  },
+  "server": {
+    "type": "python",
+    "entry_point": "src/zotero_mcp/__main__.py",
+    "mcp_config": {
+      "command": "uv",
+      "args": ["--directory", "${__dirname}", "run", "zotero-mcp"],
+      "env": {
+        "ZOTERO_API_KEY": "${user_config.api_key}",
+        "ZOTERO_USER_ID": "${user_config.user_id}"
+      }
+    }
+  },
+  "user_config": {
+    "api_key": {
+      "type": "string",
+      "title": "Zotero API Key",
+      "description": "Get yours at zotero.org/settings/keys",
+      "sensitive": true,
+      "required": true
+    },
+    "user_id": {
+      "type": "string",
+      "title": "Zotero User ID",
+      "description": "Shown on the API keys page",
+      "required": true
+    }
+  },
+  "compatibility": {
+    "platforms": ["darwin", "win32", "linux"],
+    "runtimes": {
+      "python": ">=3.11"
+    }
+  },
+  "license": "MIT",
+  "keywords": ["zotero", "research", "bibliography", "citation"]
+}

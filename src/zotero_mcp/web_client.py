@@ -1,4 +1,4 @@
-"""Writes to Zotero Web API + translation server for identifier resolution."""
+"""Zotero Web API client — primary path for reads and writes."""
 
 from __future__ import annotations
 
@@ -25,7 +25,12 @@ TIMEOUT = 10.0
 
 
 class WebClient:
-    """Write client for Zotero Web API."""
+    """Primary client for Zotero Web API — handles reads and writes.
+
+    Reads use the Web API by default. If a LocalClient is provided,
+    read-modify-write operations try the local API first (faster,
+    no rate limits) before falling back to web reads.
+    """
 
     def __init__(
         self,
@@ -53,29 +58,112 @@ class WebClient:
             timeout=TIMEOUT,
         )
 
-    def _read_item_local(self, item_key: str) -> dict:
-        """Read item from local API for read-modify-write operations."""
-        if not self._local:
-            raise RuntimeError(
-                "LocalClient is required for read-modify-write operations. "
-                "Zotero desktop must be running."
-            )
-        result = self._local.get_item(item_key)
+    # -- Web API read methods (primary read path) --
+
+    def search_items(self, query: str, limit: int = 25) -> list[dict]:
+        """Search items via Web API. Excludes attachments and notes."""
+        from zotero_mcp.local_client import _format_summary
+
+        resp = self._web_client.get(
+            "/items",
+            params={"q": query, "limit": limit, "itemType": "-attachment || -note"},
+        )
+        resp.raise_for_status()
+        return [_format_summary(item) for item in resp.json()]
+
+    def get_item(self, item_key: str, fmt: str = "json") -> dict | str:
+        """Get item metadata or BibTeX via Web API."""
+        params = {}
+        if fmt == "bibtex":
+            params["format"] = "bibtex"
+        resp = self._web_client.get(f"/items/{item_key}", params=params)
+        resp.raise_for_status()
+        if fmt == "bibtex":
+            return resp.text
+        data = resp.json()
+        return data.get("data", data)
+
+    def get_collections(self) -> list[dict]:
+        """List all collections via Web API."""
+        resp = self._web_client.get("/collections")
+        resp.raise_for_status()
+        return [
+            {
+                "key": c["data"]["key"],
+                "name": c["data"]["name"],
+                "parent_key": c["data"].get("parentCollection") or "",
+                "num_items": c.get("meta", {}).get("numItems", 0),
+            }
+            for c in resp.json()
+        ]
+
+    def get_collection_items(self, collection_key: str, limit: int = 100) -> list[dict]:
+        """Get items in a collection via Web API."""
+        from zotero_mcp.local_client import _format_summary
+
+        resp = self._web_client.get(
+            f"/collections/{collection_key}/items",
+            params={"limit": limit, "itemType": "-attachment || -note"},
+        )
+        resp.raise_for_status()
+        return [_format_summary(item) for item in resp.json()]
+
+    def get_children(self, parent_key: str, item_type: str | None = None) -> list[dict]:
+        """Get child items via Web API."""
+        params = {}
+        if item_type:
+            params["itemType"] = item_type
+        resp = self._web_client.get(
+            f"/items/{parent_key}/children", params=params or None
+        )
+        resp.raise_for_status()
+        return [item.get("data", item) for item in resp.json()]
+
+    def get_notes(self, parent_key: str) -> list[dict]:
+        """Get child notes via Web API."""
+        children = self.get_children(parent_key, item_type="note")
+        return [
+            {
+                "key": data.get("key", ""),
+                "note": data.get("note", ""),
+                "tags": [t["tag"] for t in data.get("tags", [])],
+                "dateModified": data.get("dateModified", ""),
+            }
+            for data in children
+        ]
+
+    # -- Read helpers for read-modify-write operations --
+
+    def _read_item(self, item_key: str) -> dict:
+        """Read item for read-modify-write: tries local (fast), falls back to web."""
+        if self._local:
+            try:
+                result = self._local.get_item(item_key)
+                if isinstance(result, dict):
+                    return result
+            except RuntimeError:
+                pass  # Local unavailable, fall through to web
+        # Web API read
+        result = self.get_item(item_key)
         if isinstance(result, str):
             raise RuntimeError(f"Expected dict for item {item_key}, got BibTeX string")
         return result
 
     def _check_duplicate_doi(self, doi: str) -> dict | None:
         """Check if a DOI already exists in the library. Returns item summary or None."""
-        if not doi or not self._local:
+        if not doi:
             return None
+        # Try local first (faster), fall back to web search
         try:
-            results = self._local.search_items(doi, limit=10)
+            if self._local:
+                results = self._local.search_items(doi, limit=10)
+            else:
+                results = self.search_items(doi, limit=10)
             for item in results:
                 if item.get("DOI", "").strip().lower() == doi.strip().lower():
                     return item
-        except RuntimeError:
-            pass  # Zotero not running — skip duplicate check
+        except Exception:
+            pass  # Search failed — skip duplicate check
         return None
 
     def _extract_created_key(self, result: dict) -> str:
@@ -142,6 +230,7 @@ class WebClient:
         resp.raise_for_status()
 
         key = self._extract_created_key(resp.json())
+        logger.info("Created item %s from identifier %s", key, identifier)
         return {
             "key": key,
             "title": metadata.get("title", ""),
@@ -573,6 +662,7 @@ class WebClient:
         resp.raise_for_status()
 
         key = self._extract_created_key(resp.json())
+        logger.info("Created item %s from URL %s", key, url)
         return {
             "key": key,
             "title": metadata.get("title", ""),
@@ -717,6 +807,7 @@ class WebClient:
         resp.raise_for_status()
 
         key = self._extract_created_key(resp.json())
+        logger.info("Created note %s on item %s", key, parent_key)
         return {
             "key": key,
             "parent_key": parent_key,
@@ -749,9 +840,7 @@ class WebClient:
         # Parallel read from local API
         items: dict[str, dict] = {}
         with ThreadPoolExecutor(max_workers=3) as pool:
-            futures = {
-                pool.submit(self._read_item_local, key): key for key in item_keys
-            }
+            futures = {pool.submit(self._read_item, key): key for key in item_keys}
             for future in as_completed(futures):
                 key = futures[future]
                 try:
@@ -786,8 +875,46 @@ class WebClient:
                     headers={"If-Unmodified-Since-Version": str(version)},
                     json=patch,
                 )
-                resp.raise_for_status()
-                results["updated"].append(key)
+                if resp.status_code == 412:
+                    # Version conflict — re-read and retry once
+                    item = self._read_item(key)
+                    version = item.get("version", 0)
+                    new_patch: dict = {}
+                    if tags:
+                        existing_tags = item.get("tags", [])
+                        existing_tag_names = {t.get("tag", "") for t in existing_tags}
+                        new_tags = [
+                            {"tag": t} for t in tags if t not in existing_tag_names
+                        ]
+                        if new_tags:
+                            new_patch["tags"] = existing_tags + new_tags
+                    if collection_key:
+                        existing_collections = item.get("collections", [])
+                        if collection_key not in existing_collections:
+                            new_patch["collections"] = existing_collections + [
+                                collection_key
+                            ]
+                    if new_patch:
+                        resp = self._web_client.patch(
+                            f"/items/{key}",
+                            headers={"If-Unmodified-Since-Version": str(version)},
+                            json=new_patch,
+                        )
+                        resp.raise_for_status()
+                    results["updated"].append(key)
+                elif resp.status_code == 429:
+                    retry_after = int(resp.headers.get("Retry-After", "5"))
+                    time.sleep(min(retry_after, 10))
+                    resp = self._web_client.patch(
+                        f"/items/{key}",
+                        headers={"If-Unmodified-Since-Version": str(version)},
+                        json=patch,
+                    )
+                    resp.raise_for_status()
+                    results["updated"].append(key)
+                else:
+                    resp.raise_for_status()
+                    results["updated"].append(key)
             except Exception:
                 results["failed"].append(key)
 
@@ -833,7 +960,7 @@ class WebClient:
         Returns:
             Dict with item_key and updated collections list.
         """
-        item = self._read_item_local(item_key)
+        item = self._read_item(item_key)
         version = item.get("version", 0)
         collections = list(set(item.get("collections", []) + [collection_key]))
 
@@ -861,7 +988,7 @@ class WebClient:
         Raises:
             RuntimeError: On 412 version conflict.
         """
-        item = self._read_item_local(item_key)
+        item = self._read_item(item_key)
         version = item.get("version", 0)
 
         resp = self._web_client.patch(
@@ -878,6 +1005,7 @@ class WebClient:
         resp.raise_for_status()
 
         new_version = int(resp.headers.get("Last-Modified-Version", version))
+        logger.info("Updated item %s to version %d", item_key, new_version)
         return {"key": item_key, "version": new_version}
 
     def attach_pdf(
@@ -1022,6 +1150,7 @@ class WebClient:
         )
         register_resp.raise_for_status()
 
+        logger.info("Attached PDF %s to item %s (%s)", filename, parent_key, source)
         return {
             "status": "attached",
             "attachment_key": attach_key,

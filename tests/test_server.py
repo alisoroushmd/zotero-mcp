@@ -4,7 +4,7 @@ import asyncio
 
 
 def test_server_has_all_tools():
-    """Server exposes all 14 tools."""
+    """Server exposes all 18 tools."""
     from zotero_mcp.server import mcp
 
     tools = asyncio.run(mcp.list_tools())
@@ -13,9 +13,12 @@ def test_server_has_all_tools():
         "get_item",
         "get_collections",
         "get_collection_items",
+        "get_notes",
+        "get_item_attachments",
         "create_item_from_identifier",
         "create_item_from_url",
         "create_item_manual",
+        "create_note",
         "batch_organize",
         "create_collection",
         "add_to_collection",
@@ -23,8 +26,9 @@ def test_server_has_all_tools():
         "attach_pdf",
         "insert_citations",
         "write_cited_document",
+        "server_status",
     }
     actual = {t.name for t in tools}
     missing = expected - actual
     assert not missing, f"Missing tools: {missing}"
-    assert len(tools) == 16
+    assert len(tools) == 18
