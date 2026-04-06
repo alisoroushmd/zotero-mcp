@@ -335,6 +335,103 @@ def get_pdf_content(item_key: str) -> str:
     return json.dumps(result, ensure_ascii=False)
 
 
+@mcp.tool(
+    description=(
+        "Check Zotero items for retractions, corrections, and errata. "
+        "Uses CrossRef (authoritative for retractions) and OpenAlex "
+        "(corrections, citation counts). Accepts one or more item keys. "
+        "Use this to audit references before submitting manuscripts or grants."
+    )
+)
+def check_retractions(item_keys: str | list[str]) -> str:
+    """Batch check items for retractions and corrections.
+
+    Args:
+        item_keys: Single key or list of Zotero item keys.
+
+    Returns:
+        JSON with per-item retraction/correction status and summary counts.
+    """
+    from concurrent.futures import ThreadPoolExecutor, as_completed
+
+    from zotero_mcp.openalex_client import OpenAlexClient
+
+    keys = _parse_list_param(item_keys) or []
+    if not keys:
+        raise ValueError("item_keys must not be empty")
+    for k in keys:
+        _validate_key(k, "item_key")
+
+    web = _get_web()
+    openalex = OpenAlexClient()
+
+    results = []
+    retracted_count = 0
+    corrected_count = 0
+
+    def _check_one(key: str) -> dict:
+        item = web.get_item(key.strip())
+        if isinstance(item, str):
+            return {"key": key, "error": "Could not read item"}
+
+        doi = item.get("DOI", "")
+        title = item.get("title", "")
+
+        entry: dict = {
+            "key": key,
+            "doi": doi,
+            "title": title,
+            "retracted": False,
+            "retraction_doi": "",
+            "retraction_date": "",
+            "corrections": [],
+            "cited_by_count": 0,
+        }
+
+        if not doi:
+            entry["warning"] = "No DOI — cannot check retraction status"
+            return entry
+
+        # CrossRef (authoritative for retractions)
+        crossref = web.check_crossref_updates(doi)
+        if crossref["has_retraction"]:
+            entry["retracted"] = True
+            entry["retraction_doi"] = crossref["retraction_doi"]
+            entry["retraction_date"] = crossref["retraction_date"]
+        entry["corrections"] = crossref["corrections"]
+
+        # OpenAlex (broader context + citation count)
+        oa_work = openalex.get_work(doi)
+        if oa_work:
+            entry["cited_by_count"] = oa_work.get("cited_by_count", 0)
+            # OpenAlex retraction flag as backup
+            if oa_work.get("is_retracted") and not entry["retracted"]:
+                entry["retracted"] = True
+                entry["retraction_source"] = "openalex"
+
+        return entry
+
+    with ThreadPoolExecutor(max_workers=3) as pool:
+        futures = {pool.submit(_check_one, k): k for k in keys}
+        for future in as_completed(futures):
+            entry = future.result()
+            results.append(entry)
+            if entry.get("retracted"):
+                retracted_count += 1
+            if entry.get("corrections"):
+                corrected_count += 1
+
+    return json.dumps(
+        {
+            "results": results,
+            "checked": len(results),
+            "retracted_count": retracted_count,
+            "corrected_count": corrected_count,
+        },
+        ensure_ascii=False,
+    )
+
+
 @mcp.tool(description="List items in a specific Zotero collection")
 def get_collection_items(collection_key: str, limit: str | int = 100) -> str:
     """Get items within a collection by its key."""

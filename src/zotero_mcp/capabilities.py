@@ -57,6 +57,7 @@ TOOL_MODES: dict[str, list[str]] = {
     "attach_pdf": ["cloud_crud"],
     "write_cited_document": ["cloud_crud"],
     "insert_citations": ["cloud_crud"],
+    "check_retractions": ["cloud_crud"],
 }
 
 
