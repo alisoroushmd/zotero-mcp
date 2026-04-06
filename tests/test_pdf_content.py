@@ -3,9 +3,6 @@
 import json
 from unittest.mock import MagicMock, patch
 
-import httpx
-import respx
-
 
 def _mock_web_client(item_data: dict, children: list | None = None):
     """Create a mock WebClient that returns given item data."""
@@ -30,20 +27,8 @@ def _mock_local_client(attachment_path: str | None = None):
     return mock
 
 
-@respx.mock
 def test_get_pdf_content_returns_pmcid_when_available():
     """If item has a PMID that maps to a PMCID, return PMC source."""
-    respx.get("https://eutils.ncbi.nlm.nih.gov/entrez/eutils/esearch.fcgi").mock(
-        return_value=httpx.Response(
-            200,
-            json={
-                "esearchresult": {
-                    "idlist": ["9046468"],
-                }
-            },
-        )
-    )
-
     item_data = {
         "key": "ABC123",
         "title": "Test Paper",
@@ -52,6 +37,7 @@ def test_get_pdf_content_returns_pmcid_when_available():
     }
 
     mock_web = _mock_web_client(item_data)
+    mock_web.resolve_pmid_to_pmcid.return_value = "PMC9046468"
     mock_local = _mock_local_client()
 
     import zotero_mcp.server as srv
@@ -64,6 +50,33 @@ def test_get_pdf_content_returns_pmcid_when_available():
 
     assert result["content_source"] == "pmc"
     assert result["pmcid"] == "PMC9046468"
+
+
+def test_get_pdf_content_falls_through_on_pmc_failure():
+    """If PMC lookup fails, fall through to PDF paths."""
+    item_data = {
+        "key": "ABC123",
+        "title": "Test Paper",
+        "DOI": "10.1234/test",
+        "url": "https://example.com/paper",
+        "extra": "PMID: 12345678",
+    }
+
+    mock_web = _mock_web_client(item_data, children=[])
+    mock_web.resolve_pmid_to_pmcid.side_effect = Exception("Network timeout")
+    mock_local = _mock_local_client()
+
+    import zotero_mcp.server as srv
+
+    with (
+        patch.object(srv, "_get_web", return_value=mock_web),
+        patch.object(srv, "_get_local", return_value=mock_local),
+    ):
+        result = json.loads(srv.get_pdf_content("ABC123"))
+
+    # Should fall through to not_found since no PDF attachments either
+    assert result["content_source"] == "not_found"
+    assert result["doi"] == "10.1234/test"
 
 
 def test_get_pdf_content_returns_local_path():

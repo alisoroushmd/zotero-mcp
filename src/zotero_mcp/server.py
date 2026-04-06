@@ -4,6 +4,7 @@ import json
 import logging
 import os
 import re
+import tempfile
 import threading
 
 from fastmcp import FastMCP
@@ -218,9 +219,6 @@ def get_pdf_content(item_key: str) -> str:
     Returns:
         JSON with content_source and the relevant identifier or path.
     """
-    import re
-    import tempfile
-
     _validate_key(item_key, "item_key")
     item_key = item_key.strip()
 
@@ -244,29 +242,20 @@ def get_pdf_content(item_key: str) -> str:
     if pmid_match:
         pmid = pmid_match.group(1)
         try:
-            import httpx as _httpx
-
-            resp = _httpx.get(
-                "https://eutils.ncbi.nlm.nih.gov/entrez/eutils/esearch.fcgi",
-                params={"db": "pmc", "term": f"{pmid}[pmid]", "retmode": "json"},
-                timeout=5.0,
-            )
-            if resp.status_code == 200:
-                ids = resp.json().get("esearchresult", {}).get("idlist", [])
-                if ids:
-                    pmcid = f"PMC{ids[0]}"
-                    return json.dumps(
-                        {
-                            "item_key": item_key,
-                            "content_source": "pmc",
-                            "pmcid": pmcid,
-                            "pmid": pmid,
-                            "message": (
-                                "Use PubMed MCP get_full_text_article with this "
-                                "PMCID for structured full text."
-                            ),
-                        }
-                    )
+            pmcid = _get_web().resolve_pmid_to_pmcid(pmid)
+            if pmcid:
+                return json.dumps(
+                    {
+                        "item_key": item_key,
+                        "content_source": "pmc",
+                        "pmcid": pmcid,
+                        "pmid": pmid,
+                        "message": (
+                            "Use PubMed MCP get_full_text_article with this "
+                            "PMCID for structured full text."
+                        ),
+                    }
+                )
         except Exception:
             pass  # Fall through to PDF paths
 
@@ -299,8 +288,8 @@ def get_pdf_content(item_key: str) -> str:
                         ),
                     }
                 )
-        except RuntimeError:
-            pass  # Local API not available
+        except Exception:
+            pass  # Local API not available or attachment lookup failed
 
         # Step 4: Download from web API
         try:
@@ -309,8 +298,13 @@ def get_pdf_content(item_key: str) -> str:
             tmp = tempfile.NamedTemporaryFile(
                 prefix="zotero_mcp_", suffix=".pdf", delete=False
             )
-            tmp.write(pdf_bytes)
-            tmp.close()
+            try:
+                tmp.write(pdf_bytes)
+                tmp.close()
+            except Exception:
+                tmp.close()
+                os.unlink(tmp.name)
+                raise
             return json.dumps(
                 {
                     "item_key": item_key,

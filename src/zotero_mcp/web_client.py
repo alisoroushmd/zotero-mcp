@@ -148,6 +148,28 @@ class WebClient:
         resp.raise_for_status()
         return resp.content
 
+    def resolve_pmid_to_pmcid(self, pmid: str) -> str | None:
+        """Convert a PubMed ID to a PubMed Central ID.
+
+        Args:
+            pmid: PubMed ID string (digits only).
+
+        Returns:
+            PMCID string (e.g. "PMC9046468"), or None if not in PMC.
+        """
+        try:
+            resp = self._pubmed_client.get(
+                "/esearch.fcgi",
+                params={"db": "pmc", "term": f"{pmid}[pmid]", "retmode": "json"},
+            )
+            if resp.status_code == 200:
+                ids = resp.json().get("esearchresult", {}).get("idlist", [])
+                if ids:
+                    return f"PMC{ids[0]}"
+        except Exception:
+            pass
+        return None
+
     # -- Read helpers for read-modify-write operations --
 
     def _read_item(self, item_key: str) -> dict:

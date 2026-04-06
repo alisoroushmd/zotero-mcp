@@ -131,7 +131,7 @@ class LocalClient:
 
         Returns:
             Local file path string, or None if the attachment has no local file
-            (e.g. linked_url attachments).
+            (e.g. linked_url attachments or imported files not yet synced locally).
         """
         resp = self._get(f"/users/0/items/{attachment_key}")
         data = resp.json().get("data", resp.json())
