@@ -480,6 +480,23 @@ def batch_organize(
 
 
 @mcp.tool(
+    description=(
+        "Scan the Zotero library for duplicate items. Groups by exact DOI "
+        "match and by title similarity. Use to audit and clean up the library. "
+        "Returns duplicate groups with item keys for review."
+    )
+)
+def find_duplicates(collection_key: str | None = None, limit: str | int = 100) -> str:
+    """Find duplicate items in the library or a collection."""
+    limit_int = _clamp_limit(limit)
+    if collection_key:
+        _validate_key(collection_key, "collection_key")
+        collection_key = collection_key.strip()
+    result = _get_web().find_duplicates(collection_key, limit_int)
+    return json.dumps(result, ensure_ascii=False)
+
+
+@mcp.tool(
     description="Create a new collection (folder) in Zotero. Optionally nest it under a parent collection."
 )
 def create_collection(name: str, parent_key: str | None = None) -> str:

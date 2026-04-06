@@ -127,3 +127,103 @@ def test_create_item_manual_checks_doi_first():
 
     assert result.get("duplicate") is True
     assert result["key"] == "EXIST3"
+
+
+def test_find_duplicates_groups_by_doi():
+    """find_duplicates groups items with identical DOIs."""
+    client = _make_client()
+    items = [
+        {
+            "key": "A1",
+            "title": "Paper One",
+            "DOI": "10.1234/same",
+            "date": "2024",
+            "item_type": "journalArticle",
+            "creators": "",
+            "collections": [],
+            "tags": [],
+            "version": 1,
+        },
+        {
+            "key": "A2",
+            "title": "Paper One (copy)",
+            "DOI": "10.1234/same",
+            "date": "2024",
+            "item_type": "journalArticle",
+            "creators": "",
+            "collections": [],
+            "tags": [],
+            "version": 2,
+        },
+        {
+            "key": "B1",
+            "title": "Unique Paper",
+            "DOI": "10.5678/unique",
+            "date": "2024",
+            "item_type": "journalArticle",
+            "creators": "",
+            "collections": [],
+            "tags": [],
+            "version": 3,
+        },
+    ]
+    import unittest.mock as mock
+
+    with mock.patch.object(client, "search_items", return_value=items):
+        result = client.find_duplicates(limit=100)
+
+    assert result["total_groups"] >= 1
+    doi_groups = [g for g in result["duplicate_groups"] if g["match_type"] == "doi"]
+    assert len(doi_groups) == 1
+    assert doi_groups[0]["doi"] == "10.1234/same"
+    assert len(doi_groups[0]["items"]) == 2
+
+
+def test_find_duplicates_groups_by_title_similarity():
+    """find_duplicates groups items with similar titles (no DOI)."""
+    client = _make_client()
+    items = [
+        {
+            "key": "C1",
+            "title": "Gastric Intestinal Metaplasia Detection",
+            "DOI": "",
+            "date": "2024",
+            "item_type": "journalArticle",
+            "creators": "",
+            "collections": [],
+            "tags": [],
+            "version": 1,
+        },
+        {
+            "key": "C2",
+            "title": "Gastric intestinal metaplasia detection: a review",
+            "DOI": "",
+            "date": "2024",
+            "item_type": "journalArticle",
+            "creators": "",
+            "collections": [],
+            "tags": [],
+            "version": 2,
+        },
+        {
+            "key": "D1",
+            "title": "Completely Different Topic",
+            "DOI": "",
+            "date": "2024",
+            "item_type": "journalArticle",
+            "creators": "",
+            "collections": [],
+            "tags": [],
+            "version": 3,
+        },
+    ]
+    import unittest.mock as mock
+
+    with mock.patch.object(client, "search_items", return_value=items):
+        result = client.find_duplicates(limit=100)
+
+    title_groups = [
+        g for g in result["duplicate_groups"] if g["match_type"] == "title_similarity"
+    ]
+    assert len(title_groups) == 1
+    assert len(title_groups[0]["items"]) == 2

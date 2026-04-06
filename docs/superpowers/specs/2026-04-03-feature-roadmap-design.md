@@ -458,6 +458,33 @@ semantic = [
 ]
 ```
 
+### Future: Feature 6 — Preprint-to-Publication Resolver
+
+**Priority:** Medium (prevents citing outdated preprints in manuscripts/grants)
+**New tool:** `check_published_versions`
+**New dependencies:** None (reuses `openalex_client.py` from Feature 3)
+
+Checks whether preprints in the library have been formally published as
+peer-reviewed journal articles. Uses OpenAlex's `is-preprint-of` relationship
+and CrossRef's `relation.is-preprint-of` field.
+
+**Tool: `check_published_versions(item_keys)`**
+
+For each item:
+1. Read DOI from Zotero (preprint DOIs start with `10.1101/` for bioRxiv/medRxiv).
+2. Query OpenAlex: `GET /works/doi:{doi}` — check `locations` for a published version
+   with a different DOI, or check `primary_location.source.type == "journal"`.
+3. Query CrossRef: `GET /works/{doi}` — check `relation.is-preprint-of` field.
+4. If a published version exists, check if it's already in the Zotero library
+   (reuse `_check_duplicate_doi`).
+5. Return per-item result with `has_published_version`, `published_doi`,
+   `published_title`, `in_library` flag.
+
+**Depends on:** Feature 3 (OpenAlexClient), Feature 4 (duplicate checking).
+**Build after:** Feature 5.
+
+---
+
 ### Build Order
 
 Features should be built in this order due to dependencies:

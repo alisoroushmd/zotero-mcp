@@ -170,6 +170,59 @@ class WebClient:
             pass
         return None
 
+    def check_crossref_updates(self, doi: str) -> dict:
+        """Check CrossRef for retractions, corrections, and errata.
+
+        Args:
+            doi: DOI to check.
+
+        Returns:
+            Dict with has_retraction, retraction_doi, retraction_date,
+            and corrections list.
+        """
+        result: dict = {
+            "has_retraction": False,
+            "retraction_doi": "",
+            "retraction_date": "",
+            "corrections": [],
+        }
+
+        try:
+            resp = httpx.get(
+                f"https://api.crossref.org/works/{doi}",
+                headers={
+                    "User-Agent": "zotero-mcp/1.0 (mailto:zotero-mcp@example.com)"
+                },
+                timeout=TIMEOUT,
+            )
+            if resp.status_code != 200:
+                return result
+            work = resp.json().get("message", {})
+        except Exception:
+            return result
+
+        updates = work.get("update-to", [])
+        for update in updates:
+            update_type = update.get("type", "").lower()
+            update_doi = update.get("DOI", "")
+            date_parts = update.get("updated", {}).get("date-parts", [[]])
+            date_str = "-".join(str(p) for p in date_parts[0]) if date_parts[0] else ""
+
+            if update_type == "retraction":
+                result["has_retraction"] = True
+                result["retraction_doi"] = update_doi
+                result["retraction_date"] = date_str
+            else:
+                result["corrections"].append(
+                    {
+                        "type": update_type,
+                        "doi": update_doi,
+                        "date": date_str,
+                    }
+                )
+
+        return result
+
     # -- Read helpers for read-modify-write operations --
 
     def _read_item(self, item_key: str) -> dict:
@@ -253,6 +306,131 @@ class WebClient:
                 return item
 
         return None
+
+    def find_duplicates(
+        self,
+        collection_key: str | None = None,
+        limit: int = 100,
+        title_threshold: float = 0.85,
+    ) -> dict:
+        """Scan library for duplicate items.
+
+        Groups by exact DOI match, then clusters remaining items by
+        normalized title similarity.
+
+        Args:
+            collection_key: Optional collection to scope the scan.
+            limit: Max items to scan.
+            title_threshold: Similarity ratio for title matching (0-1).
+
+        Returns:
+            Dict with duplicate_groups, total_groups, total_duplicate_items.
+        """
+        import re as _re
+        from difflib import SequenceMatcher
+
+        def _normalize(t: str) -> str:
+            t = t.lower().strip()
+            t = _re.sub(r"[^\w\s]", "", t)
+            t = _re.sub(r"\s+", " ", t)
+            return t
+
+        # Fetch items
+        if collection_key:
+            if self._local:
+                try:
+                    items = self._local.get_collection_items(collection_key, limit)
+                except RuntimeError:
+                    items = self.get_collection_items(collection_key, limit)
+            else:
+                items = self.get_collection_items(collection_key, limit)
+        else:
+            if self._local:
+                try:
+                    items = self._local.search_items("", limit)
+                except RuntimeError:
+                    items = self.search_items("", limit)
+            else:
+                items = self.search_items("", limit)
+
+        groups: list[dict] = []
+
+        # Phase 1: Group by exact DOI
+        doi_map: dict[str, list[dict]] = {}
+        no_doi_items: list[dict] = []
+        for item in items:
+            doi = (item.get("DOI") or "").strip().lower()
+            if doi:
+                doi_map.setdefault(doi, []).append(item)
+            else:
+                no_doi_items.append(item)
+
+        for doi, group_items in doi_map.items():
+            if len(group_items) >= 2:
+                groups.append(
+                    {
+                        "match_type": "doi",
+                        "doi": doi,
+                        "items": [
+                            {
+                                "key": i["key"],
+                                "title": i["title"],
+                                "date": i.get("date", ""),
+                            }
+                            for i in group_items
+                        ],
+                    }
+                )
+
+        # Phase 2: Cluster remaining items by title similarity
+        used: set[str] = set()
+        for i, item_a in enumerate(no_doi_items):
+            if item_a["key"] in used:
+                continue
+            norm_a = _normalize(item_a.get("title", ""))
+            if not norm_a:
+                continue
+            cluster = [item_a]
+            for item_b in no_doi_items[i + 1 :]:
+                if item_b["key"] in used:
+                    continue
+                norm_b = _normalize(item_b.get("title", ""))
+                if not norm_b:
+                    continue
+                ratio = SequenceMatcher(None, norm_a, norm_b).ratio()
+                if ratio >= title_threshold:
+                    cluster.append(item_b)
+                    used.add(item_b["key"])
+            if len(cluster) >= 2:
+                used.add(item_a["key"])
+                groups.append(
+                    {
+                        "match_type": "title_similarity",
+                        "similarity": round(
+                            SequenceMatcher(
+                                None,
+                                _normalize(cluster[0].get("title", "")),
+                                _normalize(cluster[1].get("title", "")),
+                            ).ratio(),
+                            3,
+                        ),
+                        "items": [
+                            {
+                                "key": i["key"],
+                                "title": i["title"],
+                                "date": i.get("date", ""),
+                            }
+                            for i in cluster
+                        ],
+                    }
+                )
+
+        total_dup_items = sum(len(g["items"]) for g in groups)
+        return {
+            "duplicate_groups": groups,
+            "total_groups": len(groups),
+            "total_duplicate_items": total_dup_items,
+        }
 
     def _extract_created_key(self, result: dict) -> str:
         """Extract item key from a Zotero Web API creation response."""

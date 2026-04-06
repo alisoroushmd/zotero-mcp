@@ -51,6 +51,7 @@ TOOL_MODES: dict[str, list[str]] = {
     "create_note": ["cloud_crud"],
     "create_collection": ["cloud_crud"],
     "batch_organize": ["cloud_crud"],
+    "find_duplicates": ["cloud_crud"],
     "add_to_collection": ["cloud_crud"],
     "update_item": ["cloud_crud"],
     "attach_pdf": ["cloud_crud"],
