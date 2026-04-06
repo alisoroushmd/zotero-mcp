@@ -204,6 +204,56 @@ class WebClient:
             pass  # Search failed — skip duplicate check
         return None
 
+    def _check_duplicate_title(
+        self, title: str, threshold: float = 0.90
+    ) -> dict | None:
+        """Check if a similar title already exists in the library.
+
+        Normalizes both titles (lowercase, strip punctuation) and uses
+        SequenceMatcher for fuzzy comparison.
+
+        Args:
+            title: Title to check against library.
+            threshold: Minimum similarity ratio (0-1) to consider a match.
+
+        Returns:
+            Item summary dict with added 'similarity' field, or None.
+        """
+        import re as _re
+        from difflib import SequenceMatcher
+
+        def _normalize(t: str) -> str:
+            t = t.lower().strip()
+            t = _re.sub(r"[^\w\s]", "", t)
+            t = _re.sub(r"\s+", " ", t)
+            return t
+
+        normalized = _normalize(title)
+        if not normalized:
+            return None
+
+        # Search using first few significant words
+        search_words = normalized.split()[:4]
+        search_query = " ".join(search_words)
+
+        try:
+            if self._local:
+                results = self._local.search_items(search_query, limit=20)
+            else:
+                results = self.search_items(search_query, limit=20)
+        except Exception:
+            return None
+
+        for item in results:
+            existing_normalized = _normalize(item.get("title", ""))
+            ratio = SequenceMatcher(None, normalized, existing_normalized).ratio()
+            if ratio >= threshold:
+                item["similarity"] = round(ratio, 3)
+                item["match_type"] = "title_similarity"
+                return item
+
+        return None
+
     def _extract_created_key(self, result: dict) -> str:
         """Extract item key from a Zotero Web API creation response."""
         successful = result.get("successful", result.get("success", {}))
