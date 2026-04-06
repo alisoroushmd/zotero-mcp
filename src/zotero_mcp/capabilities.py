@@ -54,6 +54,8 @@ TOOL_MODES: dict[str, list[str]] = {
     "find_duplicates": ["cloud_crud"],
     "add_to_collection": ["cloud_crud"],
     "update_item": ["cloud_crud"],
+    "trash_items": ["cloud_crud"],
+    "empty_trash": ["cloud_crud"],
     "attach_pdf": ["cloud_crud"],
     "write_cited_document": ["cloud_crud"],
     "insert_citations": ["cloud_crud"],

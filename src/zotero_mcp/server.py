@@ -621,6 +621,38 @@ def update_item(item_key: str, fields: dict) -> str:
 
 @mcp.tool(
     description=(
+        "Move Zotero items to the trash (reversible). Items can be "
+        "recovered in Zotero desktop until the trash is emptied. "
+        "Accepts one or more item keys."
+    )
+)
+def trash_items(item_keys: str | list[str]) -> str:
+    """Move items to Zotero trash."""
+    keys = _parse_list_param(item_keys) or []
+    if not keys:
+        raise ValueError("item_keys must not be empty")
+    for k in keys:
+        _validate_key(k, "item_key")
+    result = _get_web().trash_items([k.strip() for k in keys])
+    return json.dumps(result, ensure_ascii=False)
+
+
+@mcp.tool(
+    description=(
+        "Permanently delete ALL items in the Zotero trash. This is "
+        "IRREVERSIBLE. Always confirm with the user before calling this tool. "
+        "Use trash_items first to move items to trash, review them, then "
+        "empty the trash only when confirmed."
+    )
+)
+def empty_trash() -> str:
+    """Permanently delete all trashed items."""
+    result = _get_web().empty_trash()
+    return json.dumps(result, ensure_ascii=False)
+
+
+@mcp.tool(
+    description=(
         "Attach a PDF to a Zotero item. Automatically finds free PDFs via "
         "Unpaywall, PubMed Central, or bioRxiv/medRxiv using the item's DOI. "
         "If no free PDF is found, returns a message asking the user to provide "

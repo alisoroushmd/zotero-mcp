@@ -1311,6 +1311,63 @@ class WebClient:
         logger.info("Updated item %s to version %d", item_key, new_version)
         return {"key": item_key, "version": new_version}
 
+    def trash_items(self, item_keys: list[str]) -> dict:
+        """Move items to Zotero trash (reversible).
+
+        Uses DELETE /items?itemKey=KEY1,KEY2 with version header.
+        Chunks into batches of 50 (Zotero API limit).
+
+        Args:
+            item_keys: List of Zotero item keys to trash.
+
+        Returns:
+            Dict with trashed and failed key lists.
+        """
+        trashed: list[str] = []
+        failed: list[str] = []
+
+        # Get current library version
+        resp = self._web_client.get("/items", params={"limit": 0})
+        version = resp.headers.get("Last-Modified-Version", "0")
+
+        # Chunk into batches of 50
+        for i in range(0, len(item_keys), 50):
+            batch = item_keys[i : i + 50]
+            key_param = ",".join(k.strip() for k in batch)
+            try:
+                resp = self._web_client.delete(
+                    "/items",
+                    params={"itemKey": key_param},
+                    headers={"If-Unmodified-Since-Version": str(version)},
+                )
+                resp.raise_for_status()
+                version = resp.headers.get("Last-Modified-Version", version)
+                trashed.extend(batch)
+            except Exception:
+                failed.extend(batch)
+
+        return {"trashed": trashed, "failed": failed}
+
+    def empty_trash(self) -> dict:
+        """Permanently delete all items in Zotero trash.
+
+        This is irreversible. The calling tool should confirm with the user
+        before invoking this method.
+
+        Returns:
+            Dict with status.
+        """
+        # Get current library version
+        resp = self._web_client.get("/items", params={"limit": 0})
+        version = resp.headers.get("Last-Modified-Version", "0")
+
+        resp = self._web_client.delete(
+            "/items/trash",
+            headers={"If-Unmodified-Since-Version": str(version)},
+        )
+        resp.raise_for_status()
+        return {"status": "emptied"}
+
     def attach_pdf(
         self,
         parent_key: str,

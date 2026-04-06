@@ -121,7 +121,7 @@ def test_check_retractions_tool_merges_crossref_and_openalex():
 
     with (
         patch.object(srv, "_get_web", return_value=mock_web),
-        patch("zotero_mcp.server.OpenAlexClient", return_value=mock_openalex),
+        patch("zotero_mcp.openalex_client.OpenAlexClient", return_value=mock_openalex),
     ):
         result = json.loads(srv.check_retractions("ABC123"))
 
@@ -155,7 +155,7 @@ def test_check_retractions_tool_detects_retraction():
 
     with (
         patch.object(srv, "_get_web", return_value=mock_web),
-        patch("zotero_mcp.server.OpenAlexClient", return_value=mock_openalex),
+        patch("zotero_mcp.openalex_client.OpenAlexClient", return_value=mock_openalex),
     ):
         result = json.loads(srv.check_retractions("DEF456"))
 
