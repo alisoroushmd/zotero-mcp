@@ -147,6 +147,52 @@ def test_get_collection_items():
 
 
 @respx.mock
+def test_get_attachment_path_returns_path():
+    """get_attachment_path returns local file path for a stored PDF."""
+    respx.get(f"{LOCAL_BASE}/users/0/items/ATT001").mock(
+        return_value=httpx.Response(
+            200,
+            json={
+                "key": "ATT001",
+                "data": {
+                    "key": "ATT001",
+                    "itemType": "attachment",
+                    "linkMode": "imported_file",
+                    "path": "storage/ATT001/paper.pdf",
+                    "contentType": "application/pdf",
+                },
+            },
+        )
+    )
+    client = LocalClient()
+    path = client.get_attachment_path("ATT001")
+    assert path == "storage/ATT001/paper.pdf"
+
+
+@respx.mock
+def test_get_attachment_path_returns_none_for_linked_url():
+    """get_attachment_path returns None for linked_url attachments (no local file)."""
+    respx.get(f"{LOCAL_BASE}/users/0/items/ATT002").mock(
+        return_value=httpx.Response(
+            200,
+            json={
+                "key": "ATT002",
+                "data": {
+                    "key": "ATT002",
+                    "itemType": "attachment",
+                    "linkMode": "linked_url",
+                    "url": "https://example.com/paper.pdf",
+                    "contentType": "application/pdf",
+                },
+            },
+        )
+    )
+    client = LocalClient()
+    path = client.get_attachment_path("ATT002")
+    assert path is None
+
+
+@respx.mock
 def test_connection_error_gives_clear_message():
     """Connection refused gives actionable error message."""
     respx.get(f"{LOCAL_BASE}/users/0/items").mock(

@@ -123,6 +123,23 @@ class LocalClient:
             for data in children
         ]
 
+    def get_attachment_path(self, attachment_key: str) -> str | None:
+        """Get local file path for an attachment.
+
+        Args:
+            attachment_key: Zotero key of the attachment item.
+
+        Returns:
+            Local file path string, or None if the attachment has no local file
+            (e.g. linked_url attachments).
+        """
+        resp = self._get(f"/users/0/items/{attachment_key}")
+        data = resp.json().get("data", resp.json())
+        link_mode = data.get("linkMode", "")
+        if link_mode in ("imported_file", "imported_url", "linked_file"):
+            return data.get("path", None)
+        return None
+
 
 def _format_summary(item: dict) -> dict:
     """Extract key fields from a Zotero item for display."""

@@ -132,6 +132,22 @@ class WebClient:
             for data in children
         ]
 
+    def download_attachment(self, attachment_key: str) -> bytes:
+        """Download an attachment file from Zotero cloud storage.
+
+        Args:
+            attachment_key: Zotero key of the attachment item.
+
+        Returns:
+            Raw file bytes.
+
+        Raises:
+            httpx.HTTPStatusError: If the download fails (404, 403, etc.).
+        """
+        resp = self._web_client.get(f"/items/{attachment_key}/file")
+        resp.raise_for_status()
+        return resp.content
+
     # -- Read helpers for read-modify-write operations --
 
     def _read_item(self, item_key: str) -> dict:
