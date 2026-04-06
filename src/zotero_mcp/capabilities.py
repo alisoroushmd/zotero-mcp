@@ -60,6 +60,7 @@ TOOL_MODES: dict[str, list[str]] = {
     "write_cited_document": ["cloud_crud"],
     "insert_citations": ["cloud_crud"],
     "check_retractions": ["cloud_crud"],
+    "get_citation_graph": ["cloud_crud"],
 }
 
 

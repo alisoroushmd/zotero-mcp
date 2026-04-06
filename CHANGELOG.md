@@ -4,6 +4,26 @@ All notable changes to this project will be documented in this file.
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/).
 
+## [0.3.0] - 2026-04-06
+
+### Added
+- `get_pdf_content` tool — smart content router: returns PMCID (for PubMed MCP), local PDF path, web-downloaded PDF, or DOI/URL fallback
+- `check_retractions` tool — batch check items for retractions (CrossRef) and corrections/errata (OpenAlex) with citation counts
+- `find_duplicates` tool — scan library for duplicate items by exact DOI match and fuzzy title similarity
+- `get_citation_graph` tool — get citing and referenced works via OpenAlex with in-library flags
+- `trash_items` tool — move items to Zotero trash (reversible), with automatic batching for >50 items
+- `empty_trash` tool — permanently delete all trashed items (irreversible, LLM confirms with user)
+- `OpenAlexClient` module for retraction checks and citation graph traversal
+- `WebClient.resolve_pmid_to_pmcid()` for PMID-to-PMCID conversion via pooled PubMed client
+- `WebClient.check_crossref_updates()` for retraction and correction detection via CrossRef
+- `WebClient.download_attachment()` for downloading PDFs from Zotero cloud storage
+- `LocalClient.get_attachment_path()` for finding local PDF file paths
+- Duplicate detection on `create_item_from_url` (DOI check after URL resolution) and `create_item_manual` (DOI check + title similarity)
+
+### Changed
+- Tool count increased from 18 to 24
+- `create_item_from_url` and `create_item_manual` now check for duplicates before creating items
+
 ## [0.2.0] - 2026-04-02
 
 ### Added

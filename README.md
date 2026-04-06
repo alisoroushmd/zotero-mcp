@@ -2,7 +2,7 @@
 
 [![CI](https://github.com/alisoroushmd/zotero-mcp/actions/workflows/ci.yml/badge.svg)](https://github.com/alisoroushmd/zotero-mcp/actions/workflows/ci.yml)
 
-MCP server that lets AI assistants search, create, organize, and cite from a Zotero library. Produces Word documents with live Zotero field codes.
+MCP server that lets AI assistants search, create, organize, and cite from a Zotero library. Produces Word documents with live Zotero field codes. Checks for retractions, finds duplicates, and maps citation graphs.
 
 ## Quickstart
 
@@ -25,11 +25,11 @@ Get your API key and user ID at [zotero.org/settings/keys](https://www.zotero.or
 
 ## Operating modes
 
-**All 18 tools work with just API credentials** — Zotero desktop does not need to be running.
+**All 24 tools work with just API credentials** — Zotero desktop does not need to be running.
 
 | Mode | What it provides | Requirements |
 |------|-----------------|--------------|
-| **Cloud** (primary) | All reads, writes, citations, and attachments via Zotero Web API | `ZOTERO_API_KEY` + `ZOTERO_USER_ID` env vars |
+| **Cloud** (primary) | All reads, writes, citations, attachments, retraction checks, and citation graph | `ZOTERO_API_KEY` + `ZOTERO_USER_ID` env vars |
 | **Local** (optional) | Faster reads via Zotero desktop's local API — no rate limits | Zotero 7 desktop running with local API enabled |
 
 When Zotero desktop is running, reads automatically use the faster local API. When it is not, reads fall back to the Web API transparently.
@@ -37,6 +37,8 @@ When Zotero desktop is running, reads automatically use the faster local API. Wh
 Call `server_status` to check which modes are available.
 
 ## Tools
+
+### Read tools
 
 | Tool | Description |
 |------|-------------|
@@ -47,17 +49,38 @@ Call `server_status` to check which modes are available.
 | `get_collection_items` | List items in a collection |
 | `get_notes` | List child notes on an item |
 | `get_item_attachments` | List attachments with availability status |
-| `create_item_from_identifier` | Create item from DOI, PMID, or PubMed URL |
-| `create_item_from_url` | Create item from any URL |
-| `create_item_manual` | Create item with manual metadata |
+| `get_pdf_content` | Find best path to a paper's full text (PMCID, local PDF, or web download) |
+
+### Write tools
+
+| Tool | Description |
+|------|-------------|
+| `create_item_from_identifier` | Create item from DOI, PMID, or PubMed URL (with duplicate detection) |
+| `create_item_from_url` | Create item from any URL (with duplicate detection) |
+| `create_item_manual` | Create item with manual metadata (with duplicate detection) |
 | `create_note` | Attach a note to an item |
 | `create_collection` | Create a collection |
 | `batch_organize` | Bulk-add tags/collection to items |
 | `add_to_collection` | Add item to a collection |
 | `update_item` | Patch metadata fields |
 | `attach_pdf` | Attach a local or auto-downloaded PDF |
-| `write_cited_document` | Create new .docx with citations |
+| `trash_items` | Move items to trash (reversible) |
+| `empty_trash` | Permanently delete all trashed items |
+
+### Citation tools
+
+| Tool | Description |
+|------|-------------|
+| `write_cited_document` | Create new .docx with live Zotero citations |
 | `insert_citations` | Insert citations into existing .docx |
+
+### Analysis tools
+
+| Tool | Description |
+|------|-------------|
+| `check_retractions` | Check items for retractions, corrections, and errata via CrossRef + OpenAlex |
+| `find_duplicates` | Scan library for duplicate items by DOI and title similarity |
+| `get_citation_graph` | Get citing/referenced works via OpenAlex with in-library flags |
 
 ## Writing with live citations
 
@@ -87,6 +110,9 @@ After opening in Word with the Zotero plugin: click Refresh to populate the bibl
 │             │   resolves     ├──────────────────┤
 │             │ ──────────────>│ Translation Srv  │
 │             │                │ PubMed/CrossRef  │
+│             │   analysis     ├──────────────────┤
+│             │ ──────────────>│ OpenAlex         │
+│             │                │ CrossRef updates │
 └─────────────┘                └──────────────────┘
 ```
 

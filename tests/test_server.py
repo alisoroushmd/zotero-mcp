@@ -4,7 +4,7 @@ import asyncio
 
 
 def test_server_has_all_tools():
-    """Server exposes all 23 tools."""
+    """Server exposes all 24 tools."""
     from zotero_mcp.server import mcp
 
     tools = asyncio.run(mcp.list_tools())
@@ -32,8 +32,9 @@ def test_server_has_all_tools():
         "server_status",
         "get_pdf_content",
         "check_retractions",
+        "get_citation_graph",
     }
     actual = {t.name for t in tools}
     missing = expected - actual
     assert not missing, f"Missing tools: {missing}"
-    assert len(tools) == 23
+    assert len(tools) == 24

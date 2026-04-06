@@ -432,6 +432,81 @@ def check_retractions(item_keys: str | list[str]) -> str:
     )
 
 
+@mcp.tool(
+    description=(
+        "Get the citation graph for a Zotero item — who cites it and what "
+        "it cites. Uses OpenAlex. Each result is flagged with in_library "
+        "(true/false) showing whether it already exists in your Zotero. "
+        "Use direction='cited_by' to find papers citing your reference, "
+        "'references' for papers it cites, or 'both' for the full graph."
+    )
+)
+def get_citation_graph(
+    item_key: str, direction: str = "both", limit: str | int = 20
+) -> str:
+    """Get citing and/or referenced works for a Zotero item.
+
+    Args:
+        item_key: Zotero item key.
+        direction: "cited_by", "references", or "both".
+        limit: Max results per direction.
+
+    Returns:
+        JSON with cited_by and/or references lists, each with in_library flag.
+    """
+    from zotero_mcp.openalex_client import OpenAlexClient
+
+    _validate_key(item_key, "item_key")
+    limit_int = _clamp_limit(limit, lo=1, hi=50)
+
+    web = _get_web()
+    item = web.get_item(item_key.strip())
+    if isinstance(item, str):
+        return json.dumps({"error": "Could not read item metadata"})
+
+    doi = item.get("DOI", "")
+    if not doi:
+        return json.dumps(
+            {
+                "item_key": item_key,
+                "error": "No DOI on this item — cannot query citation graph",
+            }
+        )
+
+    openalex = OpenAlexClient()
+
+    def _add_library_flag(works: list[dict]) -> list[dict]:
+        for work in works:
+            work_doi = work.get("doi", "")
+            if work_doi:
+                existing = web._check_duplicate_doi(work_doi)
+                if existing:
+                    work["in_library"] = True
+                    work["zotero_key"] = existing["key"]
+                else:
+                    work["in_library"] = False
+            else:
+                work["in_library"] = False
+        return works
+
+    result: dict = {
+        "item_key": item_key,
+        "doi": doi,
+        "title": item.get("title", ""),
+    }
+
+    if direction in ("cited_by", "both"):
+        cited_by = openalex.get_citing_works(doi, limit_int)
+        result["cited_by"] = _add_library_flag(cited_by)
+        result["cited_by_count"] = len(cited_by)
+
+    if direction in ("references", "both"):
+        references = openalex.get_references(doi)
+        result["references"] = _add_library_flag(references)
+
+    return json.dumps(result, ensure_ascii=False)
+
+
 @mcp.tool(description="List items in a specific Zotero collection")
 def get_collection_items(collection_key: str, limit: str | int = 100) -> str:
     """Get items within a collection by its key."""

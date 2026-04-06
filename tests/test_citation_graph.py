@@ -94,3 +94,55 @@ def test_get_citing_works_returns_empty_for_unknown_doi():
     client = OpenAlexClient()
     results = client.get_citing_works("10.1234/unknown", limit=10)
     assert results == []
+
+
+import json
+from unittest.mock import MagicMock, patch
+
+
+def test_get_citation_graph_tool_with_in_library_flag():
+    """get_citation_graph flags which citing papers are in library."""
+    mock_web = MagicMock()
+    mock_web.get_item.return_value = {
+        "key": "ABC123",
+        "title": "My Paper",
+        "DOI": "10.1234/mine",
+    }
+    # First DOI is in library, second is not
+    mock_web._check_duplicate_doi.side_effect = [
+        {"key": "XYZ789", "title": "Already Have This"},  # in library
+        None,  # not in library
+    ]
+
+    mock_openalex = MagicMock()
+    mock_openalex.get_citing_works.return_value = [
+        {
+            "openalex_id": "W1",
+            "title": "In Library Paper",
+            "doi": "10.5678/inlib",
+            "year": 2025,
+            "authors": "A B",
+        },
+        {
+            "openalex_id": "W2",
+            "title": "New Paper",
+            "doi": "10.5678/new",
+            "year": 2025,
+            "authors": "C D",
+        },
+    ]
+    mock_openalex.get_references.return_value = []
+
+    import zotero_mcp.server as srv
+
+    with (
+        patch.object(srv, "_get_web", return_value=mock_web),
+        patch("zotero_mcp.openalex_client.OpenAlexClient", return_value=mock_openalex),
+    ):
+        result = json.loads(srv.get_citation_graph("ABC123"))
+
+    assert result["cited_by_count"] == 2
+    assert result["cited_by"][0]["in_library"] is True
+    assert result["cited_by"][0]["zotero_key"] == "XYZ789"
+    assert result["cited_by"][1]["in_library"] is False
+    assert "zotero_key" not in result["cited_by"][1]
