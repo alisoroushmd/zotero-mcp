@@ -44,6 +44,7 @@ TOOL_MODES: dict[str, list[str]] = {
     "get_collection_items": ["any_read"],
     "get_notes": ["any_read"],
     "get_item_attachments": ["any_read"],
+    "get_pdf_content": ["any_read"],
     "create_item_from_identifier": ["cloud_crud"],
     "create_item_from_url": ["cloud_crud"],
     "create_item_manual": ["cloud_crud"],

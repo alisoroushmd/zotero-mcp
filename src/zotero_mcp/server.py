@@ -201,6 +201,146 @@ def get_item_attachments(parent_key: str) -> str:
     return json.dumps(results, ensure_ascii=False)
 
 
+@mcp.tool(
+    description=(
+        "Find the best way to access a Zotero item's full-text content. "
+        "Returns a PMCID (for PubMed MCP full-text retrieval), a local PDF "
+        "file path (for Claude's Read tool), or a DOI/URL fallback. "
+        "Call this before trying to read a paper's content."
+    )
+)
+def get_pdf_content(item_key: str) -> str:
+    """Route to the best available content source for a Zotero item.
+
+    Args:
+        item_key: Zotero item key.
+
+    Returns:
+        JSON with content_source and the relevant identifier or path.
+    """
+    import re
+    import tempfile
+
+    _validate_key(item_key, "item_key")
+    item_key = item_key.strip()
+
+    # Read item metadata
+    item = _read_local_or_web("get_item", item_key)
+    if isinstance(item, str):
+        return json.dumps(
+            {
+                "item_key": item_key,
+                "content_source": "error",
+                "message": "Could not read item metadata.",
+            }
+        )
+
+    doi = item.get("DOI", "")
+    extra = item.get("extra", "")
+    url = item.get("url", "")
+
+    # Step 1: Check for PMCID via PMID
+    pmid_match = re.search(r"PMID:\s*(\d+)", extra)
+    if pmid_match:
+        pmid = pmid_match.group(1)
+        try:
+            import httpx as _httpx
+
+            resp = _httpx.get(
+                "https://eutils.ncbi.nlm.nih.gov/entrez/eutils/esearch.fcgi",
+                params={"db": "pmc", "term": f"{pmid}[pmid]", "retmode": "json"},
+                timeout=5.0,
+            )
+            if resp.status_code == 200:
+                ids = resp.json().get("esearchresult", {}).get("idlist", [])
+                if ids:
+                    pmcid = f"PMC{ids[0]}"
+                    return json.dumps(
+                        {
+                            "item_key": item_key,
+                            "content_source": "pmc",
+                            "pmcid": pmcid,
+                            "pmid": pmid,
+                            "message": (
+                                "Use PubMed MCP get_full_text_article with this "
+                                "PMCID for structured full text."
+                            ),
+                        }
+                    )
+        except Exception:
+            pass  # Fall through to PDF paths
+
+    # Step 2: Check for PDF attachments
+    try:
+        children = _read_local_or_web("get_children", item_key, item_type="attachment")
+    except Exception:
+        children = []
+
+    pdf_attachments = [c for c in children if c.get("contentType") == "application/pdf"]
+
+    if pdf_attachments:
+        att = pdf_attachments[0]
+        att_key = att.get("key", "")
+
+        # Step 3: Try local file path (fastest)
+        try:
+            local = _get_local()
+            local_path = local.get_attachment_path(att_key)
+            if local_path:
+                return json.dumps(
+                    {
+                        "item_key": item_key,
+                        "content_source": "local_pdf",
+                        "pdf_path": local_path,
+                        "attachment_key": att_key,
+                        "message": (
+                            "PDF available locally. Read this file path for "
+                            "full content."
+                        ),
+                    }
+                )
+        except RuntimeError:
+            pass  # Local API not available
+
+        # Step 4: Download from web API
+        try:
+            web = _get_web()
+            pdf_bytes = web.download_attachment(att_key)
+            tmp = tempfile.NamedTemporaryFile(
+                prefix="zotero_mcp_", suffix=".pdf", delete=False
+            )
+            tmp.write(pdf_bytes)
+            tmp.close()
+            return json.dumps(
+                {
+                    "item_key": item_key,
+                    "content_source": "web_pdf",
+                    "pdf_path": tmp.name,
+                    "attachment_key": att_key,
+                    "message": (
+                        "PDF downloaded from Zotero cloud storage. Read this "
+                        "file path for full content."
+                    ),
+                }
+            )
+        except Exception:
+            pass  # Fall through to not_found
+
+    # Step 5: No PDF, return DOI/URL fallback
+    result: dict = {
+        "item_key": item_key,
+        "content_source": "not_found",
+        "message": (
+            "No PDF attached. Try accessing via DOI or ask the user for the file."
+        ),
+    }
+    if doi:
+        result["doi"] = doi
+    if url:
+        result["url"] = url
+    return json.dumps(result, ensure_ascii=False)
+
+
 @mcp.tool(description="List items in a specific Zotero collection")
 def get_collection_items(collection_key: str, limit: str | int = 100) -> str:
     """Get items within a collection by its key."""

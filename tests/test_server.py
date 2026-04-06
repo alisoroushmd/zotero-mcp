@@ -27,8 +27,9 @@ def test_server_has_all_tools():
         "insert_citations",
         "write_cited_document",
         "server_status",
+        "get_pdf_content",
     }
     actual = {t.name for t in tools}
     missing = expected - actual
     assert not missing, f"Missing tools: {missing}"
-    assert len(tools) == 18
+    assert len(tools) == 19
