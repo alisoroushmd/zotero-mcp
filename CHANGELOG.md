@@ -4,6 +4,21 @@ All notable changes to this project will be documented in this file.
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/).
 
+## [Unreleased]
+
+### Changed
+- Web API reads now catch `httpx.TimeoutException` and return actionable error messages instead of silent hangs
+- Search requests use a dedicated 45s timeout to accommodate large libraries via Web API
+- Tool descriptions shortened for faster LLM processing
+- Read-only tools annotated with `readOnlyHint`, `empty_trash` marked `destructiveHint`
+- Citation graph library-membership checks parallelized (5 concurrent workers)
+- OpenAlex `get_references` parallelized (5 concurrent workers, was sequential)
+- `find_duplicates` computes title similarity during iteration instead of redundant recomputation
+- `check_retractions` and `get_item_attachments` return only populated fields, reducing response size
+
+### Fixed
+- `_read_local_or_web` web fallback could let `httpx.TimeoutException` propagate unhandled
+
 ## [0.3.0] - 2026-04-06
 
 ### Added

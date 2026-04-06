@@ -21,7 +21,10 @@ logger = logging.getLogger(__name__)
 WEB_BASE = "https://api.zotero.org"
 TRANSLATE_URL = "https://translate.zotero.org/search"
 TRANSLATE_WEB_URL = "https://translate.zotero.org/web"
-TIMEOUT = 10.0
+TIMEOUT = httpx.Timeout(10.0, connect=5.0)
+SEARCH_TIMEOUT = httpx.Timeout(
+    45.0, connect=5.0
+)  # searches can be slow on large libraries
 
 
 class WebClient:
@@ -67,6 +70,7 @@ class WebClient:
         resp = self._web_client.get(
             "/items/top",
             params={"q": query, "limit": limit},
+            timeout=SEARCH_TIMEOUT,
         )
         resp.raise_for_status()
         return [_format_summary(item) for item in resp.json()]
@@ -391,6 +395,7 @@ class WebClient:
             if not norm_a:
                 continue
             cluster = [item_a]
+            first_ratio = 0.0
             for item_b in no_doi_items[i + 1 :]:
                 if item_b["key"] in used:
                     continue
@@ -399,6 +404,8 @@ class WebClient:
                     continue
                 ratio = SequenceMatcher(None, norm_a, norm_b).ratio()
                 if ratio >= title_threshold:
+                    if not cluster[1:]:
+                        first_ratio = ratio
                     cluster.append(item_b)
                     used.add(item_b["key"])
             if len(cluster) >= 2:
@@ -406,14 +413,7 @@ class WebClient:
                 groups.append(
                     {
                         "match_type": "title_similarity",
-                        "similarity": round(
-                            SequenceMatcher(
-                                None,
-                                _normalize(cluster[0].get("title", "")),
-                                _normalize(cluster[1].get("title", "")),
-                            ).ratio(),
-                            3,
-                        ),
+                        "similarity": round(first_ratio, 3),
                         "items": [
                             {
                                 "key": i["key"],

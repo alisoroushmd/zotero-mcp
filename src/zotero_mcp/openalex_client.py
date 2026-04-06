@@ -113,7 +113,7 @@ class OpenAlexClient:
     def get_references(self, doi: str) -> list[dict]:
         """Get works referenced by the given DOI.
 
-        Resolves each referenced_works OpenAlex ID individually.
+        Fetches referenced works in parallel (up to 5 concurrent).
         Limited to first 20 references to avoid excessive API calls.
 
         Args:
@@ -122,20 +122,27 @@ class OpenAlexClient:
         Returns:
             List of work summary dicts.
         """
+        from concurrent.futures import ThreadPoolExecutor
+
         work = self.get_work(doi)
         if not work:
             return []
 
         ref_ids = work.get("referenced_works", [])[:20]
-        results: list[dict] = []
+        if not ref_ids:
+            return []
 
-        for ref_url in ref_ids:
+        def _fetch_one(ref_url: str) -> dict | None:
             ref_id = ref_url.split("/")[-1]
             try:
                 resp = self._client.get(f"/works/{ref_id}")
                 if resp.status_code == 200:
-                    results.append(self._format_work_summary(resp.json()))
+                    return self._format_work_summary(resp.json())
             except Exception:
-                continue
+                pass
+            return None
 
-        return results
+        with ThreadPoolExecutor(max_workers=5) as pool:
+            fetched = list(pool.map(_fetch_one, ref_ids))
+
+        return [r for r in fetched if r is not None]

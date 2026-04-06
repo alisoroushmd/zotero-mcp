@@ -1,6 +1,9 @@
-"""Tests for MCP server tool registration."""
+"""Tests for MCP server tool registration and timeout handling."""
 
 import asyncio
+from unittest.mock import patch
+
+import pytest
 
 
 def test_server_has_all_tools():
@@ -38,3 +41,22 @@ def test_server_has_all_tools():
     missing = expected - actual
     assert not missing, f"Missing tools: {missing}"
     assert len(tools) == 24
+
+
+def test_read_local_or_web_httpx_timeout():
+    """Web fallback converts httpx.TimeoutException to RuntimeError."""
+    import httpx
+
+    import zotero_mcp.server as srv
+
+    def _timeout_method(*args, **kwargs):
+        raise httpx.ReadTimeout("timed out")
+
+    with (
+        patch.object(srv, "_local_failed", True),
+        patch.object(srv, "_get_web") as mock_web,
+    ):
+        mock_web.return_value.search_items = _timeout_method
+
+        with pytest.raises(RuntimeError, match="timed out.*ReadTimeout"):
+            srv._read_local_or_web("search_items", "test", 10)

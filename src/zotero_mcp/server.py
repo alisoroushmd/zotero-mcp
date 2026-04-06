@@ -6,7 +6,7 @@ import os
 import re
 import tempfile
 import threading
-
+import httpx
 from fastmcp import FastMCP
 
 from zotero_mcp.capabilities import check_capabilities, format_status
@@ -112,11 +112,8 @@ def _parse_list_param(value: str | list | None) -> list | None:
 
 
 @mcp.tool(
-    description=(
-        "Check which operating modes are available. Call this first to "
-        "understand what tools will work. Reports Local Read, Cloud CRUD, "
-        "and Live Citation mode status with fix instructions."
-    )
+    description="Check available operating modes and fix instructions",
+    annotations={"readOnlyHint": True},
 )
 def server_status() -> str:
     """Probe Zotero services and report available modes and tools."""
@@ -133,17 +130,30 @@ def _read_local_or_web(local_method: str, *args, **kwargs):
         local = _get_local()
         return getattr(local, local_method)(*args, **kwargs)
     except RuntimeError:
-        return getattr(_get_web(), local_method)(*args, **kwargs)
+        try:
+            return getattr(_get_web(), local_method)(*args, **kwargs)
+        except httpx.TimeoutException as exc:
+            raise RuntimeError(
+                f"Zotero Web API timed out ({exc.__class__.__name__}). "
+                "Try a more specific query, reduce the limit, or start "
+                "Zotero desktop for faster local searches."
+            ) from exc
 
 
-@mcp.tool(description="Search items in Zotero library by keyword")
+@mcp.tool(
+    description="Search items in Zotero library by keyword",
+    annotations={"readOnlyHint": True},
+)
 def search_items(query: str, limit: str | int = 25) -> str:
     """Search for items by keyword. Excludes attachments and notes."""
     results = _read_local_or_web("search_items", query, _clamp_limit(limit))
     return json.dumps(results, ensure_ascii=False)
 
 
-@mcp.tool(description="Get detailed metadata for a single Zotero item")
+@mcp.tool(
+    description="Get detailed metadata for a single Zotero item",
+    annotations={"readOnlyHint": True},
+)
 def get_item(item_key: str, format: str = "json") -> str:
     """Get full metadata or BibTeX for one item by its key."""
     _validate_key(item_key, "item_key")
@@ -153,7 +163,10 @@ def get_item(item_key: str, format: str = "json") -> str:
     return json.dumps(result, ensure_ascii=False)
 
 
-@mcp.tool(description="List all collections in the Zotero library")
+@mcp.tool(
+    description="List all collections in the Zotero library",
+    annotations={"readOnlyHint": True},
+)
 def get_collections() -> str:
     """Returns flat list of collections with key, name, parent, and item count."""
     results = _read_local_or_web("get_collections")
@@ -161,10 +174,8 @@ def get_collections() -> str:
 
 
 @mcp.tool(
-    description=(
-        "Get child notes attached to a Zotero item. Returns note content "
-        "(HTML), tags, and modification date for each note."
-    )
+    description="Get child notes attached to a Zotero item",
+    annotations={"readOnlyHint": True},
 )
 def get_notes(parent_key: str) -> str:
     """Get all notes attached to a parent item."""
@@ -174,11 +185,8 @@ def get_notes(parent_key: str) -> str:
 
 
 @mcp.tool(
-    description=(
-        "List attachments on a Zotero item with availability status. "
-        "Returns filename, content type, link mode, and whether the "
-        "file is available locally, in cloud storage, or metadata-only."
-    )
+    description="List attachments on a Zotero item with availability status",
+    annotations={"readOnlyHint": True},
 )
 def get_item_attachments(parent_key: str) -> str:
     """Get attachments for a parent item with availability classification."""
@@ -200,24 +208,17 @@ def get_item_attachments(parent_key: str) -> str:
         results.append(
             {
                 "key": att.get("key", ""),
-                "title": att.get("title", ""),
                 "filename": att.get("filename", ""),
                 "contentType": att.get("contentType", ""),
-                "linkMode": link_mode,
                 "availability": link_mode_map.get(link_mode, "metadata_only"),
-                "path": att.get("path", ""),
             }
         )
     return json.dumps(results, ensure_ascii=False)
 
 
 @mcp.tool(
-    description=(
-        "Find the best way to access a Zotero item's full-text content. "
-        "Returns a PMCID (for PubMed MCP full-text retrieval), a local PDF "
-        "file path (for Claude's Read tool), or a DOI/URL fallback. "
-        "Call this before trying to read a paper's content."
-    )
+    description="Route to best full-text source (PMCID, local PDF, DOI)",
+    annotations={"readOnlyHint": True},
 )
 def get_pdf_content(item_key: str) -> str:
     """Route to the best available content source for a Zotero item.
@@ -259,10 +260,7 @@ def get_pdf_content(item_key: str) -> str:
                         "content_source": "pmc",
                         "pmcid": pmcid,
                         "pmid": pmid,
-                        "message": (
-                            "Use PubMed MCP get_full_text_article with this "
-                            "PMCID for structured full text."
-                        ),
+                        "message": "Use PubMed MCP get_full_text_article(pmcid)",
                     }
                 )
         except Exception:
@@ -291,10 +289,7 @@ def get_pdf_content(item_key: str) -> str:
                         "content_source": "local_pdf",
                         "pdf_path": local_path,
                         "attachment_key": att_key,
-                        "message": (
-                            "PDF available locally. Read this file path for "
-                            "full content."
-                        ),
+                        "message": "Read this PDF path",
                     }
                 )
         except Exception:
@@ -320,10 +315,7 @@ def get_pdf_content(item_key: str) -> str:
                     "content_source": "web_pdf",
                     "pdf_path": tmp.name,
                     "attachment_key": att_key,
-                    "message": (
-                        "PDF downloaded from Zotero cloud storage. Read this "
-                        "file path for full content."
-                    ),
+                    "message": "Read this PDF path",
                 }
             )
         except Exception:
@@ -334,7 +326,7 @@ def get_pdf_content(item_key: str) -> str:
         "item_key": item_key,
         "content_source": "not_found",
         "message": (
-            "No PDF attached. Try accessing via DOI or ask the user for the file."
+            "No PDF attached. Try DOI or ask user for the file."
         ),
     }
     if doi:
@@ -345,12 +337,8 @@ def get_pdf_content(item_key: str) -> str:
 
 
 @mcp.tool(
-    description=(
-        "Check Zotero items for retractions, corrections, and errata. "
-        "Uses CrossRef (authoritative for retractions) and OpenAlex "
-        "(corrections, citation counts). Accepts one or more item keys. "
-        "Use this to audit references before submitting manuscripts or grants."
-    )
+    description="Check items for retractions/corrections via CrossRef + OpenAlex",
+    annotations={"readOnlyHint": True}
 )
 def check_retractions(item_keys: str | list[str]) -> str:
     """Batch check items for retractions and corrections.
@@ -386,20 +374,13 @@ def check_retractions(item_keys: str | list[str]) -> str:
         doi = item.get("DOI", "")
         title = item.get("title", "")
 
-        entry: dict = {
-            "key": key,
-            "doi": doi,
-            "title": title,
-            "retracted": False,
-            "retraction_doi": "",
-            "retraction_date": "",
-            "corrections": [],
-            "cited_by_count": 0,
-        }
+        entry: dict = {"key": key, "title": title, "retracted": False}
 
         if not doi:
             entry["warning"] = "No DOI — cannot check retraction status"
             return entry
+
+        entry["doi"] = doi
 
         # CrossRef (authoritative for retractions)
         crossref = web.check_crossref_updates(doi)
@@ -407,12 +388,15 @@ def check_retractions(item_keys: str | list[str]) -> str:
             entry["retracted"] = True
             entry["retraction_doi"] = crossref["retraction_doi"]
             entry["retraction_date"] = crossref["retraction_date"]
-        entry["corrections"] = crossref["corrections"]
+        if crossref["corrections"]:
+            entry["corrections"] = crossref["corrections"]
 
         # OpenAlex (broader context + citation count)
         oa_work = openalex.get_work(doi)
         if oa_work:
-            entry["cited_by_count"] = oa_work.get("cited_by_count", 0)
+            cited_by = oa_work.get("cited_by_count", 0)
+            if cited_by:
+                entry["cited_by_count"] = cited_by
             # OpenAlex retraction flag as backup
             if oa_work.get("is_retracted") and not entry["retracted"]:
                 entry["retracted"] = True
@@ -442,13 +426,8 @@ def check_retractions(item_keys: str | list[str]) -> str:
 
 
 @mcp.tool(
-    description=(
-        "Get the citation graph for a Zotero item — who cites it and what "
-        "it cites. Uses OpenAlex. Each result is flagged with in_library "
-        "(true/false) showing whether it already exists in your Zotero. "
-        "Use direction='cited_by' to find papers citing your reference, "
-        "'references' for papers it cites, or 'both' for the full graph."
-    )
+    description="Get citing/referenced works for an item via OpenAlex",
+    annotations={"readOnlyHint": True}
 )
 def get_citation_graph(
     item_key: str, direction: str = "both", limit: str | int = 20
@@ -484,16 +463,22 @@ def get_citation_graph(
 
     openalex = OpenAlexClient()
 
-    def _add_library_flag(works: list[dict]) -> list[dict]:
-        for work in works:
-            work_doi = work.get("doi", "")
-            if work_doi:
-                existing = web._check_duplicate_doi(work_doi)
-                if existing:
-                    work["in_library"] = True
-                    work["zotero_key"] = existing["key"]
-                else:
-                    work["in_library"] = False
+    def _add_library_flags(works: list[dict]) -> list[dict]:
+        """Batch-check library membership using ThreadPoolExecutor."""
+        from concurrent.futures import ThreadPoolExecutor
+
+        dois = [w.get("doi", "") for w in works]
+
+        def _check_doi(d: str) -> dict | None:
+            return web._check_duplicate_doi(d) if d else None
+
+        with ThreadPoolExecutor(max_workers=5) as pool:
+            existing_items = list(pool.map(_check_doi, dois))
+
+        for work, existing in zip(works, existing_items):
+            if existing:
+                work["in_library"] = True
+                work["zotero_key"] = existing["key"]
             else:
                 work["in_library"] = False
         return works
@@ -506,17 +491,20 @@ def get_citation_graph(
 
     if direction in ("cited_by", "both"):
         cited_by = openalex.get_citing_works(doi, limit_int)
-        result["cited_by"] = _add_library_flag(cited_by)
+        result["cited_by"] = _add_library_flags(cited_by)
         result["cited_by_count"] = len(cited_by)
 
     if direction in ("references", "both"):
         references = openalex.get_references(doi)
-        result["references"] = _add_library_flag(references)
+        result["references"] = _add_library_flags(references)
 
     return json.dumps(result, ensure_ascii=False)
 
 
-@mcp.tool(description="List items in a specific Zotero collection")
+@mcp.tool(
+    description="List items in a specific Zotero collection",
+    annotations={"readOnlyHint": True},
+)
 def get_collection_items(collection_key: str, limit: str | int = 100) -> str:
     """Get items within a collection by its key."""
     _validate_key(collection_key, "collection_key")
@@ -530,10 +518,7 @@ def get_collection_items(collection_key: str, limit: str | int = 100) -> str:
 
 
 @mcp.tool(
-    description=(
-        "Create a Zotero item from a PMID, DOI, or PubMed URL. "
-        "Resolves metadata automatically via Zotero's translation server."
-    )
+    description="Create a Zotero item from a PMID, DOI, or PubMed URL"
 )
 def create_item_from_identifier(
     identifier: str,
@@ -552,11 +537,7 @@ def create_item_from_identifier(
 
 
 @mcp.tool(
-    description=(
-        "Create a Zotero item from a URL (web page, FDA document, preprint, "
-        "dataset documentation, etc.). Scrapes metadata when possible, "
-        "falls back to a basic webpage item with the URL."
-    )
+    description="Create a Zotero item from a URL (webpage, preprint, etc.)"
 )
 def create_item_from_url(
     url: str,
@@ -572,13 +553,7 @@ def create_item_from_url(
 
 
 @mcp.tool(
-    description=(
-        "Create a Zotero item with manually provided metadata. "
-        "Use when no DOI/PMID/URL can resolve the item. Claude populates "
-        "fields from context (web search results, user input, etc.). "
-        "Supports all Zotero item types: journalArticle, report, webpage, "
-        "document, statute, hearing, book, bookSection, etc."
-    )
+    description="Create item with manually provided metadata"
 )
 def create_item_manual(
     item_type: str,
@@ -622,11 +597,7 @@ def create_item_manual(
 
 
 @mcp.tool(
-    description=(
-        "Create a note attached to a Zotero item. Use for annotations, "
-        "quality assessments, 'What's New' summaries, or any structured "
-        "commentary on a reference. Content can be HTML or plain text."
-    )
+    description="Create a note attached to a Zotero item (HTML or plain text)"
 )
 def create_note(
     parent_key: str,
@@ -641,12 +612,7 @@ def create_note(
 
 
 @mcp.tool(
-    description=(
-        "Add tags and/or a collection to multiple Zotero items at once. "
-        "Before calling this, use get_item on each item to read the abstract "
-        "and title, then suggest appropriate tags based on the content. "
-        "Ask the user to approve the suggested tags before applying."
-    )
+    description="Add tags and/or collection to multiple items at once"
 )
 def batch_organize(
     item_keys: str | list[str],
@@ -661,11 +627,8 @@ def batch_organize(
 
 
 @mcp.tool(
-    description=(
-        "Scan the Zotero library for duplicate items. Groups by exact DOI "
-        "match and by title similarity. Use to audit and clean up the library. "
-        "Returns duplicate groups with item keys for review."
-    )
+    description="Scan library for duplicate items (DOI match + title similarity)",
+    annotations={"readOnlyHint": True}
 )
 def find_duplicates(collection_key: str | None = None, limit: str | int = 100) -> str:
     """Find duplicate items in the library or a collection."""
@@ -678,7 +641,7 @@ def find_duplicates(collection_key: str | None = None, limit: str | int = 100) -
 
 
 @mcp.tool(
-    description="Create a new collection (folder) in Zotero. Optionally nest it under a parent collection."
+    description="Create a new collection (folder), optionally nested under a parent"
 )
 def create_collection(name: str, parent_key: str | None = None) -> str:
     """Create a collection. Returns the new collection key."""
@@ -704,11 +667,7 @@ def update_item(item_key: str, fields: dict) -> str:
 
 
 @mcp.tool(
-    description=(
-        "Move Zotero items to the trash (reversible). Items can be "
-        "recovered in Zotero desktop until the trash is emptied. "
-        "Accepts one or more item keys."
-    )
+    description="Move items to trash (reversible). Accepts one or more keys."
 )
 def trash_items(item_keys: str | list[str]) -> str:
     """Move items to Zotero trash."""
@@ -722,12 +681,8 @@ def trash_items(item_keys: str | list[str]) -> str:
 
 
 @mcp.tool(
-    description=(
-        "Permanently delete ALL items in the Zotero trash. This is "
-        "IRREVERSIBLE. Always confirm with the user before calling this tool. "
-        "Use trash_items first to move items to trash, review them, then "
-        "empty the trash only when confirmed."
-    )
+    description="Permanently delete ALL trashed items (IRREVERSIBLE)",
+    annotations={"destructiveHint": True}
 )
 def empty_trash() -> str:
     """Permanently delete all trashed items."""
@@ -736,12 +691,7 @@ def empty_trash() -> str:
 
 
 @mcp.tool(
-    description=(
-        "Attach a PDF to a Zotero item. Automatically finds free PDFs via "
-        "Unpaywall, PubMed Central, or bioRxiv/medRxiv using the item's DOI. "
-        "If no free PDF is found, returns a message asking the user to provide "
-        "the file path. Use pdf_path to attach a user-provided local PDF."
-    )
+    description="Attach a PDF to an item (auto-downloads or accepts local path)"
 )
 def attach_pdf(
     parent_key: str,
@@ -799,14 +749,7 @@ def _fetch_item_metadata(item_keys: list[str]) -> tuple[dict[str, dict], list[st
 
 
 @mcp.tool(
-    description=(
-        "Insert live Zotero citations into an existing Word document (.docx). "
-        "Scans paragraphs and tables for [@ITEM_KEY] markers, replaces them "
-        "with Zotero field codes, and appends a bibliography. Preserves all "
-        "existing document formatting (styles, headers, images, page layout). "
-        "Use this instead of write_cited_document when you need to add "
-        "citations to a document that already has formatting you want to keep."
-    )
+    description="Insert live Zotero citations into an existing .docx"
 )
 def insert_citations(document_path: str, output_path: str | None = None) -> str:
     """Insert Zotero citation field codes into an existing Word document.
@@ -879,13 +822,7 @@ def insert_citations(document_path: str, output_path: str | None = None) -> str:
 
 
 @mcp.tool(
-    description=(
-        "Write a Word document (.docx) with live Zotero citations. "
-        "Use [@ITEM_KEY] markers in the content to insert citations. "
-        "Supports grouped citations like [@KEY1, @KEY2]. "
-        "Produces Vancouver-style superscript numbers and a bibliography. "
-        "The Zotero Word plugin will recognize these as live citations."
-    )
+    description="Write a .docx with live Zotero citations from markdown + [@KEY] markers"
 )
 def write_cited_document(content: str, output_path: str) -> str:
     """Write a Word document with live Zotero field codes.
