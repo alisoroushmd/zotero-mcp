@@ -740,6 +740,19 @@ class WebClient:
         if title:
             metadata["title"] = title
 
+        # Check for duplicate by DOI
+        doi = metadata.get("DOI", "")
+        if doi:
+            existing = self._check_duplicate_doi(doi)
+            if existing:
+                return {
+                    "key": existing["key"],
+                    "title": existing["title"],
+                    "duplicate": True,
+                    "match_type": "doi",
+                    "message": f"Item already exists in library with DOI {doi}",
+                }
+
         # Ensure URL is preserved on the item
         if "url" not in metadata:
             metadata["url"] = url
@@ -854,6 +867,30 @@ class WebClient:
         for zotero_field, value in field_mapping.items():
             if value:
                 metadata[zotero_field] = value
+
+        # Check for duplicates: DOI first, then title similarity
+        if doi:
+            existing = self._check_duplicate_doi(doi)
+            if existing:
+                return {
+                    "key": existing["key"],
+                    "title": existing["title"],
+                    "duplicate": True,
+                    "match_type": "doi",
+                    "message": f"Item already exists in library with DOI {doi}",
+                }
+
+        if not doi and title:
+            existing = self._check_duplicate_title(title)
+            if existing:
+                return {
+                    "key": existing["key"],
+                    "title": existing.get("title", ""),
+                    "duplicate": True,
+                    "match_type": existing.get("match_type", "title_similarity"),
+                    "similarity": existing.get("similarity", 0),
+                    "message": "Similar item already exists in library",
+                }
 
         self._apply_collections_and_tags(metadata, collection_keys, tags)
 
