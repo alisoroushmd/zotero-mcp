@@ -40,7 +40,7 @@ def test_search_items_returns_summaries():
             ],
         )
     )
-    client = LocalClient()
+    client = LocalClient(probe=False)
     results = client.search_items("test")
     assert len(results) == 1
     assert results[0]["key"] == "ABC123"
@@ -70,7 +70,7 @@ def test_get_item_json():
             },
         )
     )
-    client = LocalClient()
+    client = LocalClient(probe=False)
     result = client.get_item("ABC123")
     assert result["title"] == "Test Paper"
     assert result["DOI"] == "10.1234/test"
@@ -86,7 +86,7 @@ def test_get_item_bibtex():
             headers={"content-type": "text/plain"},
         )
     )
-    client = LocalClient()
+    client = LocalClient(probe=False)
     result = client.get_item("ABC123", fmt="bibtex")
     assert "@article" in result
 
@@ -110,7 +110,7 @@ def test_get_collections():
             ],
         )
     )
-    client = LocalClient()
+    client = LocalClient(probe=False)
     results = client.get_collections()
     assert len(results) == 1
     assert results[0]["name"] == "Oncology"
@@ -140,7 +140,7 @@ def test_get_collection_items():
             ],
         )
     )
-    client = LocalClient()
+    client = LocalClient(probe=False)
     results = client.get_collection_items("COL1")
     assert len(results) == 1
     assert results[0]["title"] == "Collection Paper"
@@ -164,7 +164,7 @@ def test_get_attachment_path_returns_path():
             },
         )
     )
-    client = LocalClient()
+    client = LocalClient(probe=False)
     path = client.get_attachment_path("ATT001")
     assert path == "storage/ATT001/paper.pdf"
 
@@ -187,7 +187,7 @@ def test_get_attachment_path_returns_none_for_linked_url():
             },
         )
     )
-    client = LocalClient()
+    client = LocalClient(probe=False)
     path = client.get_attachment_path("ATT002")
     assert path is None
 
@@ -198,6 +198,6 @@ def test_connection_error_gives_clear_message():
     respx.get(f"{LOCAL_BASE}/users/0/items").mock(
         side_effect=httpx.ConnectError("Connection refused")
     )
-    client = LocalClient()
+    client = LocalClient(probe=False)
     with pytest.raises(RuntimeError, match="Local Read mode requires Zotero desktop"):
         client.search_items("test")

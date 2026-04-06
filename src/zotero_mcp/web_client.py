@@ -65,8 +65,8 @@ class WebClient:
         from zotero_mcp.local_client import _format_summary
 
         resp = self._web_client.get(
-            "/items",
-            params={"q": query, "limit": limit, "itemType": "-attachment || -note"},
+            "/items/top",
+            params={"q": query, "limit": limit},
         )
         resp.raise_for_status()
         return [_format_summary(item) for item in resp.json()]
@@ -102,8 +102,8 @@ class WebClient:
         from zotero_mcp.local_client import _format_summary
 
         resp = self._web_client.get(
-            f"/collections/{collection_key}/items",
-            params={"limit": limit, "itemType": "-attachment || -note"},
+            f"/collections/{collection_key}/items/top",
+            params={"limit": limit},
         )
         resp.raise_for_status()
         return [_format_summary(item) for item in resp.json()]

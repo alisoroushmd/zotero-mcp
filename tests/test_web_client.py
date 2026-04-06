@@ -257,7 +257,7 @@ def test_create_item_duplicate_doi_returns_existing():
 
     from zotero_mcp.local_client import LocalClient
 
-    local = LocalClient()
+    local = LocalClient(probe=False)
     client = WebClient(api_key="test-key", user_id="12345", local_client=local)
     result = client.create_item_from_identifier("10.1234/existing")
     assert result["key"] == "EXISTING1"
@@ -302,7 +302,7 @@ def test_add_to_collection():
 
     from zotero_mcp.local_client import LocalClient
 
-    local = LocalClient()
+    local = LocalClient(probe=False)
     client = WebClient(api_key="test-key", user_id="12345", local_client=local)
     result = client.add_to_collection("ITEM1", "COL2")
     assert "COL1" in result["collections"]
@@ -332,7 +332,7 @@ def test_update_item():
 
     from zotero_mcp.local_client import LocalClient
 
-    local = LocalClient()
+    local = LocalClient(probe=False)
     client = WebClient(api_key="test-key", user_id="12345", local_client=local)
     result = client.update_item("ITEM1", {"title": "New Title"})
     assert result["key"] == "ITEM1"
@@ -360,7 +360,7 @@ def test_update_item_version_conflict():
 
     from zotero_mcp.local_client import LocalClient
 
-    local = LocalClient()
+    local = LocalClient(probe=False)
     client = WebClient(api_key="test-key", user_id="12345", local_client=local)
     with pytest.raises(RuntimeError, match="Version conflict.*ITEM1.*retry"):
         client.update_item("ITEM1", {"title": "New"})

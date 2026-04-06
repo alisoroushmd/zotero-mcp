@@ -13,9 +13,21 @@ TIMEOUT = 5.0
 class LocalClient:
     """Read-only client for Zotero's local HTTP API."""
 
-    def __init__(self, base_url: str = LOCAL_BASE) -> None:
+    def __init__(self, base_url: str = LOCAL_BASE, *, probe: bool = True) -> None:
         self._base = base_url
         self._client = httpx.Client(base_url=base_url, timeout=TIMEOUT)
+        if probe:
+            # Probe connectivity immediately so _get_local() fails fast
+            # when Zotero desktop is not running (avoids 5s timeout per call)
+            try:
+                self._client.get("/users/0/items", params={"limit": 0})
+            except httpx.ConnectError:
+                raise RuntimeError(
+                    "Local Read mode requires Zotero desktop running at localhost:23119. "
+                    "Start Zotero and enable: Settings > Advanced > General > "
+                    "'Allow other applications on this computer to communicate with Zotero'. "
+                    "Call server_status to check which modes are available."
+                )
 
     def _get(self, path: str, params: dict | None = None) -> httpx.Response:
         """GET request to local API with connection error handling."""
