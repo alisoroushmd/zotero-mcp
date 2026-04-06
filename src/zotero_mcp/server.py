@@ -26,6 +26,7 @@ mcp = FastMCP(
 )
 
 _local: LocalClient | None = None
+_local_failed: bool = False  # cache probe failure so we don't retry every call
 _web: WebClient | None = None
 _init_lock = threading.Lock()
 
@@ -47,11 +48,19 @@ def _clamp_limit(value: str | int, lo: int = 1, hi: int = 100) -> int:
 
 def _get_local() -> LocalClient:
     """Lazy-initialize the local client (thread-safe)."""
-    global _local
+    global _local, _local_failed
+    if _local_failed:
+        raise RuntimeError("Local API unavailable (cached)")
     if _local is None:
         with _init_lock:
+            if _local_failed:
+                raise RuntimeError("Local API unavailable (cached)")
             if _local is None:
-                _local = LocalClient()
+                try:
+                    _local = LocalClient()
+                except RuntimeError:
+                    _local_failed = True
+                    raise
     return _local
 
 
