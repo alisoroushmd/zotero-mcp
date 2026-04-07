@@ -6,6 +6,8 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/).
 
 ## [Unreleased]
 
+## [0.4.0] - 2026-04-07
+
 ### Added
 
 - `get_tags` tool — list all tags in the library, optionally filtered by prefix
