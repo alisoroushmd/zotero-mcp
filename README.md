@@ -25,7 +25,7 @@ Get your API key and user ID at [zotero.org/settings/keys](https://www.zotero.or
 
 ## Operating modes
 
-**All 27 tools work with just API credentials** — Zotero desktop does not need to be running.
+**All 28 tools work with just API credentials** — Zotero desktop does not need to be running.
 
 | Mode | What it provides | Requirements |
 | --- | --- | --- |
@@ -81,9 +81,10 @@ Call `server_status` to check which modes are available.
 
 | Tool                   | Description                                                                  |
 | ---------------------- | ---------------------------------------------------------------------------- |
-| `check_retractions`  | Check items for retractions, corrections, and errata via CrossRef + OpenAlex |
-| `find_duplicates`    | Scan library for duplicate items by DOI and title similarity                 |
-| `get_citation_graph` | Get citing/referenced works via OpenAlex with in-library flags               |
+| `check_retractions`        | Check items for retractions, corrections, and errata via CrossRef + OpenAlex      |
+| `find_duplicates`          | Scan library for duplicate items by DOI and title similarity                      |
+| `get_citation_graph`       | Get citing/referenced works via OpenAlex with in-library flags                    |
+| `check_published_versions` | Check if preprints have been formally published; reports journal and in-library status |
 
 ## Writing with live citations
 

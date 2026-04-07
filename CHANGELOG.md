@@ -6,6 +6,16 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/).
 
 ## [Unreleased]
 
+### Added
+
+- `check_published_versions` tool — checks whether preprints in the library have been
+  formally published in a peer-reviewed journal. Uses CrossRef `relation.is-preprint-of`
+  (authoritative) and OpenAlex location data (journal name). Reports published DOI, journal
+  name, and whether the published version is already saved in the library.
+- `OpenAlexClient.check_published_version(doi)` — detects preprint type and finds journal
+  locations in OpenAlex work metadata
+- `WebClient.check_crossref_published(doi)` — reads CrossRef `relation.is-preprint-of` field
+
 ## [0.4.0] - 2026-04-07
 
 ### Added

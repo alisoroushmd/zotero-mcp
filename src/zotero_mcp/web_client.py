@@ -301,6 +301,43 @@ class WebClient:
 
         return result
 
+    def check_crossref_published(self, doi: str) -> dict:
+        """Check CrossRef for a published journal version of a preprint.
+
+        Reads the ``relation.is-preprint-of`` field, which publishers populate
+        when a preprint DOI is linked to its final journal article.
+
+        Args:
+            doi: DOI to check (typically a bioRxiv/medRxiv DOI starting with 10.1101/).
+
+        Returns:
+            Dict with published_doi (str | None).
+        """
+        result: dict = {"published_doi": None}
+        try:
+            resp = httpx.get(
+                f"https://api.crossref.org/works/{doi}",
+                headers={
+                    "User-Agent": "zotero-mcp/1.0 (mailto:zotero-mcp@example.com)"
+                },
+                timeout=TIMEOUT,
+            )
+            if resp.status_code != 200:
+                return result
+            work = resp.json().get("message", {})
+        except Exception as exc:
+            logger.warning(
+                "CrossRef published-version check failed for %s: %s", doi, exc
+            )
+            return result
+
+        for item in work.get("relation", {}).get("is-preprint-of", []):
+            if item.get("id-type") == "doi" and item.get("id"):
+                result["published_doi"] = item["id"]
+                break
+
+        return result
+
     # -- Read helpers for read-modify-write operations --
 
     def _read_item(self, item_key: str) -> dict:

@@ -843,6 +843,99 @@ def rename_tag(old_tag: str, new_tag: str) -> str:
     return json.dumps(result, ensure_ascii=False)
 
 
+@mcp.tool(
+    description=(
+        "Check if preprints in the library have been formally published in a peer-reviewed journal. "
+        "Uses CrossRef (authoritative) and OpenAlex. Reports published DOI, journal name, "
+        "and whether the published version is already in the library."
+    ),
+    annotations={"readOnlyHint": True},
+)
+@_handle_tool_errors
+def check_published_versions(item_keys: str | list[str]) -> str:
+    """Check for published journal versions of preprints.
+
+    Args:
+        item_keys: Single key or list of Zotero item keys (typically preprints).
+
+    Returns:
+        JSON with per-item results and a summary count of items with published versions.
+    """
+    from concurrent.futures import ThreadPoolExecutor, as_completed
+
+    from zotero_mcp.openalex_client import OpenAlexClient
+
+    keys = _parse_list_param(item_keys) or []
+    if not keys:
+        raise ValueError("item_keys must not be empty")
+    for k in keys:
+        _validate_key(k, "item_key")
+
+    web = _get_web()
+    openalex = OpenAlexClient()
+
+    published_count = 0
+    results: list[dict] = []
+
+    def _check_one(key: str) -> dict:
+        item = web.get_item(key.strip())
+        if isinstance(item, str):
+            return {"key": key, "error": "Could not read item"}
+
+        doi = item.get("DOI", "")
+        title = item.get("title", "")
+        entry: dict = {"key": key, "title": title, "has_published_version": False}
+
+        if not doi:
+            entry["warning"] = "No DOI — cannot check for published version"
+            return entry
+
+        entry["doi"] = doi
+
+        # CrossRef is authoritative for preprint→article links
+        crossref = web.check_crossref_published(doi)
+        published_doi = crossref.get("published_doi")
+
+        # OpenAlex for confirmation and journal name
+        oa = openalex.check_published_version(doi)
+        entry["is_preprint"] = oa.get("is_preprint", doi.startswith("10.1101/"))
+
+        # Use CrossRef DOI if available; fall back to OpenAlex
+        if not published_doi and oa.get("published_doi"):
+            published_doi = oa["published_doi"]
+
+        if published_doi:
+            entry["has_published_version"] = True
+            entry["published_doi"] = published_doi
+            if oa.get("journal"):
+                entry["journal"] = oa["journal"]
+            existing = web._check_duplicate_doi(published_doi)
+            if existing:
+                entry["in_library"] = True
+                entry["zotero_key"] = existing.get("key")
+            else:
+                entry["in_library"] = False
+
+        return entry
+
+    with ThreadPoolExecutor(max_workers=3) as pool:
+        futures = {pool.submit(_check_one, k): k for k in keys}
+        for future in as_completed(futures):
+            entry = future.result()
+            results.append(entry)
+            if entry.get("has_published_version"):
+                published_count += 1
+
+    return json.dumps(
+        {
+            "results": results,
+            "checked": len(results),
+            "published_count": published_count,
+        },
+        ensure_ascii=False,
+    )
+
+
 @mcp.tool(description="Attach a PDF to an item (auto-downloads or accepts local path)")
 @_handle_tool_errors
 def attach_pdf(

@@ -148,3 +148,50 @@ class OpenAlexClient:
             fetched = list(pool.map(_fetch_one, ref_ids))
 
         return [r for r in fetched if r is not None]
+
+    def check_published_version(self, doi: str) -> dict:
+        """Check if a preprint DOI has been formally published in a journal.
+
+        Inspects the work's type and locations in OpenAlex. A preprint is
+        identified by type=="preprint" or primary_location.source.type=="repository".
+        A published version is signalled by a location with source.type=="journal"
+        whose landing_page_url contains a doi.org link.
+
+        Args:
+            doi: DOI of the preprint (e.g. "10.1101/2024.01.01.123456").
+
+        Returns:
+            Dict with:
+            - is_preprint (bool): whether the item looks like a preprint
+            - published_doi (str | None): DOI of published version, if found
+            - journal (str | None): journal display name, if found
+        """
+        work = self.get_work(doi)
+        if not work:
+            return {"is_preprint": False, "published_doi": None, "journal": None}
+
+        # Determine if this work is a preprint
+        is_preprint = work.get("type") == "preprint"
+        if not is_preprint:
+            primary = work.get("primary_location") or {}
+            source = primary.get("source") or {}
+            is_preprint = source.get("type") == "repository"
+
+        if not is_preprint:
+            return {"is_preprint": False, "published_doi": None, "journal": None}
+
+        # Look for a journal location with a DOI
+        for loc in work.get("locations", []):
+            source = loc.get("source") or {}
+            if source.get("type") == "journal":
+                url = loc.get("landing_page_url", "")
+                published_doi = None
+                if "doi.org/" in url:
+                    published_doi = url.split("doi.org/")[-1].strip()
+                return {
+                    "is_preprint": True,
+                    "published_doi": published_doi,
+                    "journal": source.get("display_name"),
+                }
+
+        return {"is_preprint": True, "published_doi": None, "journal": None}
