@@ -61,6 +61,9 @@ TOOL_MODES: dict[str, list[str]] = {
     "insert_citations": ["cloud_crud"],
     "check_retractions": ["cloud_crud"],
     "get_citation_graph": ["cloud_crud"],
+    "get_tags": ["any_read"],
+    "remove_tag": ["cloud_crud"],
+    "rename_tag": ["cloud_crud"],
 }
 
 

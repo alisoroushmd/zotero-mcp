@@ -6,7 +6,17 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/).
 
 ## [Unreleased]
 
+### Added
+
+- `get_tags` tool — list all tags in the library, optionally filtered by prefix
+- `remove_tag` tool — remove a tag from every item in the library (destructive)
+- `rename_tag` tool — rename a tag across every item in the library
+- `_retry_request` helper in `web_client.py` — exponential backoff for write operations
+- `_error_response` / `_handle_tool_errors` decorator in `server.py` — structured JSON error responses instead of unhandled exceptions
+
 ### Changed
+
+- Tool count increased from 24 to 27
 - Web API reads now catch `httpx.TimeoutException` and return actionable error messages instead of silent hangs
 - Search requests use a dedicated 45s timeout to accommodate large libraries via Web API
 - Tool descriptions shortened for faster LLM processing
@@ -17,11 +27,13 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/).
 - `check_retractions` and `get_item_attachments` return only populated fields, reducing response size
 
 ### Fixed
+
 - `_read_local_or_web` web fallback could let `httpx.TimeoutException` propagate unhandled
 
 ## [0.3.0] - 2026-04-06
 
 ### Added
+
 - `get_pdf_content` tool — smart content router: returns PMCID (for PubMed MCP), local PDF path, web-downloaded PDF, or DOI/URL fallback
 - `check_retractions` tool — batch check items for retractions (CrossRef) and corrections/errata (OpenAlex) with citation counts
 - `find_duplicates` tool — scan library for duplicate items by exact DOI match and fuzzy title similarity
@@ -36,12 +48,14 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/).
 - Duplicate detection on `create_item_from_url` (DOI check after URL resolution) and `create_item_manual` (DOI check + title similarity)
 
 ### Changed
+
 - Tool count increased from 18 to 24
 - `create_item_from_url` and `create_item_manual` now check for duplicates before creating items
 
 ## [0.2.0] - 2026-04-02
 
 ### Added
+
 - Web API read path — all 18 tools work with just API credentials, Zotero desktop no longer required
 - `server_status` tool reports available operating modes with fix instructions
 - `get_item_attachments` tool with canonical availability states (stored_remote, stored_local, linked_local, metadata_only)
@@ -51,6 +65,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/).
 - Claude Desktop DXT manifest for one-click extension install
 
 ### Changed
+
 - Read routing: local API is now an optional fast path, Web API is the primary read path with automatic fallback
 - Read-modify-write operations (update_item, batch_organize, add_to_collection) fall back to web reads when desktop is closed
 - Citation tools (write_cited_document, insert_citations) no longer require Zotero desktop
@@ -60,6 +75,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/).
 - Error messages reference operating mode names with actionable fix instructions
 
 ### Fixed
+
 - Web client initializes independently when Zotero desktop is closed
 - test_server.py expected tool set was missing get_notes and create_note
 
@@ -68,6 +84,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/).
 ### Added
 
 #### Read tools (Local API)
+
 - `search_items` — keyword search across library, excludes attachments and notes
 - `get_item` — full metadata or BibTeX for a single item
 - `get_collections` — list all collections with parent info and item counts
@@ -75,6 +92,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/).
 - `get_notes` — child notes attached to an item
 
 #### Write tools (Web API)
+
 - `create_item_from_identifier` — create item from DOI, PMID, or PubMed URL with duplicate detection
 - `create_item_from_url` — create item from any URL with translation server scraping
 - `create_item_manual` — create item with manually supplied metadata
@@ -86,10 +104,12 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/).
 - `attach_pdf` — attach local PDF or auto-download via Unpaywall/PMC/bioRxiv
 
 #### Citation and document tools
+
 - `write_cited_document` — create new .docx with live Zotero field codes from markdown
 - `insert_citations` — insert citations into existing .docx, preserving formatting
 
 #### Identifier resolution
+
 - Zotero translation server as primary resolver
 - PubMed efetch fallback with abstract extraction and publication type mapping
 - CrossRef fallback for all DOI-registered content (books, conference papers, datasets)
