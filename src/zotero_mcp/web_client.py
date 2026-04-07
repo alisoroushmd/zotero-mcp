@@ -27,6 +27,58 @@ SEARCH_TIMEOUT = httpx.Timeout(
 )  # searches can be slow on large libraries
 
 
+def _is_valid_pdf(content: bytes) -> bool:
+    """Validate PDF by magic bytes rather than content length."""
+    return len(content) >= 5 and content[:5] == b"%PDF-"
+
+
+def _retry_request(
+    fn,
+    max_attempts: int = 3,
+    base_delay: float = 1.0,
+) -> httpx.Response:
+    """Call fn() and retry on 429 with exponential backoff.
+
+    Args:
+        fn: Zero-argument callable that returns an httpx.Response.
+        max_attempts: Maximum number of attempts (including first).
+        base_delay: Base sleep in seconds; doubles each retry.
+
+    Returns:
+        The successful response.
+
+    Raises:
+        httpx.HTTPStatusError: If rate-limited on the final attempt.
+    """
+    resp = fn()
+    for attempt in range(1, max_attempts):
+        if resp.status_code != 429:
+            return resp
+        retry_after = float(
+            resp.headers.get("Retry-After", base_delay * (2 ** (attempt - 1)))
+        )
+        delay = min(retry_after, 30.0)
+        logger.warning(
+            "Rate limited (429), retrying in %.1fs (attempt %d/%d)",
+            delay,
+            attempt,
+            max_attempts,
+        )
+        time.sleep(delay)
+        resp = fn()
+    if resp.status_code == 429:
+        try:
+            resp.raise_for_status()
+        except RuntimeError:
+            # Response has no request attached (e.g. in tests); raise directly
+            raise httpx.HTTPStatusError(
+                f"429 Too Many Requests after {max_attempts} attempts",
+                request=httpx.Request("GET", ""),
+                response=resp,
+            )
+    return resp
+
+
 class WebClient:
     """Primary client for Zotero Web API — handles reads and writes.
 
@@ -63,13 +115,34 @@ class WebClient:
 
     # -- Web API read methods (primary read path) --
 
-    def search_items(self, query: str, limit: int = 25) -> list[dict]:
-        """Search items via Web API. Excludes attachments and notes."""
+    def search_items(
+        self,
+        query: str,
+        limit: int = 25,
+        item_type: str | None = None,
+        tag: str | None = None,
+    ) -> list[dict]:
+        """Search items via Web API. Excludes attachments and notes.
+
+        Args:
+            query: Keyword search string.
+            limit: Max results (1–100).
+            item_type: Filter by Zotero item type, e.g. "journalArticle".
+            tag: Filter by tag name (exact match).
+
+        Returns:
+            List of item summary dicts.
+        """
         from zotero_mcp.local_client import _format_summary
 
+        params: dict = {"q": query, "limit": limit}
+        if item_type:
+            params["itemType"] = item_type
+        if tag:
+            params["tag"] = tag
         resp = self._web_client.get(
             "/items/top",
-            params={"q": query, "limit": limit},
+            params=params,
             timeout=SEARCH_TIMEOUT,
         )
         resp.raise_for_status()
@@ -170,8 +243,8 @@ class WebClient:
                 ids = resp.json().get("esearchresult", {}).get("idlist", [])
                 if ids:
                     return f"PMC{ids[0]}"
-        except Exception:
-            pass
+        except Exception as exc:
+            logger.warning("PMID→PMCID lookup failed for %s: %s", pmid, exc)
         return None
 
     def check_crossref_updates(self, doi: str) -> dict:
@@ -202,7 +275,8 @@ class WebClient:
             if resp.status_code != 200:
                 return result
             work = resp.json().get("message", {})
-        except Exception:
+        except Exception as exc:
+            logger.warning("CrossRef update check failed for %s: %s", doi, exc)
             return result
 
         updates = work.get("update-to", [])
@@ -257,8 +331,8 @@ class WebClient:
             for item in results:
                 if item.get("DOI", "").strip().lower() == doi.strip().lower():
                     return item
-        except Exception:
-            pass  # Search failed — skip duplicate check
+        except Exception as exc:
+            logger.warning("Duplicate DOI check failed for %s: %s", doi, exc)
         return None
 
     def _check_duplicate_title(
@@ -492,7 +566,7 @@ class WebClient:
         self._apply_collections_and_tags(metadata, collection_keys, tags)
 
         # Create item via Web API
-        resp = self._web_client.post("/items", json=[metadata])
+        resp = _retry_request(lambda: self._web_client.post("/items", json=[metadata]))
         resp.raise_for_status()
 
         key = self._extract_created_key(resp.json())
@@ -589,7 +663,8 @@ class WebClient:
             )
             resp.raise_for_status()
             return self._parse_pubmed_xml(resp.text, pmid)
-        except Exception:
+        except Exception as exc:
+            logger.warning("PubMed efetch failed for PMID %s: %s", pmid, exc)
             return None
 
     @staticmethod
@@ -749,7 +824,8 @@ class WebClient:
             if not work:
                 return None
             return self._parse_crossref_work(work, doi)
-        except Exception:
+        except Exception as exc:
+            logger.warning("CrossRef resolve failed for %s: %s", identifier, exc)
             return None
 
     @staticmethod
@@ -890,8 +966,8 @@ class WebClient:
             items = resp.json()
             if items and len(items) > 0:
                 metadata = items[0]
-        except Exception:
-            pass
+        except Exception as exc:
+            logger.warning("Translation server /web failed for %s: %s", url, exc)
 
         # Fallback: try to extract a DOI from the URL and resolve it
         if not metadata:
@@ -937,7 +1013,7 @@ class WebClient:
 
         self._apply_collections_and_tags(metadata, collection_keys, tags)
 
-        resp = self._web_client.post("/items", json=[metadata])
+        resp = _retry_request(lambda: self._web_client.post("/items", json=[metadata]))
         resp.raise_for_status()
 
         key = self._extract_created_key(resp.json())
@@ -1072,7 +1148,7 @@ class WebClient:
 
         self._apply_collections_and_tags(metadata, collection_keys, tags)
 
-        resp = self._web_client.post("/items", json=[metadata])
+        resp = _retry_request(lambda: self._web_client.post("/items", json=[metadata]))
         resp.raise_for_status()
 
         key = self._extract_created_key(resp.json())
@@ -1106,7 +1182,7 @@ class WebClient:
             "tags": [{"tag": t} for t in (tags or [])],
         }
 
-        resp = self._web_client.post("/items", json=[note_data])
+        resp = _retry_request(lambda: self._web_client.post("/items", json=[note_data]))
         resp.raise_for_status()
 
         key = self._extract_created_key(resp.json())
@@ -1240,7 +1316,9 @@ class WebClient:
             Dict with "key", "name", and "parent_key".
         """
         payload = [{"name": name, "parentCollection": parent_key or False}]
-        resp = self._web_client.post("/collections", json=payload)
+        resp = _retry_request(
+            lambda: self._web_client.post("/collections", json=payload)
+        )
         resp.raise_for_status()
 
         key = self._extract_created_key(resp.json())
@@ -1267,10 +1345,12 @@ class WebClient:
         version = item.get("version", 0)
         collections = list(set(item.get("collections", []) + [collection_key]))
 
-        resp = self._web_client.patch(
-            f"/items/{item_key}",
-            headers={"If-Unmodified-Since-Version": str(version)},
-            json={"collections": collections},
+        resp = _retry_request(
+            lambda: self._web_client.patch(
+                f"/items/{item_key}",
+                headers={"If-Unmodified-Since-Version": str(version)},
+                json={"collections": collections},
+            )
         )
         resp.raise_for_status()
 
@@ -1294,10 +1374,12 @@ class WebClient:
         item = self._read_item(item_key)
         version = item.get("version", 0)
 
-        resp = self._web_client.patch(
-            f"/items/{item_key}",
-            headers={"If-Unmodified-Since-Version": str(version)},
-            json=fields,
+        resp = _retry_request(
+            lambda: self._web_client.patch(
+                f"/items/{item_key}",
+                headers={"If-Unmodified-Since-Version": str(version)},
+                json=fields,
+            )
         )
 
         if resp.status_code == 412:
@@ -1368,6 +1450,120 @@ class WebClient:
         resp.raise_for_status()
         return {"status": "emptied"}
 
+    def get_tags(self, prefix: str = "") -> list[str]:
+        """Return all tags in the library, optionally filtered by prefix.
+
+        Args:
+            prefix: Only return tags starting with this string (case-sensitive).
+
+        Returns:
+            Sorted list of tag strings.
+        """
+        params: dict = {"limit": 100}
+        if prefix:
+            params["q"] = prefix
+        tags: list[str] = []
+        start = 0
+        while True:
+            params["start"] = start
+            resp = self._web_client.get("/tags", params=params)
+            resp.raise_for_status()
+            page = resp.json()
+            if not page:
+                break
+            tags.extend(t["tag"] for t in page)
+            if len(page) < 100:
+                break
+            start += 100
+        return sorted(tags)
+
+    def remove_tag(self, tag: str) -> dict:
+        """Remove a tag from every item in the library.
+
+        Args:
+            tag: Exact tag name to delete.
+
+        Returns:
+            Dict with "tag" and "status".
+        """
+        # Get current library version for the If-Unmodified-Since-Version header
+        resp = self._web_client.get("/items", params={"limit": 0})
+        version = resp.headers.get("Last-Modified-Version", "0")
+
+        resp = self._web_client.delete(
+            f"/tags/{tag}",
+            headers={"If-Unmodified-Since-Version": str(version)},
+        )
+        resp.raise_for_status()
+        logger.info("Removed tag %r from library", tag)
+        return {"tag": tag, "status": "removed"}
+
+    def rename_tag(self, old_tag: str, new_tag: str) -> dict:
+        """Rename a tag across all items in the library.
+
+        Fetches every item carrying old_tag, replaces the tag name in-place,
+        and PATCHes each item. Uses parallel requests for speed.
+
+        Args:
+            old_tag: Current tag name.
+            new_tag: Replacement tag name.
+
+        Returns:
+            Dict with updated count and failed keys.
+        """
+        from concurrent.futures import ThreadPoolExecutor, as_completed
+
+        # Collect all items with this tag
+        items: list[dict] = []
+        start = 0
+        while True:
+            resp = self._web_client.get(
+                "/items", params={"tag": old_tag, "limit": 100, "start": start}
+            )
+            resp.raise_for_status()
+            page = resp.json()
+            if not page:
+                break
+            items.extend(page)
+            if len(page) < 100:
+                break
+            start += 100
+
+        updated: list[str] = []
+        failed: list[str] = []
+
+        def _patch_item(item: dict) -> tuple[str, bool]:
+            key = item["data"]["key"]
+            version = item["data"].get("version", 0)
+            tags = item["data"].get("tags", [])
+            new_tags = [{"tag": new_tag} if t["tag"] == old_tag else t for t in tags]
+            patch_resp = self._web_client.patch(
+                f"/items/{key}",
+                json={"tags": new_tags},
+                headers={"If-Unmodified-Since-Version": str(version)},
+            )
+            return key, patch_resp.status_code in (200, 204)
+
+        with ThreadPoolExecutor(max_workers=5) as pool:
+            futures = {pool.submit(_patch_item, item): item for item in items}
+            for fut in as_completed(futures):
+                key, ok = fut.result()
+                (updated if ok else failed).append(key)
+
+        logger.info(
+            "Renamed tag %r → %r: %d updated, %d failed",
+            old_tag,
+            new_tag,
+            len(updated),
+            len(failed),
+        )
+        return {
+            "old_tag": old_tag,
+            "new_tag": new_tag,
+            "updated": len(updated),
+            "failed": failed,
+        }
+
     def attach_pdf(
         self,
         parent_key: str,
@@ -1410,8 +1606,8 @@ class WebClient:
                     item = self._local.get_item(parent_key)
                     if isinstance(item, dict):
                         doi = item.get("DOI", "")
-                except Exception:
-                    pass
+                except Exception as exc:
+                    logger.warning("Local DOI read failed for %s: %s", parent_key, exc)
 
             if doi:
                 pdf_bytes, filename, source = self._download_free_pdf(doi)
@@ -1447,68 +1643,90 @@ class WebClient:
         resp.raise_for_status()
         attach_key = self._extract_created_key(resp.json())
 
-        # Step 2: Get upload authorization
-        md5_hash = hashlib.md5(pdf_bytes).hexdigest()
-        file_size = len(pdf_bytes)
+        try:
+            # Step 2: Get upload authorization
+            md5_hash = hashlib.md5(pdf_bytes).hexdigest()
+            file_size = len(pdf_bytes)
 
-        auth_resp = self._web_client.post(
-            f"/items/{attach_key}/file",
-            headers={
-                "If-None-Match": "*",
-                "Content-Type": "application/x-www-form-urlencoded",
-            },
-            content=urlencode(
-                {
-                    "md5": md5_hash,
+            auth_resp = self._web_client.post(
+                f"/items/{attach_key}/file",
+                headers={
+                    "If-None-Match": "*",
+                    "Content-Type": "application/x-www-form-urlencoded",
+                },
+                content=urlencode(
+                    {
+                        "md5": md5_hash,
+                        "filename": filename,
+                        "filesize": file_size,
+                        "mtime": int(time.time() * 1000),
+                    }
+                ),
+            )
+            auth_resp.raise_for_status()
+            auth_data = auth_resp.json()
+
+            if auth_data.get("exists"):
+                return {
+                    "status": "exists",
+                    "attachment_key": attach_key,
                     "filename": filename,
-                    "filesize": file_size,
-                    "mtime": int(time.time() * 1000),
+                    "source": source,
+                    "message": "File already exists in Zotero storage.",
                 }
-            ),
-        )
-        auth_resp.raise_for_status()
-        auth_data = auth_resp.json()
 
-        if auth_data.get("exists"):
-            return {
-                "status": "exists",
-                "attachment_key": attach_key,
-                "filename": filename,
-                "source": source,
-                "message": "File already exists in Zotero storage.",
-            }
+            # Step 3: Upload to Zotero storage
+            upload_url = auth_data["url"]
+            upload_prefix = auth_data.get("prefix", b"")
+            upload_suffix = auth_data.get("suffix", b"")
+            upload_content_type = auth_data.get("contentType", "application/pdf")
 
-        # Step 3: Upload to Zotero storage
-        upload_url = auth_data["url"]
-        upload_prefix = auth_data.get("prefix", b"")
-        upload_suffix = auth_data.get("suffix", b"")
-        upload_content_type = auth_data.get("contentType", "application/pdf")
+            if isinstance(upload_prefix, str):
+                upload_prefix = upload_prefix.encode()
+            if isinstance(upload_suffix, str):
+                upload_suffix = upload_suffix.encode()
 
-        if isinstance(upload_prefix, str):
-            upload_prefix = upload_prefix.encode()
-        if isinstance(upload_suffix, str):
-            upload_suffix = upload_suffix.encode()
+            upload_body = upload_prefix + pdf_bytes + upload_suffix
 
-        upload_body = upload_prefix + pdf_bytes + upload_suffix
+            upload_resp = httpx.post(
+                upload_url,
+                content=upload_body,
+                headers={"Content-Type": upload_content_type},
+                timeout=60.0,
+            )
+            upload_resp.raise_for_status()
 
-        upload_resp = httpx.post(
-            upload_url,
-            content=upload_body,
-            headers={"Content-Type": upload_content_type},
-            timeout=60.0,
-        )
-        upload_resp.raise_for_status()
+            # Step 4: Register upload
+            register_resp = self._web_client.post(
+                f"/items/{attach_key}/file",
+                headers={
+                    "If-None-Match": "*",
+                    "Content-Type": "application/x-www-form-urlencoded",
+                },
+                content=urlencode({"upload": auth_data["uploadKey"]}),
+            )
+            register_resp.raise_for_status()
 
-        # Step 4: Register upload
-        register_resp = self._web_client.post(
-            f"/items/{attach_key}/file",
-            headers={
-                "If-None-Match": "*",
-                "Content-Type": "application/x-www-form-urlencoded",
-            },
-            content=urlencode({"upload": auth_data["uploadKey"]}),
-        )
-        register_resp.raise_for_status()
+        except Exception:
+            # Clean up orphaned attachment item so it doesn't pollute the library
+            try:
+                ver_resp = self._web_client.get("/items", params={"limit": 0})
+                version = ver_resp.headers.get("Last-Modified-Version", "0")
+                self._web_client.delete(
+                    "/items",
+                    params={"itemKey": attach_key},
+                    headers={"If-Unmodified-Since-Version": version},
+                )
+                logger.warning(
+                    "Cleaned up orphan attachment %s after upload failure", attach_key
+                )
+            except Exception as cleanup_exc:
+                logger.warning(
+                    "Failed to clean up orphan attachment %s: %s",
+                    attach_key,
+                    cleanup_exc,
+                )
+            raise
 
         logger.info("Attached PDF %s to item %s (%s)", filename, parent_key, source)
         return {
@@ -1547,10 +1765,10 @@ class WebClient:
                 pdf_url = best_oa.get("url_for_pdf") if best_oa else None
                 if pdf_url:
                     pdf_resp = httpx.get(pdf_url, timeout=30.0, follow_redirects=True)
-                    if pdf_resp.status_code == 200 and len(pdf_resp.content) > 1000:
+                    if pdf_resp.status_code == 200 and _is_valid_pdf(pdf_resp.content):
                         return pdf_resp.content, f"{safe_doi}.pdf", "unpaywall"
-        except Exception:
-            pass
+        except Exception as exc:
+            logger.warning("Unpaywall PDF download failed for %s: %s", doi, exc)
 
         # 2. Try PubMed Central
         if not doi.startswith("10.1101/"):  # Skip bioRxiv DOIs for PMC
@@ -1567,24 +1785,40 @@ class WebClient:
                         pdf_resp = httpx.get(
                             pdf_url, timeout=30.0, follow_redirects=True
                         )
-                        if pdf_resp.status_code == 200 and len(pdf_resp.content) > 1000:
+                        if pdf_resp.status_code == 200 and _is_valid_pdf(
+                            pdf_resp.content
+                        ):
                             return pdf_resp.content, f"PMC{pmc_id}.pdf", "pmc"
-            except Exception:
-                pass
+            except Exception as exc:
+                logger.warning("PMC PDF download failed for %s: %s", doi, exc)
 
         # 3. Try bioRxiv/medRxiv (DOIs starting with 10.1101/)
         if doi.startswith("10.1101/"):
-            try:
-                pdf_url = f"https://www.biorxiv.org/content/{doi}v1.full.pdf"
-                pdf_resp = httpx.get(pdf_url, timeout=30.0, follow_redirects=True)
-                if pdf_resp.status_code == 200 and len(pdf_resp.content) > 1000:
-                    return pdf_resp.content, f"{safe_doi}.pdf", "biorxiv"
-                # Try medRxiv
-                pdf_url = f"https://www.medrxiv.org/content/{doi}v1.full.pdf"
-                pdf_resp = httpx.get(pdf_url, timeout=30.0, follow_redirects=True)
-                if pdf_resp.status_code == 200 and len(pdf_resp.content) > 1000:
-                    return pdf_resp.content, f"{safe_doi}.pdf", "medrxiv"
-            except Exception:
-                pass
+            for server, host in (
+                ("biorxiv", "www.biorxiv.org"),
+                ("medrxiv", "www.medrxiv.org"),
+            ):
+                try:
+                    # Detect the latest version via the bioRxiv/medRxiv API
+                    api_resp = httpx.get(
+                        f"https://api.biorxiv.org/details/{server}/{doi}",
+                        timeout=10.0,
+                    )
+                    version = 1
+                    if api_resp.status_code == 200:
+                        collection = api_resp.json().get("collection", [])
+                        if collection:
+                            try:
+                                version = int(collection[-1].get("version", 1))
+                            except (ValueError, TypeError):
+                                version = 1
+                    pdf_url = f"https://{host}/content/{doi}v{version}.full.pdf"
+                    pdf_resp = httpx.get(pdf_url, timeout=30.0, follow_redirects=True)
+                    if pdf_resp.status_code == 200 and _is_valid_pdf(pdf_resp.content):
+                        return pdf_resp.content, f"{safe_doi}.pdf", server
+                except Exception as exc:
+                    logger.warning(
+                        "%s PDF download failed for %s: %s", server, doi, exc
+                    )
 
         return None, "", ""

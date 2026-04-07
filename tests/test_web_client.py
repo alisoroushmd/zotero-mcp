@@ -101,6 +101,54 @@ def _mock_zotero_create() -> None:
     )
 
 
+# -- search_items filter tests --
+
+_ITEM_STUB = {
+    "data": {
+        "key": "ABC123",
+        "title": "Test Paper",
+        "itemType": "journalArticle",
+        "creators": [],
+        "date": "",
+    }
+}
+
+
+@respx.mock
+def test_search_items_passes_item_type_param():
+    """search_items forwards item_type as itemType query param."""
+    route = respx.get(f"{WEB_BASE}/users/12345/items/top").mock(
+        return_value=httpx.Response(200, json=[_ITEM_STUB])
+    )
+    client = WebClient(api_key="k", user_id="12345")
+    client.search_items("cancer", item_type="journalArticle")
+    assert route.calls[0].request.url.params["itemType"] == "journalArticle"
+
+
+@respx.mock
+def test_search_items_passes_tag_param():
+    """search_items forwards tag as tag query param."""
+    route = respx.get(f"{WEB_BASE}/users/12345/items/top").mock(
+        return_value=httpx.Response(200, json=[_ITEM_STUB])
+    )
+    client = WebClient(api_key="k", user_id="12345")
+    client.search_items("cancer", tag="reviewed")
+    assert route.calls[0].request.url.params["tag"] == "reviewed"
+
+
+@respx.mock
+def test_search_items_no_filters_omits_params():
+    """search_items without filters sends no itemType or tag params."""
+    route = respx.get(f"{WEB_BASE}/users/12345/items/top").mock(
+        return_value=httpx.Response(200, json=[_ITEM_STUB])
+    )
+    client = WebClient(api_key="k", user_id="12345")
+    client.search_items("cancer")
+    params = route.calls[0].request.url.params
+    assert "itemType" not in params
+    assert "tag" not in params
+
+
 # -- Existing tests (updated for efetch) --
 
 
@@ -729,3 +777,80 @@ def test_create_collection_api_failure():
     client = WebClient(api_key="test-key", user_id="12345")
     with pytest.raises(RuntimeError, match="Failed to create"):
         client.create_collection("Bad Collection")
+
+
+# -- Tag management tests --
+
+BASE_TAG = f"{WEB_BASE}/users/12345"
+
+
+@respx.mock
+def test_get_tags_returns_sorted_list():
+    """get_tags returns all tag strings sorted."""
+    respx.get(f"{BASE_TAG}/tags").mock(
+        return_value=httpx.Response(
+            200, json=[{"tag": "zebra"}, {"tag": "apple"}, {"tag": "mango"}]
+        )
+    )
+    client = WebClient(api_key="k", user_id="12345")
+    tags = client.get_tags()
+    assert tags == ["apple", "mango", "zebra"]
+
+
+@respx.mock
+def test_get_tags_passes_prefix_as_q():
+    """get_tags with prefix sends q param."""
+    route = respx.get(f"{BASE_TAG}/tags").mock(
+        return_value=httpx.Response(200, json=[{"tag": "cancer-review"}])
+    )
+    client = WebClient(api_key="k", user_id="12345")
+    client.get_tags(prefix="cancer")
+    assert route.calls[0].request.url.params["q"] == "cancer"
+
+
+@respx.mock
+def test_remove_tag_sends_delete():
+    """remove_tag DELETEs the tag and returns status removed."""
+    respx.get(f"{BASE_TAG}/items").mock(
+        return_value=httpx.Response(
+            200, json=[], headers={"Last-Modified-Version": "5"}
+        )
+    )
+    delete_route = respx.delete(f"{BASE_TAG}/tags/old-tag").mock(
+        return_value=httpx.Response(204)
+    )
+    client = WebClient(api_key="k", user_id="12345")
+    result = client.remove_tag("old-tag")
+    assert result["status"] == "removed"
+    assert delete_route.called
+
+
+@respx.mock
+def test_rename_tag_patches_all_items():
+    """rename_tag fetches items with old tag and PATCHes each one."""
+    item_data = {
+        "data": {
+            "key": "ITEM001",
+            "version": 3,
+            "tags": [{"tag": "old"}, {"tag": "keep"}],
+        }
+    }
+    respx.get(f"{BASE_TAG}/items").mock(
+        return_value=httpx.Response(200, json=[item_data])
+    )
+    patch_route = respx.patch(f"{BASE_TAG}/items/ITEM001").mock(
+        return_value=httpx.Response(204)
+    )
+    client = WebClient(api_key="k", user_id="12345")
+    result = client.rename_tag("old", "new")
+    assert result["updated"] == 1
+    assert result["failed"] == []
+    assert patch_route.called
+    sent = patch_route.calls[0].request
+    import json as _json
+
+    body = _json.loads(sent.content)
+    tag_names = [t["tag"] for t in body["tags"]]
+    assert "new" in tag_names
+    assert "old" not in tag_names
+    assert "keep" in tag_names

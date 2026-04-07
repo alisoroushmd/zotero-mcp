@@ -138,8 +138,10 @@ class OpenAlexClient:
                 resp = self._client.get(f"/works/{ref_id}")
                 if resp.status_code == 200:
                     return self._format_work_summary(resp.json())
-            except Exception:
-                pass
+            except Exception as exc:
+                logger.warning(
+                    "OpenAlex reference fetch failed for %s: %s", ref_id, exc
+                )
             return None
 
         with ThreadPoolExecutor(max_workers=5) as pool:

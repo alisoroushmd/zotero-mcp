@@ -43,16 +43,32 @@ class LocalClient:
                 "Call server_status to check which modes are available."
             )
 
-    def search_items(self, query: str, limit: int = 25) -> list[dict]:
-        """Keyword search across the library. Excludes attachments and notes."""
-        resp = self._get(
-            "/users/0/items",
-            params={
-                "q": query,
-                "limit": limit,
-                "itemType": "-attachment || -note",
-            },
-        )
+    def search_items(
+        self,
+        query: str,
+        limit: int = 25,
+        item_type: str | None = None,
+        tag: str | None = None,
+    ) -> list[dict]:
+        """Keyword search across the library. Excludes attachments and notes.
+
+        Args:
+            query: Keyword search string.
+            limit: Max results (1–100).
+            item_type: Filter by Zotero item type, e.g. "journalArticle".
+            tag: Filter by tag name (exact match).
+
+        Returns:
+            List of item summary dicts.
+        """
+        params: dict = {
+            "q": query,
+            "limit": limit,
+            "itemType": item_type if item_type else "-attachment || -note",
+        }
+        if tag:
+            params["tag"] = tag
+        resp = self._get("/users/0/items", params=params)
         return [_format_summary(item) for item in resp.json()]
 
     def get_item(self, item_key: str, fmt: str = "json") -> dict | str:
