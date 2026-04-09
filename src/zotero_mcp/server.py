@@ -1,5 +1,6 @@
 """MCP server exposing Zotero tools via FastMCP."""
 
+import atexit
 import functools
 import json
 import logging
@@ -33,7 +34,74 @@ _LOCAL_RETRY_INTERVAL = 300.0  # retry local API probe every 5 minutes
 _web: WebClient | None = None
 _init_lock = threading.Lock()
 
+# Temp file tracking for cleanup at exit.
+_temp_files: list[str] = []
+_temp_lock = threading.Lock()
+
+
+def _register_temp_file(path: str) -> None:
+    """Register a temporary file for cleanup at process exit."""
+    with _temp_lock:
+        _temp_files.append(path)
+
+
+def _cleanup_temp_files() -> None:
+    """Remove all registered temporary files."""
+    with _temp_lock:
+        for path in _temp_files:
+            try:
+                os.unlink(path)
+            except OSError:
+                pass
+        _temp_files.clear()
+
+
+atexit.register(_cleanup_temp_files)
+
 _ZOTERO_KEY_RE = re.compile(r"^[A-Za-z0-9]+$")
+
+# Directories allowed for file read/write operations.
+_ALLOWED_PATH_ROOTS: list[str] = []
+
+
+def _get_allowed_path_roots() -> list[str]:
+    """Return the set of directories allowed for file I/O.
+
+    Includes the current working directory, user home, and system temp dir.
+    Computed lazily and cached.
+    """
+    if not _ALLOWED_PATH_ROOTS:
+        import pathlib
+        candidates = [
+            pathlib.Path.cwd(),
+            pathlib.Path.home(),
+            pathlib.Path(tempfile.gettempdir()),
+        ]
+        for c in candidates:
+            try:
+                _ALLOWED_PATH_ROOTS.append(str(c.resolve()))
+            except OSError:
+                pass
+    return _ALLOWED_PATH_ROOTS
+
+
+def _validate_path(file_path: str, name: str = "path") -> str:
+    """Validate that a file path is within allowed directories.
+
+    Resolves the path (following symlinks) and checks it falls under
+    the current working directory, user home, or system temp directory.
+
+    Returns the resolved absolute path string.
+    """
+    import pathlib
+    resolved = str(pathlib.Path(file_path).resolve())
+    allowed = _get_allowed_path_roots()
+    if not any(resolved.startswith(root + os.sep) or resolved == root for root in allowed):
+        raise ValueError(
+            f"{name} must be within the working directory, home directory, "
+            f"or temp directory. Got: {file_path!r}"
+        )
+    return resolved
 
 
 def _validate_key(value: str, name: str = "key") -> None:
@@ -399,6 +467,7 @@ def get_pdf_content(item_key: str) -> str:
                 tmp.close()
                 os.unlink(tmp.name)
                 raise
+            _register_temp_file(tmp.name)
             return json.dumps(
                 {
                     "item_key": item_key,
@@ -428,6 +497,7 @@ def get_pdf_content(item_key: str) -> str:
                     tmp.close()
                     os.unlink(tmp.name)
                     raise
+                _register_temp_file(tmp.name)
                 return json.dumps(
                     {
                         "item_key": item_key,
@@ -776,11 +846,28 @@ def add_to_collection(item_key: str, collection_key: str) -> str:
     return json.dumps(result, ensure_ascii=False)
 
 
+_ALLOWED_UPDATE_FIELDS = {
+    "title", "creators", "date", "DOI", "url", "abstractNote",
+    "publicationTitle", "volume", "issue", "pages", "publisher",
+    "ISBN", "ISSN", "extra", "tags", "collections", "itemType",
+    "bookTitle", "proceedingsTitle", "series", "seriesTitle",
+    "language", "rights", "shortTitle", "accessDate", "archive",
+    "archiveLocation", "callNumber", "libraryCatalog", "place",
+    "numPages", "edition", "numberOfVolumes",
+}
+
+
 @mcp.tool(description="Update metadata fields on an existing Zotero item")
 @_handle_tool_errors
 def update_item(item_key: str, fields: dict) -> str:
     """Update item fields. Uses optimistic locking with version check."""
     _validate_key(item_key, "item_key")
+    disallowed = set(fields.keys()) - _ALLOWED_UPDATE_FIELDS
+    if disallowed:
+        raise ValueError(
+            f"Fields not allowed for update: {', '.join(sorted(disallowed))}. "
+            f"Allowed fields: {', '.join(sorted(_ALLOWED_UPDATE_FIELDS))}"
+        )
     result = _get_web().update_item(item_key.strip(), fields)
     return json.dumps(result, ensure_ascii=False)
 
@@ -954,8 +1041,10 @@ def attach_pdf(
         JSON with status, attachment_key, filename, source.
     """
     _validate_key(parent_key, "parent_key")
-    if pdf_path and not pdf_path.lower().endswith(".pdf"):
-        raise ValueError("pdf_path must be a .pdf file")
+    if pdf_path:
+        if not pdf_path.lower().endswith(".pdf"):
+            raise ValueError("pdf_path must be a .pdf file")
+        pdf_path = _validate_path(pdf_path, "pdf_path")
     result = _get_web().attach_pdf(parent_key.strip(), pdf_path, doi)
     return json.dumps(result, ensure_ascii=False)
 
@@ -1009,6 +1098,9 @@ def insert_citations(document_path: str, output_path: str | None = None) -> str:
         raise ValueError("document_path must be a .docx file")
     if output_path and not output_path.lower().endswith(".docx"):
         raise ValueError("output_path must be a .docx file")
+    document_path = _validate_path(document_path, "document_path")
+    if output_path:
+        output_path = _validate_path(output_path, "output_path")
 
     from zotero_mcp.citation_writer import insert_citations as _insert_citations
     from zotero_mcp.citation_writer import parse_citations
@@ -1081,6 +1173,7 @@ def write_cited_document(content: str, output_path: str) -> str:
     """
     if not output_path.lower().endswith(".docx"):
         raise ValueError("output_path must be a .docx file")
+    output_path = _validate_path(output_path, "output_path")
 
     from zotero_mcp.citation_writer import build_document, parse_citations
 

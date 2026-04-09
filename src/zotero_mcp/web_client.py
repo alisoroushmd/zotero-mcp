@@ -3,13 +3,16 @@
 from __future__ import annotations
 
 import hashlib
+import ipaddress
 import logging
+import os
 import re
 import time
 from pathlib import Path
 from typing import TYPE_CHECKING
-from urllib.parse import urlencode
-from xml.etree import ElementTree
+from urllib.parse import urlencode, urlparse
+
+import defusedxml.ElementTree as ElementTree
 
 import httpx
 
@@ -18,10 +21,54 @@ if TYPE_CHECKING:
 
 logger = logging.getLogger(__name__)
 
+
+_BLOCKED_NETWORKS = [
+    ipaddress.ip_network("127.0.0.0/8"),
+    ipaddress.ip_network("10.0.0.0/8"),
+    ipaddress.ip_network("172.16.0.0/12"),
+    ipaddress.ip_network("192.168.0.0/16"),
+    ipaddress.ip_network("169.254.0.0/16"),
+    ipaddress.ip_network("::1/128"),
+    ipaddress.ip_network("fc00::/7"),
+    ipaddress.ip_network("fe80::/10"),
+]
+
+
+def _validate_url(url: str) -> None:
+    """Validate a URL to prevent SSRF attacks.
+
+    Blocks private/loopback IP ranges and non-HTTPS schemes.
+
+    Raises:
+        ValueError: If the URL targets a private network or uses a blocked scheme.
+    """
+    parsed = urlparse(url)
+    if parsed.scheme not in ("http", "https"):
+        raise ValueError(f"URL scheme must be http or https, got: {parsed.scheme!r}")
+
+    hostname = parsed.hostname or ""
+    # Block obvious internal hostnames
+    if hostname in ("localhost", "0.0.0.0"):
+        raise ValueError(f"URLs targeting internal hosts are not allowed: {hostname}")
+
+    # Try to parse hostname as IP address and check against blocked ranges
+    try:
+        addr = ipaddress.ip_address(hostname)
+        for network in _BLOCKED_NETWORKS:
+            if addr in network:
+                raise ValueError(
+                    f"URLs targeting private/internal networks are not allowed: {hostname}"
+                )
+    except ValueError as exc:
+        if "not allowed" in str(exc):
+            raise
+        # Not an IP literal — hostname is a domain name, allow it
+
 WEB_BASE = "https://api.zotero.org"
 TRANSLATE_URL = "https://translate.zotero.org/search"
 TRANSLATE_WEB_URL = "https://translate.zotero.org/web"
 TIMEOUT = httpx.Timeout(10.0, connect=5.0)
+POLITE_EMAIL = os.environ.get("ZOTERO_MCP_EMAIL", "zotero-mcp@example.com")
 SEARCH_TIMEOUT = httpx.Timeout(
     45.0, connect=5.0
 )  # searches can be slow on large libraries
@@ -268,7 +315,7 @@ class WebClient:
             resp = httpx.get(
                 f"https://api.crossref.org/works/{doi}",
                 headers={
-                    "User-Agent": "zotero-mcp/1.0 (mailto:zotero-mcp@example.com)"
+                    "User-Agent": f"zotero-mcp/1.0 (mailto:{POLITE_EMAIL})"
                 },
                 timeout=TIMEOUT,
             )
@@ -318,7 +365,7 @@ class WebClient:
             resp = httpx.get(
                 f"https://api.crossref.org/works/{doi}",
                 headers={
-                    "User-Agent": "zotero-mcp/1.0 (mailto:zotero-mcp@example.com)"
+                    "User-Agent": f"zotero-mcp/1.0 (mailto:{POLITE_EMAIL})"
                 },
                 timeout=TIMEOUT,
             )
@@ -851,7 +898,7 @@ class WebClient:
             resp = httpx.get(
                 f"https://api.crossref.org/works/{doi}",
                 headers={
-                    "User-Agent": "zotero-mcp/1.0 (mailto:zotero-mcp@example.com)"
+                    "User-Agent": f"zotero-mcp/1.0 (mailto:{POLITE_EMAIL})"
                 },
                 timeout=TIMEOUT,
             )
@@ -989,6 +1036,8 @@ class WebClient:
             Dict with "key" and "title".
         """
         from datetime import date
+
+        _validate_url(url)
 
         metadata = None
 
@@ -1793,7 +1842,7 @@ class WebClient:
         try:
             resp = httpx.get(
                 f"https://api.unpaywall.org/v2/{doi}",
-                params={"email": "zotero-mcp@example.com"},
+                params={"email": POLITE_EMAIL},
                 timeout=TIMEOUT,
             )
             if resp.status_code == 200:
@@ -1801,6 +1850,7 @@ class WebClient:
                 best_oa = data.get("best_oa_location", {})
                 pdf_url = best_oa.get("url_for_pdf") if best_oa else None
                 if pdf_url:
+                    _validate_url(pdf_url)
                     pdf_resp = httpx.get(pdf_url, timeout=30.0, follow_redirects=True)
                     if pdf_resp.status_code == 200 and _is_valid_pdf(pdf_resp.content):
                         return pdf_resp.content, f"{safe_doi}.pdf", "unpaywall"

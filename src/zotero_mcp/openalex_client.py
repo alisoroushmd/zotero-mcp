@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import logging
+import os
 
 import httpx
 
@@ -10,6 +11,7 @@ logger = logging.getLogger(__name__)
 
 OPENALEX_BASE = "https://api.openalex.org"
 TIMEOUT = 10.0
+POLITE_EMAIL = os.environ.get("ZOTERO_MCP_EMAIL", "zotero-mcp@example.com")
 
 
 class OpenAlexClient:
@@ -20,7 +22,7 @@ class OpenAlexClient:
     an email in the User-Agent header.
     """
 
-    def __init__(self, email: str = "zotero-mcp@example.com") -> None:
+    def __init__(self, email: str = POLITE_EMAIL) -> None:
         self._client = httpx.Client(
             base_url=OPENALEX_BASE,
             headers={"User-Agent": f"zotero-mcp/1.0 (mailto:{email})"},
