@@ -10,3 +10,6 @@ build/
 .pytest_cache/
 .venv/
 venv/
+.env
+.env.*
+*.local
