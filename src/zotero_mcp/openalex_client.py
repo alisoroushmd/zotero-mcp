@@ -270,3 +270,56 @@ class OpenAlexClient:
             except Exception as exc:
                 logger.warning("OpenAlex ID resolution failed for batch %d: %s", i, exc)
         return id_to_doi
+
+    @staticmethod
+    def extract_topics(work: dict) -> list[dict]:
+        """Extract topic hierarchy from an OpenAlex work.
+
+        Args:
+            work: Raw OpenAlex work dict from bulk_get_works.
+
+        Returns:
+            List of dicts with keys: topic_id, topic_name, subfield, field, domain, score.
+        """
+        topics = []
+        for t in work.get("topics", []):
+            topic_id = (t.get("id") or "").split("/")[-1]  # Extract ID from URL
+            if not topic_id:
+                continue
+            topics.append({
+                "topic_id": topic_id,
+                "topic_name": t.get("display_name", ""),
+                "subfield": (t.get("subfield") or {}).get("display_name", ""),
+                "field": (t.get("field") or {}).get("display_name", ""),
+                "domain": (t.get("domain") or {}).get("display_name", ""),
+                "score": t.get("score", 0.0),
+            })
+        return topics
+
+    @staticmethod
+    def extract_authorships(work: dict) -> list[dict]:
+        """Extract structured author records from an OpenAlex work.
+
+        Args:
+            work: Raw OpenAlex work dict from bulk_get_works.
+
+        Returns:
+            List of dicts with keys: openalex_author_id, display_name, orcid,
+            institution, position.
+        """
+        authors = []
+        for i, a in enumerate(work.get("authorships", [])):
+            author = a.get("author", {})
+            author_id = (author.get("id") or "").split("/")[-1]
+            if not author_id:
+                continue
+            institutions = a.get("institutions", [])
+            institution = institutions[0].get("display_name", "") if institutions else ""
+            authors.append({
+                "openalex_author_id": author_id,
+                "display_name": author.get("display_name", ""),
+                "orcid": (author.get("orcid") or "").replace("https://orcid.org/", ""),
+                "institution": institution,
+                "position": i,
+            })
+        return authors

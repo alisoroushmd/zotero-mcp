@@ -162,3 +162,164 @@ def test_get_doi_set(tmp_db):
     )
     doi_set = store.get_doi_set()
     assert doi_set == {"10.1/a", "10.1/b"}
+
+
+def test_upsert_and_get_topic(tmp_db):
+    """Topics can be stored and retrieved by DOI."""
+    store = GraphStore(tmp_db)
+    store.upsert_topic(
+        doi="10.1/a",
+        topic_id="T1",
+        topic_name="Gastric Cancer",
+        subfield="Oncology",
+        field="Medicine",
+        domain="Health Sciences",
+        score=0.95,
+    )
+    topics = store.get_topics_for_doi("10.1/a")
+    assert len(topics) == 1
+    assert topics[0]["topic_id"] == "T1"
+    assert topics[0]["topic_name"] == "Gastric Cancer"
+    assert topics[0]["score"] == 0.95
+
+
+def test_upsert_topic_updates_on_conflict(tmp_db):
+    """Upserting the same (doi, topic_id) updates fields."""
+    store = GraphStore(tmp_db)
+    store.upsert_topic(
+        doi="10.1/a",
+        topic_id="T1",
+        topic_name="Old Name",
+        subfield="Old Subfield",
+        field="Old Field",
+        domain="Old Domain",
+        score=0.5,
+    )
+    store.upsert_topic(
+        doi="10.1/a",
+        topic_id="T1",
+        topic_name="Gastric Cancer",
+        subfield="Oncology",
+        field="Medicine",
+        domain="Health Sciences",
+        score=0.95,
+    )
+    topics = store.get_topics_for_doi("10.1/a")
+    assert len(topics) == 1
+    assert topics[0]["topic_name"] == "Gastric Cancer"
+    assert topics[0]["subfield"] == "Oncology"
+    assert topics[0]["score"] == 0.95
+
+
+def test_upsert_and_get_author(tmp_db):
+    """Authors can be stored and retrieved."""
+    store = GraphStore(tmp_db)
+    store.upsert_author(
+        openalex_author_id="A100",
+        display_name="Jane Smith",
+        orcid="0000-0001-2345-6789",
+        institution="Mount Sinai",
+    )
+    authors = store.get_all_authors()
+    assert len(authors) == 1
+    assert authors[0]["openalex_author_id"] == "A100"
+    assert authors[0]["display_name"] == "Jane Smith"
+    assert authors[0]["institution"] == "Mount Sinai"
+
+
+def test_upsert_author_updates_on_conflict(tmp_db):
+    """Upserting the same author_id updates fields."""
+    store = GraphStore(tmp_db)
+    store.upsert_author(
+        openalex_author_id="A100",
+        display_name="Jane Smith",
+        orcid=None,
+        institution="Old University",
+    )
+    store.upsert_author(
+        openalex_author_id="A100",
+        display_name="Jane A. Smith",
+        orcid="0000-0001-2345-6789",
+        institution="Mount Sinai",
+    )
+    authors = store.get_all_authors()
+    assert len(authors) == 1
+    assert authors[0]["display_name"] == "Jane A. Smith"
+    assert authors[0]["orcid"] == "0000-0001-2345-6789"
+    assert authors[0]["institution"] == "Mount Sinai"
+
+
+def test_upsert_and_get_paper_author(tmp_db):
+    """Paper-author links can be stored and retrieved."""
+    store = GraphStore(tmp_db)
+    store.upsert_paper_author(
+        doi="10.1/a",
+        openalex_author_id="A100",
+        position=0,
+    )
+    store.upsert_paper_author(
+        doi="10.1/a",
+        openalex_author_id="A200",
+        position=1,
+    )
+    links = store.get_all_paper_authors()
+    assert len(links) == 2
+    assert ("10.1/a", "A100", 0) in links
+    assert ("10.1/a", "A200", 1) in links
+
+
+def test_get_all_topics(tmp_db):
+    """Can retrieve topics across multiple DOIs."""
+    store = GraphStore(tmp_db)
+    store.upsert_topic(
+        doi="10.1/a",
+        topic_id="T1",
+        topic_name="Gastric Cancer",
+        subfield="Oncology",
+        field="Medicine",
+        domain="Health Sciences",
+        score=0.9,
+    )
+    store.upsert_topic(
+        doi="10.1/b",
+        topic_id="T2",
+        topic_name="Machine Learning",
+        subfield="AI",
+        field="Computer Science",
+        domain="Physical Sciences",
+        score=0.8,
+    )
+    topics = store.get_all_topics()
+    assert len(topics) == 2
+    topic_ids = {t["topic_id"] for t in topics}
+    assert topic_ids == {"T1", "T2"}
+
+
+def test_get_topics_for_doi_filters(tmp_db):
+    """get_topics_for_doi only returns topics for the requested DOI."""
+    store = GraphStore(tmp_db)
+    store.upsert_topic(
+        doi="10.1/a",
+        topic_id="T1",
+        topic_name="Gastric Cancer",
+        subfield="Oncology",
+        field="Medicine",
+        domain="Health Sciences",
+        score=0.9,
+    )
+    store.upsert_topic(
+        doi="10.1/b",
+        topic_id="T2",
+        topic_name="Machine Learning",
+        subfield="AI",
+        field="Computer Science",
+        domain="Physical Sciences",
+        score=0.8,
+    )
+    topics_a = store.get_topics_for_doi("10.1/a")
+    assert len(topics_a) == 1
+    assert topics_a[0]["topic_id"] == "T1"
+
+    topics_b = store.get_topics_for_doi("10.1/b")
+    assert len(topics_b) == 1
+    assert topics_b[0]["topic_id"] == "T2"

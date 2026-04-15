@@ -19,8 +19,7 @@ def test_server_has_all_tools():
         "get_collection_items",
         "get_notes",
         "get_item_attachments",
-        "create_item_from_identifier",
-        "create_item_from_url",
+        "create_item",
         "create_item_manual",
         "create_note",
         "batch_organize",
@@ -44,7 +43,8 @@ def test_server_has_all_tools():
         "build_knowledge_graph",
         "query_knowledge_graph",
         "find_related_papers",
-        "sync_knowledge_graph",
+        "query_authors",
+        "export_knowledge_graph",
     }
     actual = {t.name for t in tools}
     missing = expected - actual

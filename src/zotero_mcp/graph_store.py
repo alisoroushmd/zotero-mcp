@@ -58,6 +58,31 @@ class GraphStore:
                 ON citations(cited_doi);
             CREATE INDEX IF NOT EXISTS idx_papers_zotero_key
                 ON papers(zotero_key);
+            CREATE TABLE IF NOT EXISTS paper_topics (
+                doi TEXT NOT NULL,
+                topic_id TEXT NOT NULL,
+                topic_name TEXT,
+                subfield TEXT,
+                field TEXT,
+                domain TEXT,
+                score REAL,
+                PRIMARY KEY (doi, topic_id)
+            );
+            CREATE TABLE IF NOT EXISTS authors (
+                openalex_author_id TEXT PRIMARY KEY,
+                display_name TEXT,
+                orcid TEXT,
+                institution TEXT,
+                updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            );
+            CREATE TABLE IF NOT EXISTS paper_authors (
+                doi TEXT NOT NULL,
+                openalex_author_id TEXT NOT NULL,
+                position INTEGER,
+                PRIMARY KEY (doi, openalex_author_id)
+            );
+            CREATE INDEX IF NOT EXISTS idx_paper_authors_author
+                ON paper_authors(openalex_author_id);
         """)
         self._conn.commit()
 
@@ -156,6 +181,133 @@ class GraphStore:
                 (str(library_version),),
             )
         self._conn.commit()
+
+    def upsert_topic(
+        self,
+        doi: str,
+        topic_id: str,
+        topic_name: str | None,
+        subfield: str | None,
+        field: str | None,
+        domain: str | None,
+        score: float | None,
+    ) -> None:
+        """Insert or update a topic association for a paper.
+
+        Args:
+            doi: Paper DOI.
+            topic_id: OpenAlex topic identifier.
+            topic_name: Human-readable topic name.
+            subfield: OpenAlex subfield name.
+            field: OpenAlex field name.
+            domain: OpenAlex domain name.
+            score: Topic relevance score (0-1).
+        """
+        self._conn.execute(
+            """INSERT INTO paper_topics
+                   (doi, topic_id, topic_name, subfield, field, domain, score)
+               VALUES (?, ?, ?, ?, ?, ?, ?)
+               ON CONFLICT(doi, topic_id) DO UPDATE SET
+                   topic_name=excluded.topic_name,
+                   subfield=excluded.subfield,
+                   field=excluded.field,
+                   domain=excluded.domain,
+                   score=excluded.score""",
+            (doi, topic_id, topic_name, subfield, field, domain, score),
+        )
+        self._conn.commit()
+
+    def upsert_author(
+        self,
+        openalex_author_id: str,
+        display_name: str | None,
+        orcid: str | None,
+        institution: str | None,
+    ) -> None:
+        """Insert or update an author record.
+
+        Args:
+            openalex_author_id: OpenAlex author identifier.
+            display_name: Author display name.
+            orcid: ORCID identifier.
+            institution: Primary institutional affiliation.
+        """
+        self._conn.execute(
+            """INSERT INTO authors
+                   (openalex_author_id, display_name, orcid, institution)
+               VALUES (?, ?, ?, ?)
+               ON CONFLICT(openalex_author_id) DO UPDATE SET
+                   display_name=excluded.display_name,
+                   orcid=excluded.orcid,
+                   institution=excluded.institution,
+                   updated_at=CURRENT_TIMESTAMP""",
+            (openalex_author_id, display_name, orcid, institution),
+        )
+        self._conn.commit()
+
+    def upsert_paper_author(
+        self,
+        doi: str,
+        openalex_author_id: str,
+        position: int,
+    ) -> None:
+        """Insert a paper-author link (ignores duplicates).
+
+        Args:
+            doi: Paper DOI.
+            openalex_author_id: OpenAlex author identifier.
+            position: Author position in the author list (0-indexed).
+        """
+        self._conn.execute(
+            """INSERT OR IGNORE INTO paper_authors
+                   (doi, openalex_author_id, position)
+               VALUES (?, ?, ?)""",
+            (doi, openalex_author_id, position),
+        )
+        self._conn.commit()
+
+    def get_topics_for_doi(self, doi: str) -> list[dict]:
+        """Return all topic associations for a given DOI.
+
+        Args:
+            doi: Paper DOI to look up.
+
+        Returns:
+            List of topic dicts for the paper.
+        """
+        rows = self._conn.execute(
+            "SELECT * FROM paper_topics WHERE doi = ?", (doi,)
+        ).fetchall()
+        return [dict(r) for r in rows]
+
+    def get_all_topics(self) -> list[dict]:
+        """Return all topic associations across all papers.
+
+        Returns:
+            List of all topic dicts.
+        """
+        rows = self._conn.execute("SELECT * FROM paper_topics").fetchall()
+        return [dict(r) for r in rows]
+
+    def get_all_authors(self) -> list[dict]:
+        """Return all author records.
+
+        Returns:
+            List of author dicts.
+        """
+        rows = self._conn.execute("SELECT * FROM authors").fetchall()
+        return [dict(r) for r in rows]
+
+    def get_all_paper_authors(self) -> list[tuple[str, str, int]]:
+        """Return all paper-author links.
+
+        Returns:
+            List of (doi, openalex_author_id, position) tuples.
+        """
+        rows = self._conn.execute(
+            "SELECT doi, openalex_author_id, position FROM paper_authors"
+        ).fetchall()
+        return [(r[0], r[1], r[2]) for r in rows]
 
     def close(self) -> None:
         self._conn.close()

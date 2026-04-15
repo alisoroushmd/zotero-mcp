@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import logging
+from collections import Counter
 from typing import TYPE_CHECKING
 
 try:
@@ -34,11 +35,16 @@ class KnowledgeGraph:
             )
         self._graph: nx.DiGraph = nx.DiGraph()
         self._paper_data: dict[str, dict] = {}
+        self._topic_data: dict[str, list[dict]] = {}
+        self._author_data: dict[str, dict] = {}
+        self._author_papers: dict[str, set[str]] = {}
+        self._coauthor_graph: nx.Graph = nx.Graph()
 
     def build_from_store(self, store: GraphStore) -> dict:
         """Build the graph from persisted data."""
         self._graph.clear()
         self._paper_data.clear()
+        self._topic_data.clear()
 
         papers = store.get_all_papers()
         for p in papers:
@@ -49,6 +55,39 @@ class KnowledgeGraph:
         for citing, cited in store.get_all_citations():
             if citing in self._graph and cited in self._graph:
                 self._graph.add_edge(citing, cited)
+
+        # Load topic data for cluster labeling
+        for t in store.get_all_topics():
+            doi = t["doi"]
+            self._topic_data.setdefault(doi, []).append(t)
+
+        # Load author data
+        self._author_data.clear()
+        self._author_papers.clear()
+        self._coauthor_graph.clear()
+
+        for a in store.get_all_authors():
+            aid = a["openalex_author_id"]
+            self._author_data[aid] = a
+            self._coauthor_graph.add_node(aid)
+
+        for doi, author_id, position in store.get_all_paper_authors():
+            self._author_papers.setdefault(author_id, set()).add(doi)
+
+        # Build co-authorship edges (for each paper, connect all co-author pairs)
+        from collections import defaultdict
+
+        papers_to_authors: dict[str, list[str]] = defaultdict(list)
+        for doi, author_id, _ in store.get_all_paper_authors():
+            papers_to_authors[doi].append(author_id)
+
+        for doi, author_ids in papers_to_authors.items():
+            for i, a1 in enumerate(author_ids):
+                for a2 in author_ids[i + 1 :]:
+                    if self._coauthor_graph.has_edge(a1, a2):
+                        self._coauthor_graph[a1][a2]["weight"] += 1
+                    else:
+                        self._coauthor_graph.add_edge(a1, a2, weight=1)
 
         return self.get_stats()
 
@@ -88,10 +127,30 @@ class KnowledgeGraph:
         clusters = []
         for i, community in enumerate(communities):
             papers = [self._paper_data.get(doi, {"doi": doi}) for doi in community]
+
+            # Label cluster by dominant subfield from topic data
+            topic_counts: Counter[str] = Counter()
+            for doi in community:
+                for t in self._topic_data.get(doi, []):
+                    sf = t.get("subfield")
+                    if sf:
+                        topic_counts[sf] += 1
+
+            label = topic_counts.most_common(1)[0][0] if topic_counts else "Unlabeled"
+            total = sum(topic_counts.values())
+            secondary = [
+                sf
+                for sf, c in topic_counts.most_common()
+                if sf != label and total > 0 and c / total > 0.2
+            ]
+
             clusters.append(
                 {
                     "cluster_id": i,
                     "size": len(community),
+                    "label": label,
+                    "secondary_labels": secondary,
+                    "topic_distribution": dict(topic_counts.most_common(10)),
                     "papers": papers,
                 }
             )
@@ -131,3 +190,131 @@ class KnowledgeGraph:
         subgraph = self._graph.subgraph(neighbors.keys())
         edges = [{"from": u, "to": v} for u, v in subgraph.edges()]
         return {"center": doi, "papers": papers, "edges": edges}
+
+    # -- Author analysis methods --
+
+    def _resolve_author(self, name: str) -> str:
+        """Resolve an author name to an openalex_author_id.
+
+        First tries case-insensitive substring match, then SequenceMatcher > 0.85.
+        Raises ValueError if no match or ambiguous (multiple matches).
+        """
+        from difflib import SequenceMatcher
+
+        name_lower = name.lower()
+
+        # Pass 1: case-insensitive substring
+        matches = [
+            aid
+            for aid, data in self._author_data.items()
+            if name_lower in data.get("display_name", "").lower()
+        ]
+        if len(matches) == 1:
+            return matches[0]
+        if len(matches) > 1:
+            # Try exact match first
+            exact = [
+                aid
+                for aid in matches
+                if self._author_data[aid].get("display_name", "").lower() == name_lower
+            ]
+            if len(exact) == 1:
+                return exact[0]
+            names = [self._author_data[m].get("display_name", "") for m in matches[:5]]
+            raise ValueError(f"Ambiguous author name '{name}'. Matches: {names}")
+
+        # Pass 2: fuzzy matching
+        best_id = None
+        best_ratio = 0.0
+        for aid, data in self._author_data.items():
+            ratio = SequenceMatcher(
+                None, name_lower, data.get("display_name", "").lower()
+            ).ratio()
+            if ratio > best_ratio:
+                best_ratio = ratio
+                best_id = aid
+        if best_ratio > 0.85 and best_id:
+            return best_id
+
+        raise ValueError(f"No author matching '{name}' found in knowledge graph")
+
+    def get_prolific_authors(self, top_n: int = 10) -> list[dict]:
+        """Return authors ranked by paper count in the library."""
+        ranked = sorted(
+            self._author_papers.items(),
+            key=lambda x: len(x[1]),
+            reverse=True,
+        )[:top_n]
+        return [
+            {**self._author_data.get(aid, {"openalex_author_id": aid}), "paper_count": len(dois)}
+            for aid, dois in ranked
+        ]
+
+    def get_influential_authors(self, top_n: int = 10) -> list[dict]:
+        """Return authors ranked by summed PageRank of their papers."""
+        if not self._graph.nodes:
+            return []
+        pr = nx.pagerank(self._graph)
+        author_scores: dict[str, float] = {}
+        for aid, dois in self._author_papers.items():
+            author_scores[aid] = sum(pr.get(doi, 0) for doi in dois)
+        ranked = sorted(author_scores.items(), key=lambda x: x[1], reverse=True)[:top_n]
+        return [
+            {
+                **self._author_data.get(aid, {"openalex_author_id": aid}),
+                "influence_score": round(score, 6),
+            }
+            for aid, score in ranked
+        ]
+
+    def get_coauthors_of(self, author_id: str, top_n: int = 10) -> list[dict]:
+        """Return co-authors of a given author, ranked by shared paper count."""
+        if author_id not in self._coauthor_graph:
+            return []
+        neighbors = [
+            (neighbor, self._coauthor_graph[author_id][neighbor].get("weight", 1))
+            for neighbor in self._coauthor_graph.neighbors(author_id)
+        ]
+        ranked = sorted(neighbors, key=lambda x: x[1], reverse=True)[:top_n]
+        return [
+            {**self._author_data.get(aid, {"openalex_author_id": aid}), "shared_papers": w}
+            for aid, w in ranked
+        ]
+
+    def get_author_clusters(self) -> list[dict]:
+        """Detect author communities via greedy modularity on co-authorship graph."""
+        if self._coauthor_graph.number_of_nodes() < 2:
+            return []
+        try:
+            from networkx.algorithms.community import greedy_modularity_communities
+
+            communities = greedy_modularity_communities(self._coauthor_graph)
+        except Exception:
+            return []
+
+        clusters = []
+        for i, community in enumerate(communities):
+            members = [
+                self._author_data.get(aid, {"openalex_author_id": aid})
+                for aid in community
+            ]
+            clusters.append({"cluster_id": i, "size": len(community), "authors": members})
+        return sorted(clusters, key=lambda c: c["size"], reverse=True)
+
+    def get_author_network(self, author_id: str, depth: int = 1) -> dict:
+        """Get ego network for an author: co-authors within N hops, shared papers."""
+        if author_id not in self._coauthor_graph:
+            return {"center": author_id, "authors": [], "edges": []}
+        neighbors = nx.single_source_shortest_path_length(
+            self._coauthor_graph, author_id, cutoff=depth
+        )
+        authors = [
+            {**self._author_data.get(aid, {"openalex_author_id": aid}), "distance": dist}
+            for aid, dist in neighbors.items()
+        ]
+        subgraph = self._coauthor_graph.subgraph(neighbors.keys())
+        edges = [
+            {"from": u, "to": v, "shared_papers": d.get("weight", 1)}
+            for u, v, d in subgraph.edges(data=True)
+        ]
+        return {"center": author_id, "authors": authors, "edges": edges}

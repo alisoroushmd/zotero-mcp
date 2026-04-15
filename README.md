@@ -56,8 +56,7 @@ Call `server_status` to check which modes are available.
 
 | Tool                            | Description                                                          |
 | ------------------------------- | -------------------------------------------------------------------- |
-| `create_item_from_identifier` | Create item from DOI, PMID, or PubMed URL (with duplicate detection) |
-| `create_item_from_url`        | Create item from any URL (with duplicate detection)                  |
+| `create_item`                 | Create item from DOI, PMID, or URL (with duplicate detection)        |
 | `create_item_manual`          | Create item with manual metadata (with duplicate detection)          |
 | `create_note`                 | Attach a note to an item                                             |
 | `create_collection`           | Create a collection                                                  |
@@ -92,10 +91,11 @@ Requires `pip install zotero-mcp[graph]` (adds networkx) and `OPENALEX_API_KEY` 
 
 | Tool                       | Description                                                                       |
 | -------------------------- | --------------------------------------------------------------------------------- |
-| `build_knowledge_graph`    | Build citation network from entire library via OpenAlex (run once to initialize)  |
-| `query_knowledge_graph`    | PageRank, clusters, bridge papers, shortest paths, neighborhood, graph stats      |
+| `build_knowledge_graph`    | Build or sync citation network via OpenAlex (auto-detects full vs incremental)    |
+| `query_knowledge_graph`    | PageRank, clusters (topic-labeled), bridge papers, shortest paths, neighborhood   |
 | `find_related_papers`      | Semantic Scholar recommendations from library seeds (like Connected Papers)        |
-| `sync_knowledge_graph`     | Incremental update for new items since last build                                 |
+| `query_authors`            | Prolific/influential authors, co-author lookup, ego network, author clusters      |
+| `export_knowledge_graph`   | Interactive HTML visualization (citations, authors, or full view) with D3.js      |
 
 ## Writing with live citations
 
@@ -177,7 +177,7 @@ OpenAlex requires a free API key as of Feb 2026:
 pip install zotero-mcp[graph]
 ```
 
-This adds networkx (plus numpy and scipy for PageRank) for `build_knowledge_graph`, `query_knowledge_graph`, and `sync_knowledge_graph`. The `find_related_papers` tool works without it (uses Semantic Scholar API directly).
+This adds networkx (plus numpy and scipy for PageRank) for `build_knowledge_graph`, `query_knowledge_graph`, `query_authors`, and `export_knowledge_graph`. The `find_related_papers` tool works without it (uses Semantic Scholar API directly).
 
 Optionally set `SEMANTIC_SCHOLAR_API_KEY` for improved rate limits.
 

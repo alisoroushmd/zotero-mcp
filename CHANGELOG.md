@@ -6,6 +6,49 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/).
 
 ## [Unreleased]
 
+## [0.6.0] - 2026-04-15
+
+### Added
+
+- **Topic-labeled clusters** — `query_knowledge_graph(query_type="clusters")` now returns
+  `label`, `secondary_labels`, and `topic_distribution` per cluster, derived from OpenAlex
+  topic hierarchy (subfield level). Graceful degradation: clusters from pre-0.6.0 databases
+  are labeled "Unlabeled"
+- **Author co-citation network** — `query_authors` tool with query types: prolific (by paper
+  count), influential (by summed PageRank), coauthors_of, network (ego network within N hops),
+  clusters. Fuzzy name resolution (substring + SequenceMatcher > 0.85)
+- **Graph visualization** — `export_knowledge_graph` tool generates interactive HTML with
+  D3.js force-directed layout. Three views: `citations` (paper nodes colored by cluster),
+  `authors` (co-authorship edges), `full` (both layers, papers capped at 200 by PageRank).
+  Drag, zoom, click-to-inspect info panel
+- `GraphStore` schema: 3 new tables (`paper_topics`, `authors`, `paper_authors`) with
+  `CREATE TABLE IF NOT EXISTS` for transparent upgrade from v0.5.0 databases
+- `OpenAlexClient.extract_topics()` and `extract_authorships()` static methods — parse
+  topic hierarchy and structured author records from already-fetched work dicts (no new API calls)
+- `graph_renderer.py` module — HTML template with embedded D3.js visualization
+- `build_knowledge_graph` now indexes topics and authors from OpenAlex responses, reporting
+  `topics_indexed` and `authors_indexed` in stats. Auto-detects incremental sync vs full
+  build (set `full_rebuild=true` to force)
+
+### Changed
+
+- Tool count stays at 32 (3 new tools added, 3 consolidated away)
+- Consolidated `create_item_from_identifier` + `create_item_from_url` → `create_item`
+  (auto-routes URLs vs bare identifiers)
+- Consolidated `get_author_network` into `query_authors(query_type="network")`
+- Consolidated `sync_knowledge_graph` into `build_knowledge_graph` (auto-detects sync)
+- `KnowledgeGraph` now maintains a separate `nx.Graph` for co-authorship (keeps citation
+  DiGraph clean for PageRank and community detection)
+- `build_from_store()` loads topic data for cluster labeling and builds author/co-authorship
+  structures from `GraphStore`
+
+### Removed
+
+- `create_item_from_identifier` — replaced by `create_item`
+- `create_item_from_url` — replaced by `create_item`
+- `get_author_network` — replaced by `query_authors(query_type="network")`
+- `sync_knowledge_graph` — replaced by `build_knowledge_graph` (auto-detects)
+
 ## [0.5.0] - 2026-04-08
 
 ### Added

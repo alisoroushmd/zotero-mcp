@@ -177,3 +177,123 @@ def test_bulk_get_works_single_doi():
     client = OpenAlexClient()
     results = client.bulk_get_works(["10.1/only"])
     assert len(results) == 1
+
+
+# --- Static extraction helpers (no API calls, no respx needed) ---
+
+
+def test_extract_topics():
+    """extract_topics parses topic hierarchy from an OpenAlex work dict."""
+    work = {
+        "topics": [
+            {
+                "id": "https://openalex.org/T10234",
+                "display_name": "Gastric Cancer Risk Factors",
+                "subfield": {"id": "https://openalex.org/subfields/2721", "display_name": "Gastroenterology"},
+                "field": {"id": "https://openalex.org/fields/27", "display_name": "Medicine"},
+                "domain": {"id": "https://openalex.org/domains/4", "display_name": "Health Sciences"},
+                "score": 0.95,
+            },
+            {
+                "id": "https://openalex.org/T20456",
+                "display_name": "Helicobacter pylori Pathogenesis",
+                "subfield": {"id": "https://openalex.org/subfields/2726", "display_name": "Microbiology"},
+                "field": {"id": "https://openalex.org/fields/27", "display_name": "Medicine"},
+                "domain": {"id": "https://openalex.org/domains/4", "display_name": "Health Sciences"},
+                "score": 0.82,
+            },
+        ]
+    }
+    topics = OpenAlexClient.extract_topics(work)
+    assert len(topics) == 2
+    assert topics[0]["topic_id"] == "T10234"
+    assert topics[0]["topic_name"] == "Gastric Cancer Risk Factors"
+    assert topics[0]["subfield"] == "Gastroenterology"
+    assert topics[0]["field"] == "Medicine"
+    assert topics[0]["domain"] == "Health Sciences"
+    assert topics[0]["score"] == 0.95
+    assert topics[1]["topic_id"] == "T20456"
+    assert topics[1]["topic_name"] == "Helicobacter pylori Pathogenesis"
+    assert topics[1]["score"] == 0.82
+
+
+def test_extract_topics_empty():
+    """extract_topics returns empty list when work has no topics key."""
+    assert OpenAlexClient.extract_topics({}) == []
+    assert OpenAlexClient.extract_topics({"topics": []}) == []
+
+
+def test_extract_authorships():
+    """extract_authorships parses structured author records from an OpenAlex work dict."""
+    work = {
+        "authorships": [
+            {
+                "author": {
+                    "id": "https://openalex.org/A5023888391",
+                    "display_name": "John Smith",
+                    "orcid": "https://orcid.org/0000-0001-2345-6789",
+                },
+                "institutions": [{"display_name": "Mount Sinai"}],
+                "author_position": "first",
+            },
+            {
+                "author": {
+                    "id": "https://openalex.org/A5098765432",
+                    "display_name": "Jane Doe",
+                    "orcid": "https://orcid.org/0000-0002-9876-5432",
+                },
+                "institutions": [
+                    {"display_name": "Harvard Medical School"},
+                    {"display_name": "Brigham and Women's Hospital"},
+                ],
+                "author_position": "middle",
+            },
+            {
+                "author": {
+                    "id": "https://openalex.org/A5011112222",
+                    "display_name": "Bob Chen",
+                    "orcid": "https://orcid.org/0000-0003-1111-2222",
+                },
+                "institutions": [{"display_name": "Stanford University"}],
+                "author_position": "last",
+            },
+        ]
+    }
+    authors = OpenAlexClient.extract_authorships(work)
+    assert len(authors) == 3
+    assert authors[0]["openalex_author_id"] == "A5023888391"
+    assert authors[0]["display_name"] == "John Smith"
+    assert authors[0]["orcid"] == "0000-0001-2345-6789"
+    assert authors[0]["institution"] == "Mount Sinai"
+    assert authors[0]["position"] == 0
+    # Second author — takes first institution only
+    assert authors[1]["openalex_author_id"] == "A5098765432"
+    assert authors[1]["institution"] == "Harvard Medical School"
+    assert authors[1]["position"] == 1
+    # Third author
+    assert authors[2]["position"] == 2
+    assert authors[2]["display_name"] == "Bob Chen"
+
+
+def test_extract_authorships_handles_missing_fields():
+    """extract_authorships gracefully handles missing orcid and institutions."""
+    work = {
+        "authorships": [
+            {
+                "author": {
+                    "id": "https://openalex.org/A5055555555",
+                    "display_name": "Anonymous Researcher",
+                    "orcid": None,
+                },
+                "institutions": [],
+                "author_position": "first",
+            },
+        ]
+    }
+    authors = OpenAlexClient.extract_authorships(work)
+    assert len(authors) == 1
+    assert authors[0]["openalex_author_id"] == "A5055555555"
+    assert authors[0]["display_name"] == "Anonymous Researcher"
+    assert authors[0]["orcid"] == ""
+    assert authors[0]["institution"] == ""
+    assert authors[0]["position"] == 0
