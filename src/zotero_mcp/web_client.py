@@ -74,6 +74,15 @@ SEARCH_TIMEOUT = httpx.Timeout(
 )  # searches can be slow on large libraries
 
 
+# medRxiv/bioRxiv DOI prefixes (medRxiv migrated from 10.1101 to 10.64898)
+_PREPRINT_DOI_PREFIXES = ("10.1101/", "10.64898/")
+
+
+def _is_preprint_doi(doi: str) -> bool:
+    """Check if a DOI belongs to bioRxiv or medRxiv."""
+    return doi.startswith(_PREPRINT_DOI_PREFIXES)
+
+
 def _is_valid_pdf(content: bytes) -> bool:
     """Validate PDF by magic bytes rather than content length."""
     return len(content) >= 5 and content[:5] == b"%PDF-"
@@ -355,7 +364,7 @@ class WebClient:
         when a preprint DOI is linked to its final journal article.
 
         Args:
-            doi: DOI to check (typically a bioRxiv/medRxiv DOI starting with 10.1101/).
+            doi: DOI to check (typically a bioRxiv/medRxiv DOI starting with 10.1101/ or 10.64898/).
 
         Returns:
             Dict with published_doi (str | None).
@@ -1536,6 +1545,50 @@ class WebClient:
         resp.raise_for_status()
         return {"status": "emptied"}
 
+    def get_all_items_with_dois(self) -> list[dict]:
+        """Fetch all library items that have a DOI, paginating through results.
+
+        Uses the Zotero API's ``start`` and ``limit`` params with ``Total-Results``
+        header for pagination. Excludes attachments and notes.
+
+        Returns:
+            List of dicts with keys: key, DOI, title (from _format_summary).
+        """
+        from zotero_mcp.local_client import _format_summary
+
+        results: list[dict] = []
+        start = 0
+        page_size = 100  # Zotero API max per page
+        total = None
+
+        while True:
+            params = {
+                "limit": page_size,
+                "start": start,
+                "itemType": "-attachment || -note",
+                "format": "json",
+            }
+            resp = self._web_client.get(
+                "/items/top",
+                params=params,
+                timeout=SEARCH_TIMEOUT,
+            )
+            resp.raise_for_status()
+
+            if total is None:
+                total = int(resp.headers.get("Total-Results", "0"))
+
+            for item in resp.json():
+                summary = _format_summary(item)
+                if summary.get("DOI"):
+                    results.append(summary)
+
+            start += page_size
+            if start >= total:
+                break
+
+        return results
+
     def get_tags(self, prefix: str = "") -> list[str]:
         """Return all tags in the library, optionally filtered by prefix.
 
@@ -1858,7 +1911,7 @@ class WebClient:
             logger.warning("Unpaywall PDF download failed for %s: %s", doi, exc)
 
         # 2. Try PubMed Central
-        if not doi.startswith("10.1101/"):  # Skip bioRxiv DOIs for PMC
+        if not _is_preprint_doi(doi):  # Skip bioRxiv/medRxiv DOIs for PMC
             try:
                 id_resp = self._pubmed_client.get(
                     "/esearch.fcgi",
@@ -1879,8 +1932,8 @@ class WebClient:
             except Exception as exc:
                 logger.warning("PMC PDF download failed for %s: %s", doi, exc)
 
-        # 3. Try bioRxiv/medRxiv (DOIs starting with 10.1101/)
-        if doi.startswith("10.1101/"):
+        # 3. Try bioRxiv/medRxiv
+        if _is_preprint_doi(doi):
             for server, host in (
                 ("biorxiv", "www.biorxiv.org"),
                 ("medrxiv", "www.medrxiv.org"),

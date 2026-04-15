@@ -2,8 +2,8 @@
   "manifest_version": "0.3",
   "name": "zotero-mcp",
   "display_name": "Zotero",
-  "version": "0.2.0",
-  "description": "Search, organize, and cite from your Zotero library",
+  "version": "0.5.0",
+  "description": "Search, organize, cite, and analyze your Zotero library",
   "author": {
     "name": "Ali Soroush",
     "url": "https://github.com/alisoroushmd/zotero-mcp"
@@ -16,7 +16,9 @@
       "args": ["--directory", "${__dirname}", "run", "zotero-mcp"],
       "env": {
         "ZOTERO_API_KEY": "${user_config.api_key}",
-        "ZOTERO_USER_ID": "${user_config.user_id}"
+        "ZOTERO_USER_ID": "${user_config.user_id}",
+        "OPENALEX_API_KEY": "${user_config.openalex_api_key}",
+        "SEMANTIC_SCHOLAR_API_KEY": "${user_config.semantic_scholar_api_key}"
       }
     }
   },
@@ -33,6 +35,20 @@
       "title": "Zotero User ID",
       "description": "Shown on the API keys page",
       "required": true
+    },
+    "openalex_api_key": {
+      "type": "string",
+      "title": "OpenAlex API Key",
+      "description": "Free key from openalex.org/users/me — required for knowledge graph and citation tools",
+      "sensitive": true,
+      "required": false
+    },
+    "semantic_scholar_api_key": {
+      "type": "string",
+      "title": "Semantic Scholar API Key",
+      "description": "Optional — improves rate limits for find_related_papers",
+      "sensitive": true,
+      "required": false
     }
   },
   "compatibility": {

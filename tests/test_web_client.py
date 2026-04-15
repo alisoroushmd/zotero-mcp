@@ -854,3 +854,58 @@ def test_rename_tag_patches_all_items():
     assert "new" in tag_names
     assert "old" not in tag_names
     assert "keep" in tag_names
+
+
+# -- get_all_items_with_dois tests --
+
+
+@respx.mock
+def test_get_all_items_with_dois_paginates():
+    """get_all_items_with_dois fetches multiple pages."""
+    page1 = [
+        {
+            "key": "A",
+            "data": {"itemType": "journalArticle", "title": "P1", "DOI": "10.1/a"},
+        },
+    ]
+    page2 = [
+        {
+            "key": "B",
+            "data": {"itemType": "journalArticle", "title": "P2", "DOI": "10.1/b"},
+        },
+    ]
+    respx.get(
+        url__regex=r".*/items/top.*",
+        params__contains={"start": "0"},
+    ).mock(
+        return_value=httpx.Response(200, json=page1, headers={"Total-Results": "101"})
+    )
+    respx.get(
+        url__regex=r".*/items/top.*",
+        params__contains={"start": "100"},
+    ).mock(
+        return_value=httpx.Response(200, json=page2, headers={"Total-Results": "101"})
+    )
+
+    client = WebClient(api_key="test", user_id="123")
+    items = client.get_all_items_with_dois()
+    assert len(items) == 2
+    assert items[0]["DOI"] == "10.1/a"
+
+
+@respx.mock
+def test_get_all_items_with_dois_skips_no_doi():
+    """Items without DOIs are excluded."""
+    items = [
+        {
+            "key": "A",
+            "data": {"itemType": "journalArticle", "title": "P1", "DOI": "10.1/a"},
+        },
+        {"key": "B", "data": {"itemType": "journalArticle", "title": "P2"}},
+    ]
+    respx.get(url__regex=r".*/items/top.*").mock(
+        return_value=httpx.Response(200, json=items, headers={"Total-Results": "2"})
+    )
+    client = WebClient(api_key="test", user_id="123")
+    result = client.get_all_items_with_dois()
+    assert len(result) == 1

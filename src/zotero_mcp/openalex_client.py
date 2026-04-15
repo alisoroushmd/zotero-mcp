@@ -1,4 +1,4 @@
-"""OpenAlex API client — citation graph and retraction data."""
+"""OpenAlex API client — citation graph, retraction data, and bulk queries."""
 
 from __future__ import annotations
 
@@ -10,6 +10,8 @@ import httpx
 logger = logging.getLogger(__name__)
 
 OPENALEX_BASE = "https://api.openalex.org"
+OPENALEX_API_KEY = os.environ.get("OPENALEX_API_KEY", "")
+POLITE_EMAIL = "zotero-mcp@example.com"
 TIMEOUT = 10.0
 POLITE_EMAIL = os.environ.get("ZOTERO_MCP_EMAIL", "zotero-mcp@example.com")
 
@@ -17,15 +19,20 @@ POLITE_EMAIL = os.environ.get("ZOTERO_MCP_EMAIL", "zotero-mcp@example.com")
 class OpenAlexClient:
     """Wrapper for the OpenAlex API.
 
-    Used for retraction checks (Feature 3) and citation graph (Feature 5).
-    OpenAlex is free and requires no API key. Polite pool access uses
-    an email in the User-Agent header.
+    Used for retraction checks, citation graph, and knowledge graph bulk queries.
+    As of Feb 2026, OpenAlex requires a free API key. Register at
+    https://openalex.org/users/me and set OPENALEX_API_KEY env var.
     """
 
-    def __init__(self, email: str = POLITE_EMAIL) -> None:
+    def __init__(
+        self, api_key: str = OPENALEX_API_KEY, email: str = POLITE_EMAIL
+    ) -> None:
+        headers = {"User-Agent": f"zotero-mcp/1.0 (mailto:{email})"}
+        if api_key:
+            headers["Authorization"] = f"Bearer {api_key}"
         self._client = httpx.Client(
             base_url=OPENALEX_BASE,
-            headers={"User-Agent": f"zotero-mcp/1.0 (mailto:{email})"},
+            headers=headers,
             timeout=TIMEOUT,
         )
 
@@ -197,3 +204,69 @@ class OpenAlexClient:
                 }
 
         return {"is_preprint": True, "published_doi": None, "journal": None}
+
+    def bulk_get_works(self, dois: list[str], batch_size: int = 50) -> list[dict]:
+        """Batch-fetch work metadata for multiple DOIs.
+
+        OpenAlex filter syntax: ``doi:10.1/a|10.1/b`` (prefix once, values pipe-separated).
+        Up to ~50 per query to stay within URL length limits.
+
+        Args:
+            dois: List of DOI strings (without https://doi.org/ prefix).
+            batch_size: Max DOIs per API request.
+
+        Returns:
+            List of raw OpenAlex work dicts.
+        """
+        all_works: list[dict] = []
+        for i in range(0, len(dois), batch_size):
+            batch = dois[i : i + batch_size]
+            doi_filter = "doi:" + "|".join(batch)
+            try:
+                resp = self._client.get(
+                    "/works",
+                    params={"filter": doi_filter, "per_page": batch_size},
+                )
+                resp.raise_for_status()
+                all_works.extend(resp.json().get("results", []))
+            except Exception as exc:
+                logger.warning("OpenAlex bulk query failed for batch %d: %s", i, exc)
+        return all_works
+
+    def resolve_ids_to_dois(
+        self, openalex_ids: list[str], batch_size: int = 50
+    ) -> dict[str, str]:
+        """Resolve OpenAlex work IDs to DOIs.
+
+        ``referenced_works`` from OpenAlex are IDs like ``https://openalex.org/W123``,
+        not DOIs. This method batch-fetches those works and extracts DOIs.
+
+        Args:
+            openalex_ids: List of OpenAlex work IDs (e.g. ["W123", "W456"]).
+            batch_size: Max IDs per API request.
+
+        Returns:
+            Dict mapping OpenAlex ID -> DOI (only for works that have DOIs).
+        """
+        id_to_doi: dict[str, str] = {}
+        for i in range(0, len(openalex_ids), batch_size):
+            batch = openalex_ids[i : i + batch_size]
+            id_filter = "openalex:" + "|".join(batch)
+            try:
+                resp = self._client.get(
+                    "/works",
+                    params={
+                        "filter": id_filter,
+                        "per_page": batch_size,
+                        "select": "id,doi",
+                    },
+                )
+                resp.raise_for_status()
+                for work in resp.json().get("results", []):
+                    oa_id = (work.get("id") or "").split("/")[-1]
+                    doi = work.get("doi")
+                    if oa_id and doi:
+                        id_to_doi[oa_id] = doi.replace("https://doi.org/", "")
+            except Exception as exc:
+                logger.warning("OpenAlex ID resolution failed for batch %d: %s", i, exc)
+        return id_to_doi

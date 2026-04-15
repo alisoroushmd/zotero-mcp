@@ -2,10 +2,13 @@
 
 from __future__ import annotations
 
+import logging
 import os
 from dataclasses import dataclass
 
 import httpx
+
+logger = logging.getLogger(__name__)
 
 
 @dataclass
@@ -64,6 +67,11 @@ TOOL_MODES: dict[str, list[str]] = {
     "get_tags": ["any_read"],
     "remove_tag": ["cloud_crud"],
     "rename_tag": ["cloud_crud"],
+    "check_published_versions": ["cloud_crud"],
+    "build_knowledge_graph": ["cloud_crud"],
+    "query_knowledge_graph": ["any_read"],
+    "find_related_papers": ["cloud_crud"],
+    "sync_knowledge_graph": ["cloud_crud"],
 }
 
 
@@ -109,6 +117,13 @@ def check_capabilities() -> ServerCapabilities:
         web_error = (
             f"Missing environment variable(s): {', '.join(missing)}. "
             f"Get your API key at https://www.zotero.org/settings/keys"
+        )
+
+    openalex_key = os.environ.get("OPENALEX_API_KEY", "")
+    if not openalex_key:
+        logger.warning(
+            "OPENALEX_API_KEY not set — knowledge graph, citation graph, "
+            "and retraction checks may fail"
         )
 
     return ServerCapabilities(

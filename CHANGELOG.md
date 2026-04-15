@@ -6,15 +6,52 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/).
 
 ## [Unreleased]
 
+## [0.5.0] - 2026-04-08
+
 ### Added
 
+- **Knowledge Graph** — 4 new tools for library-wide citation analysis:
+  - `build_knowledge_graph` — batch-fetch citation data for all library DOIs via OpenAlex,
+    resolve references to DOIs (two-pass), build persistent citation network in SQLite
+  - `query_knowledge_graph` — PageRank (influential papers), community detection (clusters),
+    betweenness centrality (bridge papers), shortest paths, neighborhood queries, graph stats
+  - `find_related_papers` — Semantic Scholar recommendations from library seeds, each flagged
+    with `in_library` status. Similar to Connected Papers / ResearchRabbit
+  - `sync_knowledge_graph` — incremental update for new/changed items since last build
+- `GraphStore` module — SQLite persistence for papers (nodes) and citations (edges) at
+  `~/.local/share/zotero-mcp/knowledge_graph.db`
+- `KnowledgeGraph` module — NetworkX DiGraph with cached graph analytics
+- `SemanticScholarClient` module — paper recommendations via raw httpx (no third-party wrapper)
+- `OpenAlexClient.bulk_get_works(dois)` — batch-fetch work metadata (up to 50 DOIs per query)
+- `OpenAlexClient.resolve_ids_to_dois(openalex_ids)` — convert OpenAlex work IDs to DOIs
+  for DOI-keyed citation graph construction
+- `WebClient.get_all_items_with_dois()` — paginated fetcher for all library items with DOIs
 - `check_published_versions` tool — checks whether preprints in the library have been
   formally published in a peer-reviewed journal. Uses CrossRef `relation.is-preprint-of`
-  (authoritative) and OpenAlex location data (journal name). Reports published DOI, journal
-  name, and whether the published version is already saved in the library.
-- `OpenAlexClient.check_published_version(doi)` — detects preprint type and finds journal
-  locations in OpenAlex work metadata
-- `WebClient.check_crossref_published(doi)` — reads CrossRef `relation.is-preprint-of` field
+  (authoritative) and OpenAlex location data (journal name)
+- `[graph]` optional extra in pyproject.toml — `pip install zotero-mcp[graph]` adds networkx, numpy, scipy
+
+### Changed
+
+- Tool count increased from 27 to 32
+- OpenAlex client now requires API key authentication via `OPENALEX_API_KEY` env var
+  (required since Feb 2026 — register free at openalex.org/users/me)
+- `capabilities.py` warns if `OPENALEX_API_KEY` is not set
+- manifest.json updated to v0.5.0 with `OPENALEX_API_KEY` and `SEMANTIC_SCHOLAR_API_KEY` config fields
+- medRxiv DOI detection extended to `10.64898/` prefix (migration from `10.1101/`)
+- Development setup simplified to `pip install -e ".[dev,graph]"`
+- Python 3.14 compatibility verified
+
+### Removed
+
+- Completed feature plans (Features 1–5, hardening) and original roadmap spec
+- Duplicate `[dependency-groups]` section in pyproject.toml
+
+### Breaking
+
+- OpenAlex API key now required for citation graph, retraction checks, and knowledge graph
+  tools. Set `OPENALEX_API_KEY` environment variable. The previous polite-pool email
+  approach no longer works as of Feb 2026.
 
 ## [0.4.0] - 2026-04-07
 

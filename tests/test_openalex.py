@@ -86,3 +86,94 @@ def test_get_work_strips_doi_prefix():
     result = client.get_work("https://doi.org/10.1234/test")
     assert result is not None
     assert result["title"] == "Test Paper"
+
+
+@respx.mock
+def test_bulk_get_works_batches_dois():
+    """bulk_get_works fetches metadata for multiple DOIs in batches."""
+    respx.get(
+        f"{OPENALEX_BASE}/works",
+        params__contains={"filter": "doi:10.1/a|10.1/b"},
+    ).mock(
+        return_value=httpx.Response(
+            200,
+            json={
+                "results": [
+                    {
+                        "id": "https://openalex.org/W1",
+                        "doi": "https://doi.org/10.1/a",
+                        "title": "Paper A",
+                        "publication_year": 2020,
+                        "authorships": [],
+                        "referenced_works": ["https://openalex.org/W99"],
+                    },
+                    {
+                        "id": "https://openalex.org/W2",
+                        "doi": "https://doi.org/10.1/b",
+                        "title": "Paper B",
+                        "publication_year": 2022,
+                        "authorships": [],
+                        "referenced_works": [],
+                    },
+                ]
+            },
+        )
+    )
+    client = OpenAlexClient()
+    results = client.bulk_get_works(["10.1/a", "10.1/b"])
+    assert len(results) == 2
+    assert results[0]["doi"] == "https://doi.org/10.1/a"
+
+
+@respx.mock
+def test_resolve_openalex_ids_to_dois():
+    """resolve_ids_to_dois converts OpenAlex IDs to DOIs."""
+    respx.get(
+        f"{OPENALEX_BASE}/works",
+        params__contains={"filter": "openalex:W99|W100"},
+    ).mock(
+        return_value=httpx.Response(
+            200,
+            json={
+                "results": [
+                    {
+                        "id": "https://openalex.org/W99",
+                        "doi": "https://doi.org/10.1/ref1",
+                    },
+                    {"id": "https://openalex.org/W100", "doi": None},
+                ]
+            },
+        )
+    )
+    client = OpenAlexClient()
+    mapping = client.resolve_ids_to_dois(["W99", "W100"])
+    assert mapping == {"W99": "10.1/ref1"}
+    # W100 has no DOI, so it's excluded
+
+
+@respx.mock
+def test_bulk_get_works_single_doi():
+    """bulk_get_works works with a single DOI (no trailing pipe)."""
+    respx.get(
+        f"{OPENALEX_BASE}/works",
+        params__contains={"filter": "doi:10.1/only"},
+    ).mock(
+        return_value=httpx.Response(
+            200,
+            json={
+                "results": [
+                    {
+                        "id": "W1",
+                        "doi": "https://doi.org/10.1/only",
+                        "title": "Only",
+                        "publication_year": 2023,
+                        "authorships": [],
+                        "referenced_works": [],
+                    },
+                ]
+            },
+        )
+    )
+    client = OpenAlexClient()
+    results = client.bulk_get_works(["10.1/only"])
+    assert len(results) == 1

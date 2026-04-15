@@ -1,5 +1,7 @@
 """MCP server exposing Zotero tools via FastMCP."""
 
+from __future__ import annotations
+
 import atexit
 import functools
 import json
@@ -9,12 +11,13 @@ import re
 import tempfile
 import threading
 import time
+
 import httpx
 from fastmcp import FastMCP
 
 from zotero_mcp.capabilities import check_capabilities, format_status
 from zotero_mcp.local_client import LocalClient
-from zotero_mcp.web_client import WebClient
+from zotero_mcp.web_client import WebClient, _is_preprint_doi
 
 logger = logging.getLogger(__name__)
 
@@ -72,6 +75,7 @@ def _get_allowed_path_roots() -> list[str]:
     """
     if not _ALLOWED_PATH_ROOTS:
         import pathlib
+
         candidates = [
             pathlib.Path.cwd(),
             pathlib.Path.home(),
@@ -94,9 +98,12 @@ def _validate_path(file_path: str, name: str = "path") -> str:
     Returns the resolved absolute path string.
     """
     import pathlib
+
     resolved = str(pathlib.Path(file_path).resolve())
     allowed = _get_allowed_path_roots()
-    if not any(resolved.startswith(root + os.sep) or resolved == root for root in allowed):
+    if not any(
+        resolved.startswith(root + os.sep) or resolved == root for root in allowed
+    ):
         raise ValueError(
             f"{name} must be within the working directory, home directory, "
             f"or temp directory. Got: {file_path!r}"
@@ -847,13 +854,39 @@ def add_to_collection(item_key: str, collection_key: str) -> str:
 
 
 _ALLOWED_UPDATE_FIELDS = {
-    "title", "creators", "date", "DOI", "url", "abstractNote",
-    "publicationTitle", "volume", "issue", "pages", "publisher",
-    "ISBN", "ISSN", "extra", "tags", "collections", "itemType",
-    "bookTitle", "proceedingsTitle", "series", "seriesTitle",
-    "language", "rights", "shortTitle", "accessDate", "archive",
-    "archiveLocation", "callNumber", "libraryCatalog", "place",
-    "numPages", "edition", "numberOfVolumes",
+    "title",
+    "creators",
+    "date",
+    "DOI",
+    "url",
+    "abstractNote",
+    "publicationTitle",
+    "volume",
+    "issue",
+    "pages",
+    "publisher",
+    "ISBN",
+    "ISSN",
+    "extra",
+    "tags",
+    "collections",
+    "itemType",
+    "bookTitle",
+    "proceedingsTitle",
+    "series",
+    "seriesTitle",
+    "language",
+    "rights",
+    "shortTitle",
+    "accessDate",
+    "archive",
+    "archiveLocation",
+    "callNumber",
+    "libraryCatalog",
+    "place",
+    "numPages",
+    "edition",
+    "numberOfVolumes",
 }
 
 
@@ -985,7 +1018,7 @@ def check_published_versions(item_keys: str | list[str]) -> str:
 
         # OpenAlex for confirmation and journal name
         oa = openalex.check_published_version(doi)
-        entry["is_preprint"] = oa.get("is_preprint", doi.startswith("10.1101/"))
+        entry["is_preprint"] = oa.get("is_preprint", _is_preprint_doi(doi))
 
         # Use CrossRef DOI if available; fall back to OpenAlex
         if not published_doi and oa.get("published_doi"):
@@ -1203,3 +1236,375 @@ def write_cited_document(content: str, output_path: str) -> str:
             f"{', '.join(missing_keys)}. These citations were skipped."
         )
     return json.dumps(result, ensure_ascii=False)
+
+
+# -- Knowledge graph tools --
+
+# Module-level graph cache (avoids rebuilding from SQLite on every query)
+_kg_cache: KnowledgeGraph | None = None
+_kg_cache_lock = threading.Lock()
+
+
+def _get_or_build_kg() -> KnowledgeGraph:
+    """Return cached KnowledgeGraph, rebuilding from SQLite if needed."""
+    global _kg_cache
+    with _kg_cache_lock:
+        if _kg_cache is not None:
+            return _kg_cache
+        from zotero_mcp.graph_store import GraphStore
+        from zotero_mcp.knowledge_graph import KnowledgeGraph
+
+        store = GraphStore()
+        if store.get_last_sync() is None:
+            raise RuntimeError(
+                "Knowledge graph not yet built. Run build_knowledge_graph first."
+            )
+        kg = KnowledgeGraph()
+        kg.build_from_store(store)
+        _kg_cache = kg
+        return kg
+
+
+def _invalidate_kg_cache() -> None:
+    """Invalidate the cached graph after build/sync."""
+    global _kg_cache
+    with _kg_cache_lock:
+        _kg_cache = None
+
+
+def _extract_openalex_id(url: str) -> str:
+    """Extract OpenAlex ID from URL like 'https://openalex.org/W123'."""
+    return url.split("/")[-1] if "/" in url else url
+
+
+@mcp.tool(
+    description=(
+        "Build a knowledge graph from your entire Zotero library. "
+        "Fetches citation data for all items with DOIs via OpenAlex, "
+        "resolves references to DOIs, stores in a local database, and "
+        "computes graph analytics. Run once to initialize, then use "
+        "sync_knowledge_graph for updates."
+    ),
+)
+@_handle_tool_errors
+def build_knowledge_graph() -> str:
+    """Build the full knowledge graph from library items."""
+    from zotero_mcp.graph_store import GraphStore
+    from zotero_mcp.knowledge_graph import KnowledgeGraph
+    from zotero_mcp.openalex_client import OpenAlexClient
+
+    web = _get_web()
+    openalex = OpenAlexClient()
+    store = GraphStore()
+
+    # Step 1: Fetch ALL library items with DOIs (paginated)
+    items = web.get_all_items_with_dois()
+    if not items:
+        return json.dumps({"error": "No items with DOIs found in library"})
+
+    doi_list = [item["DOI"] for item in items]
+    key_by_doi = {item["DOI"]: item["key"] for item in items}
+
+    # Step 2: Batch-fetch from OpenAlex
+    works = openalex.bulk_get_works(doi_list)
+
+    # Step 3: Store papers and collect referenced OpenAlex IDs
+    papers_added = 0
+    all_ref_ids: set[str] = set()
+    work_refs: dict[str, list[str]] = {}
+
+    for work in works:
+        doi = (work.get("doi") or "").replace("https://doi.org/", "")
+        if not doi:
+            continue
+        authorships = work.get("authorships", [])
+        authors = "; ".join(
+            a.get("author", {}).get("display_name", "") for a in authorships[:3]
+        )
+        store.upsert_paper(
+            doi=doi,
+            zotero_key=key_by_doi.get(doi, ""),
+            title=work.get("title", ""),
+            year=work.get("publication_year", 0),
+            authors=authors,
+            openalex_id=work.get("id", ""),
+        )
+        papers_added += 1
+
+        # Collect reference IDs for resolution
+        ref_ids = [
+            _extract_openalex_id(url) for url in work.get("referenced_works", [])
+        ]
+        if ref_ids:
+            work_refs[doi] = ref_ids
+            all_ref_ids.update(ref_ids)
+
+    # Step 4: Resolve OpenAlex IDs to DOIs (second pass)
+    known_oa_ids = {_extract_openalex_id(w.get("id", "")) for w in works if w.get("id")}
+    unknown_ids = list(all_ref_ids - known_oa_ids)
+
+    # Build initial mapping from already-fetched works
+    id_to_doi: dict[str, str] = {}
+    for w in works:
+        oa_id = _extract_openalex_id(w.get("id", ""))
+        d = (w.get("doi") or "").replace("https://doi.org/", "")
+        if oa_id and d:
+            id_to_doi[oa_id] = d
+
+    # Resolve the rest
+    if unknown_ids:
+        resolved = openalex.resolve_ids_to_dois(unknown_ids)
+        id_to_doi.update(resolved)
+        # Also store these referenced papers
+        for oa_id, ref_doi in resolved.items():
+            store.upsert_paper(
+                doi=ref_doi,
+                zotero_key="",  # not in library
+                title="",
+                year=0,
+                authors="",
+                openalex_id=f"https://openalex.org/{oa_id}",
+            )
+
+    # Step 5: Store citation edges (DOI -> DOI)
+    citations_added = 0
+    for citing_doi, ref_ids in work_refs.items():
+        for ref_id in ref_ids:
+            cited_doi = id_to_doi.get(ref_id)
+            if cited_doi:
+                store.upsert_citation(citing_doi=citing_doi, cited_doi=cited_doi)
+                citations_added += 1
+
+    # Step 6: Build graph and compute stats
+    from datetime import datetime, timezone
+
+    store.set_last_sync(datetime.now(timezone.utc).isoformat())
+
+    _invalidate_kg_cache()
+    kg = _get_or_build_kg()
+    stats = kg.get_stats()
+    stats["papers_indexed"] = papers_added
+    stats["citations_indexed"] = citations_added
+    stats["references_resolved"] = len(id_to_doi)
+
+    return json.dumps(stats, ensure_ascii=False)
+
+
+@mcp.tool(
+    description=(
+        "Query the knowledge graph for insights about your library. "
+        "Query types: 'influential' (PageRank-ranked papers), "
+        "'clusters' (research topic groupings), "
+        "'bridges' (papers connecting different clusters), "
+        "'path' (shortest citation path between two DOIs — requires doi_a and doi_b), "
+        "'neighborhood' (papers within N hops of a DOI — requires doi and optional depth), "
+        "'stats' (graph summary). "
+        "Requires build_knowledge_graph to be run first."
+    ),
+    annotations={"readOnlyHint": True},
+)
+@_handle_tool_errors
+def query_knowledge_graph(
+    query_type: str,
+    doi: str = "",
+    doi_a: str = "",
+    doi_b: str = "",
+    depth: int = 1,
+    limit: int = 10,
+) -> str:
+    """Query the knowledge graph (uses cached graph)."""
+    kg = _get_or_build_kg()
+
+    if query_type == "influential":
+        result = kg.get_influential_papers(top_n=limit)
+    elif query_type == "clusters":
+        result = kg.get_clusters()
+    elif query_type == "bridges":
+        result = kg.get_bridge_papers(top_n=limit)
+    elif query_type == "path":
+        if not doi_a or not doi_b:
+            raise ValueError("path query requires doi_a and doi_b")
+        result = kg.get_path(doi_a, doi_b)
+    elif query_type == "neighborhood":
+        if not doi:
+            raise ValueError("neighborhood query requires doi")
+        result = kg.get_neighborhood(doi, depth=depth)
+    elif query_type == "stats":
+        result = kg.get_stats()
+    else:
+        raise ValueError(
+            f"Unknown query_type: {query_type!r}. "
+            "Must be: influential, clusters, bridges, path, neighborhood, stats"
+        )
+
+    return json.dumps(result, ensure_ascii=False)
+
+
+@mcp.tool(
+    description=(
+        "Find papers related to items in your Zotero library using "
+        "Semantic Scholar recommendations. Similar to Connected Papers "
+        "or ResearchRabbit. Provide one or more item keys as seeds — "
+        "the more seeds, the better the recommendations. Each result "
+        "is flagged with in_library (true/false)."
+    ),
+    annotations={"readOnlyHint": True},
+)
+@_handle_tool_errors
+def find_related_papers(
+    item_keys: str | list[str],
+    limit: str | int = 10,
+) -> str:
+    """Get paper recommendations from Semantic Scholar."""
+    from zotero_mcp.semantic_scholar_client import SemanticScholarClient
+
+    keys = _parse_list_param(item_keys) or []
+    if not keys:
+        raise ValueError("item_keys must not be empty")
+    for k in keys:
+        _validate_key(k, "item_key")
+
+    limit_int = _clamp_limit(limit, lo=1, hi=50)
+    web = _get_web()
+
+    # Resolve keys to DOIs
+    dois: list[str] = []
+    for key in keys:
+        item = web.get_item(key.strip())
+        if isinstance(item, dict) and item.get("DOI"):
+            dois.append(item["DOI"])
+
+    if not dois:
+        return json.dumps(
+            {
+                "error": "None of the provided items have DOIs",
+                "item_keys": keys,
+            }
+        )
+
+    s2 = SemanticScholarClient(api_key=os.environ.get("SEMANTIC_SCHOLAR_API_KEY"))
+    recommendations = s2.get_recommendations(dois, limit=limit_int)
+
+    # Flag which recommendations are already in library
+    for rec in recommendations:
+        rec_doi = rec.get("doi", "")
+        if rec_doi:
+            existing = web._check_duplicate_doi(rec_doi)
+            if existing:
+                rec["in_library"] = True
+                rec["zotero_key"] = existing["key"]
+            else:
+                rec["in_library"] = False
+        else:
+            rec["in_library"] = False
+
+    return json.dumps(
+        {
+            "seed_count": len(dois),
+            "recommendations": recommendations,
+        },
+        ensure_ascii=False,
+    )
+
+
+@mcp.tool(
+    description=(
+        "Incrementally update the knowledge graph with items added or "
+        "modified since the last build. Faster than a full rebuild. "
+        "Run build_knowledge_graph first, then use this for updates."
+    ),
+)
+@_handle_tool_errors
+def sync_knowledge_graph() -> str:
+    """Incrementally update the knowledge graph."""
+    from datetime import datetime, timezone
+
+    from zotero_mcp.graph_store import GraphStore
+    from zotero_mcp.openalex_client import OpenAlexClient
+
+    store = GraphStore()
+    last_sync = store.get_last_sync()
+    if last_sync is None:
+        raise RuntimeError(
+            "Knowledge graph not yet built. Run build_knowledge_graph first."
+        )
+
+    web = _get_web()
+    openalex = OpenAlexClient()
+
+    # Fetch all library items with DOIs (paginated)
+    items = web.get_all_items_with_dois()
+    existing_dois = store.get_doi_set()
+
+    # Find DOIs not yet in the graph
+    new_items = [item for item in items if item["DOI"] not in existing_dois]
+
+    if not new_items:
+        kg = _get_or_build_kg()
+        stats = kg.get_stats()
+        stats["new_papers"] = 0
+        stats["new_citations"] = 0
+        return json.dumps(stats, ensure_ascii=False)
+
+    new_dois = [item["DOI"] for item in new_items]
+    key_by_doi = {item["DOI"]: item["key"] for item in new_items}
+    works = openalex.bulk_get_works(new_dois)
+
+    new_papers = 0
+    new_citations = 0
+    all_ref_ids: set[str] = set()
+    work_refs: dict[str, list[str]] = {}
+
+    for work in works:
+        doi = (work.get("doi") or "").replace("https://doi.org/", "")
+        if not doi:
+            continue
+        authorships = work.get("authorships", [])
+        authors = "; ".join(
+            a.get("author", {}).get("display_name", "") for a in authorships[:3]
+        )
+        store.upsert_paper(
+            doi=doi,
+            zotero_key=key_by_doi.get(doi, ""),
+            title=work.get("title", ""),
+            year=work.get("publication_year", 0),
+            authors=authors,
+            openalex_id=work.get("id", ""),
+        )
+        new_papers += 1
+
+        ref_ids = [
+            _extract_openalex_id(url) for url in work.get("referenced_works", [])
+        ]
+        if ref_ids:
+            work_refs[doi] = ref_ids
+            all_ref_ids.update(ref_ids)
+
+    # Resolve new references to DOIs
+    id_to_doi: dict[str, str] = {}
+    for w in works:
+        oa_id = _extract_openalex_id(w.get("id", ""))
+        d = (w.get("doi") or "").replace("https://doi.org/", "")
+        if oa_id and d:
+            id_to_doi[oa_id] = d
+
+    unknown_ids = [oa_id for oa_id in all_ref_ids if oa_id not in id_to_doi]
+    if unknown_ids:
+        resolved = openalex.resolve_ids_to_dois(unknown_ids)
+        id_to_doi.update(resolved)
+
+    for citing_doi, ref_ids in work_refs.items():
+        for ref_id in ref_ids:
+            cited_doi = id_to_doi.get(ref_id)
+            if cited_doi:
+                store.upsert_citation(citing_doi=citing_doi, cited_doi=cited_doi)
+                new_citations += 1
+
+    store.set_last_sync(datetime.now(timezone.utc).isoformat())
+    _invalidate_kg_cache()
+    kg = _get_or_build_kg()
+    stats = kg.get_stats()
+    stats["new_papers"] = new_papers
+    stats["new_citations"] = new_citations
+
+    return json.dumps(stats, ensure_ascii=False)

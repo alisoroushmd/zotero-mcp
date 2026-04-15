@@ -2,7 +2,7 @@
 
 [![CI](https://github.com/alisoroushmd/zotero-mcp/actions/workflows/ci.yml/badge.svg)](https://github.com/alisoroushmd/zotero-mcp/actions/workflows/ci.yml)
 
-MCP server that lets AI assistants search, create, organize, and cite from a Zotero library. Produces Word documents with live Zotero field codes. Checks for retractions, finds duplicates, and maps citation graphs.
+MCP server that lets AI assistants search, create, organize, and cite from a Zotero library. Produces Word documents with live Zotero field codes. Checks for retractions, finds duplicates, maps citation graphs, and builds a knowledge graph with paper recommendations.
 
 ## Quickstart
 
@@ -25,11 +25,11 @@ Get your API key and user ID at [zotero.org/settings/keys](https://www.zotero.or
 
 ## Operating modes
 
-**All 28 tools work with just API credentials** — Zotero desktop does not need to be running.
+**All 32 tools work with just API credentials** — Zotero desktop does not need to be running.
 
 | Mode | What it provides | Requirements |
 | --- | --- | --- |
-| **Cloud** (primary) | All reads, writes, citations, attachments, retraction checks, and citation graph | `ZOTERO_API_KEY` + `ZOTERO_USER_ID` env vars |
+| **Cloud** (primary) | All reads, writes, citations, attachments, analysis tools | `ZOTERO_API_KEY` + `ZOTERO_USER_ID` env vars |
 | **Local** (optional) | Faster reads via Zotero desktop's local API (no rate limits) | Zotero 7 desktop running with local API enabled |
 
 When Zotero desktop is running, reads automatically use the faster local API. When it is not, reads fall back to the Web API transparently.
@@ -50,6 +50,7 @@ Call `server_status` to check which modes are available.
 | `get_notes`            | List child notes on an item                                               |
 | `get_item_attachments` | List attachments with availability status                                 |
 | `get_pdf_content`      | Find best path to a paper's full text (PMCID, local PDF, or web download) |
+| `get_tags`             | List all tags in the library, optionally filtered by prefix               |
 
 ### Write tools
 
@@ -66,7 +67,6 @@ Call `server_status` to check which modes are available.
 | `attach_pdf`                  | Attach a local or auto-downloaded PDF                                |
 | `trash_items`                 | Move items to trash (reversible)                                     |
 | `empty_trash`                 | Permanently delete all trashed items                                 |
-| `get_tags`                    | List all tags in the library, optionally filtered by prefix          |
 | `remove_tag`                  | Remove a tag from every item in the library                          |
 | `rename_tag`                  | Rename a tag across every item in the library                        |
 
@@ -85,6 +85,17 @@ Call `server_status` to check which modes are available.
 | `find_duplicates`          | Scan library for duplicate items by DOI and title similarity                      |
 | `get_citation_graph`       | Get citing/referenced works via OpenAlex with in-library flags                    |
 | `check_published_versions` | Check if preprints have been formally published; reports journal and in-library status |
+
+### Knowledge graph tools
+
+Requires `pip install zotero-mcp[graph]` (adds networkx) and `OPENALEX_API_KEY` env var.
+
+| Tool                       | Description                                                                       |
+| -------------------------- | --------------------------------------------------------------------------------- |
+| `build_knowledge_graph`    | Build citation network from entire library via OpenAlex (run once to initialize)  |
+| `query_knowledge_graph`    | PageRank, clusters, bridge papers, shortest paths, neighborhood, graph stats      |
+| `find_related_papers`      | Semantic Scholar recommendations from library seeds (like Connected Papers)        |
+| `sync_knowledge_graph`     | Incremental update for new items since last build                                 |
 
 ## Writing with live citations
 
@@ -117,6 +128,11 @@ After opening in Word with the Zotero plugin: click Refresh to populate the bibl
 │             │   analysis     ├──────────────────┤
 │             │ ──────────────>│ OpenAlex         │
 │             │                │ CrossRef updates │
+│             │  knowledge     ├──────────────────┤
+│             │  graph         │ SQLite + NetworkX│
+│             │                │ (local cache)    │
+│             │  related       ├──────────────────┤
+│             │  papers        │ Semantic Scholar │
 └─────────────┘                └──────────────────┘
 ```
 
@@ -148,6 +164,23 @@ pip install -e .
 
 Then configure your MCP client to run `python -m zotero_mcp`.
 
+### 4. Set up OpenAlex API key (required for analysis tools)
+
+OpenAlex requires a free API key as of Feb 2026:
+
+1. Register at [openalex.org/users/me](https://openalex.org/users/me)
+2. Set `OPENALEX_API_KEY` in your MCP client config
+
+### 5. Install knowledge graph support (optional)
+
+```bash
+pip install zotero-mcp[graph]
+```
+
+This adds networkx (plus numpy and scipy for PageRank) for `build_knowledge_graph`, `query_knowledge_graph`, and `sync_knowledge_graph`. The `find_related_papers` tool works without it (uses Semantic Scholar API directly).
+
+Optionally set `SEMANTIC_SCHOLAR_API_KEY` for improved rate limits.
+
 ## Troubleshooting
 
 | Problem                                     | Cause                                                | Fix                                                                           |
@@ -161,8 +194,7 @@ Then configure your MCP client to run `python -m zotero_mcp`.
 ## Development
 
 ```bash
-pip install -e .
-pip install pytest pytest-asyncio respx
+pip install -e ".[dev,graph]"
 python -m pytest tests/ -v
 ```
 
