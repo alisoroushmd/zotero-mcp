@@ -1,5 +1,6 @@
 .DS_Store
 CLAUDE.md
+docs/superpowers/
 __pycache__/
 *.py[cod]
 *.egg-info/
