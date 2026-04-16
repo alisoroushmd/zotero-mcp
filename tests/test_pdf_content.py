@@ -98,9 +98,7 @@ def test_get_pdf_content_returns_local_path():
     ]
 
     mock_web = _mock_web_client(item_data, children)
-    mock_local = _mock_local_client(
-        attachment_path="/Users/test/Zotero/storage/ATT001/paper.pdf"
-    )
+    mock_local = _mock_local_client(attachment_path="/Users/test/Zotero/storage/ATT001/paper.pdf")
     mock_local.get_children.return_value = children
 
     import zotero_mcp.server as srv

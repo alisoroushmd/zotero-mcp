@@ -164,8 +164,12 @@ def populated_store_with_topics():
         ("10.1/e", "E", "Paper E", 2021),
     ]:
         store.upsert_paper(
-            doi=doi, zotero_key=key, title=title, year=year,
-            authors="Author", openalex_id=f"W{key}",
+            doi=doi,
+            zotero_key=key,
+            title=title,
+            year=year,
+            authors="Author",
+            openalex_id=f"W{key}",
         )
 
     store.upsert_citation("10.1/a", "10.1/b")
@@ -178,15 +182,23 @@ def populated_store_with_topics():
     # Add topics
     for doi in ["10.1/a", "10.1/b", "10.1/d"]:
         store.upsert_topic(
-            doi=doi, topic_id="T1", topic_name="GI Cancer",
-            subfield="Gastroenterology", field="Medicine",
-            domain="Health Sciences", score=0.9,
+            doi=doi,
+            topic_id="T1",
+            topic_name="GI Cancer",
+            subfield="Gastroenterology",
+            field="Medicine",
+            domain="Health Sciences",
+            score=0.9,
         )
     for doi in ["10.1/c", "10.1/e"]:
         store.upsert_topic(
-            doi=doi, topic_id="T2", topic_name="Tumor Biology",
-            subfield="Oncology", field="Medicine",
-            domain="Health Sciences", score=0.85,
+            doi=doi,
+            topic_id="T2",
+            topic_name="Tumor Biology",
+            subfield="Oncology",
+            field="Medicine",
+            domain="Health Sciences",
+            score=0.85,
         )
 
     yield store
@@ -260,8 +272,12 @@ def populated_store_with_authors():
         ("10.1/e", "E", "Paper E", 2021),
     ]:
         store.upsert_paper(
-            doi=doi, zotero_key=key, title=title, year=year,
-            authors="Author", openalex_id=f"W{key}",
+            doi=doi,
+            zotero_key=key,
+            title=title,
+            year=year,
+            authors="Author",
+            openalex_id=f"W{key}",
         )
 
     store.upsert_citation("10.1/a", "10.1/b")
@@ -438,23 +454,35 @@ def temporal_store():
     ]
     for doi, key, title, year, pub_date in papers:
         store.upsert_paper(
-            doi=doi, zotero_key=key, title=title, year=year,
-            authors="Author", openalex_id=f"W{key}",
+            doi=doi,
+            zotero_key=key,
+            title=title,
+            year=year,
+            authors="Author",
+            openalex_id=f"W{key}",
             publication_date=pub_date,
         )
 
     # Topics: A, B = Gastroenterology; C, D, E = Oncology
     for doi in ["10.1/a", "10.1/b"]:
         store.upsert_topic(
-            doi=doi, topic_id="T1", topic_name="GI Cancer",
-            subfield="Gastroenterology", field="Medicine",
-            domain="Health Sciences", score=0.9,
+            doi=doi,
+            topic_id="T1",
+            topic_name="GI Cancer",
+            subfield="Gastroenterology",
+            field="Medicine",
+            domain="Health Sciences",
+            score=0.9,
         )
     for doi in ["10.1/c", "10.1/d", "10.1/e"]:
         store.upsert_topic(
-            doi=doi, topic_id="T2", topic_name="Tumor Biology",
-            subfield="Oncology", field="Medicine",
-            domain="Health Sciences", score=0.85,
+            doi=doi,
+            topic_id="T2",
+            topic_name="Tumor Biology",
+            subfield="Oncology",
+            field="Medicine",
+            domain="Health Sciences",
+            score=0.85,
         )
 
     # Citations: B, C, D, E all cite A; D also cites B

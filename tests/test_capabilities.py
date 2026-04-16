@@ -15,9 +15,7 @@ from zotero_mcp.capabilities import (
 
 def test_all_available():
     """Both APIs available reports all modes active."""
-    caps = ServerCapabilities(
-        local_api=True, web_api=True, local_api_error="", web_api_error=""
-    )
+    caps = ServerCapabilities(local_api=True, web_api=True, local_api_error="", web_api_error="")
     assert caps.local_read is True
     assert caps.cloud_crud is True
     assert caps.any_read is True
@@ -74,11 +72,7 @@ def test_check_capabilities_local_down():
         side_effect=httpx.ConnectError("Connection refused")
     )
     with patch.dict(os.environ, {}, clear=False):
-        env = {
-            k: v
-            for k, v in os.environ.items()
-            if k not in ("ZOTERO_API_KEY", "ZOTERO_USER_ID")
-        }
+        env = {k: v for k, v in os.environ.items() if k not in ("ZOTERO_API_KEY", "ZOTERO_USER_ID")}
         with patch.dict(os.environ, env, clear=True):
             caps = check_capabilities()
     assert caps.local_api is False
@@ -87,12 +81,11 @@ def test_check_capabilities_local_down():
 
 def test_check_capabilities_missing_env():
     """check_capabilities reports missing env vars."""
-    with patch.dict(os.environ, {}, clear=True):
-        with respx.mock:
-            respx.get("http://localhost:23119/api/users/0/items").mock(
-                side_effect=httpx.ConnectError("refused")
-            )
-            caps = check_capabilities()
+    with patch.dict(os.environ, {}, clear=True), respx.mock:
+        respx.get("http://localhost:23119/api/users/0/items").mock(
+            side_effect=httpx.ConnectError("refused")
+        )
+        caps = check_capabilities()
     assert caps.web_api is False
     assert "ZOTERO_API_KEY" in caps.web_api_error
 
@@ -111,9 +104,7 @@ def test_format_status_shows_fix_instructions():
     assert status["modes"]["cloud_crud"]["available"] is False
     assert "Set API key" in status["modes"]["cloud_crud"]["fix"]
     # server_status has no mode requirements, so it's always available
-    unavailable = [
-        t for t in status["unavailable_tools"] if t["name"] != "server_status"
-    ]
+    unavailable = [t for t in status["unavailable_tools"] if t["name"] != "server_status"]
     assert len(unavailable) > 0
 
 
@@ -131,9 +122,7 @@ def test_format_status_web_only():
 
 def test_format_status_all_available():
     """format_status with everything available."""
-    caps = ServerCapabilities(
-        local_api=True, web_api=True, local_api_error="", web_api_error=""
-    )
+    caps = ServerCapabilities(local_api=True, web_api=True, local_api_error="", web_api_error="")
     status = format_status(caps)
     assert all(m["available"] for m in status["modes"].values())
     assert len(status["unavailable_tools"]) == 0

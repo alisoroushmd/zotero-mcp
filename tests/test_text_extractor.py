@@ -7,7 +7,7 @@ from unittest.mock import MagicMock, patch
 import pytest
 
 from zotero_mcp.graph_store import GraphStore
-from zotero_mcp.text_extractor import extract_text_from_pdf, index_paper_text, search_text
+from zotero_mcp.text_extractor import index_paper_text, search_text
 
 
 @pytest.fixture
@@ -29,13 +29,16 @@ def test_extract_text_from_pdf_bytes():
     mock_reader = MagicMock()
     mock_reader.pages = [mock_page1, mock_page2]
 
-    with patch("zotero_mcp.text_extractor.PdfReader", return_value=mock_reader, create=True) as mock_cls:
+    with patch(
+        "zotero_mcp.text_extractor.PdfReader", return_value=mock_reader, create=True
+    ):
         # Patch the import inside the function
         import zotero_mcp.text_extractor as te
+
         original_func = te.extract_text_from_pdf
 
         def patched_extract(source):
-            import io as _io
+
             with patch.dict("sys.modules", {"pypdf": MagicMock()}):
                 # Directly test the logic by mocking PdfReader at the point of use
                 pass
@@ -54,7 +57,9 @@ def test_extract_text_from_pdf_bytes():
     with patch.dict("sys.modules", {"pypdf": mock_pypdf}):
         # Re-import to pick up the mock
         import importlib
+
         import zotero_mcp.text_extractor as te
+
         importlib.reload(te)
 
         result = te.extract_text_from_pdf(b"%PDF-fake-bytes")
@@ -76,7 +81,9 @@ def test_extract_text_returns_none_for_empty():
 
     with patch.dict("sys.modules", {"pypdf": mock_pypdf}):
         import importlib
+
         import zotero_mcp.text_extractor as te
+
         importlib.reload(te)
 
         result = te.extract_text_from_pdf(b"%PDF-fake-bytes")

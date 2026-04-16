@@ -31,8 +31,7 @@ class KnowledgeGraph:
     def __init__(self) -> None:
         if not HAS_NETWORKX:
             raise ImportError(
-                "Knowledge graph requires networkx. "
-                "Install with: pip install zotero-mcp[graph]"
+                "Knowledge graph requires networkx. Install with: pip install zotero-mcp[graph]"
             )
         self._graph: nx.DiGraph = nx.DiGraph()
         self._paper_data: dict[str, dict] = {}
@@ -72,7 +71,7 @@ class KnowledgeGraph:
             self._author_data[aid] = a
             self._coauthor_graph.add_node(aid)
 
-        for doi, author_id, position in store.get_all_paper_authors():
+        for doi, author_id, _position in store.get_all_paper_authors():
             self._author_papers.setdefault(author_id, set()).add(doi)
 
         # Build co-authorship edges (for each paper, connect all co-author pairs)
@@ -80,7 +79,7 @@ class KnowledgeGraph:
         for doi, author_id, _ in store.get_all_paper_authors():
             papers_to_authors[doi].append(author_id)
 
-        for doi, author_ids in papers_to_authors.items():
+        for _doi, author_ids in papers_to_authors.items():
             for i, a1 in enumerate(author_ids):
                 for a2 in author_ids[i + 1 :]:
                     if self._coauthor_graph.has_edge(a1, a2):
@@ -226,9 +225,7 @@ class KnowledgeGraph:
         best_id = None
         best_ratio = 0.0
         for aid, data in self._author_data.items():
-            ratio = SequenceMatcher(
-                None, name_lower, data.get("display_name", "").lower()
-            ).ratio()
+            ratio = SequenceMatcher(None, name_lower, data.get("display_name", "").lower()).ratio()
             if ratio > best_ratio:
                 best_ratio = ratio
                 best_id = aid
@@ -293,10 +290,7 @@ class KnowledgeGraph:
 
         clusters = []
         for i, community in enumerate(communities):
-            members = [
-                self._author_data.get(aid, {"openalex_author_id": aid})
-                for aid in community
-            ]
+            members = [self._author_data.get(aid, {"openalex_author_id": aid}) for aid in community]
             clusters.append({"cluster_id": i, "size": len(community), "authors": members})
         return sorted(clusters, key=lambda c: c["size"], reverse=True)
 
@@ -364,19 +358,13 @@ class KnowledgeGraph:
         for doi in self._filter_by_date_range(start_year, end_year):
             if topic:
                 topics = self._topic_data.get(doi, [])
-                match = any(
-                    topic.lower() in (t.get("subfield") or "").lower()
-                    for t in topics
-                )
+                match = any(topic.lower() in (t.get("subfield") or "").lower() for t in topics)
                 if not match:
                     continue
             pub_date = (self._paper_data[doi].get("publication_date") or "")[:7]
             if pub_date:
                 counts[pub_date] += 1
-        return [
-            {"month": m, "count": c}
-            for m, c in sorted(counts.items())
-        ]
+        return [{"month": m, "count": c} for m, c in sorted(counts.items())]
 
     def get_topic_evolution(
         self,
@@ -430,10 +418,7 @@ class KnowledgeGraph:
             pub_date = (self._paper_data.get(citing_doi, {}).get("publication_date") or "")[:7]
             if pub_date:
                 counts[pub_date] += 1
-        return [
-            {"month": m, "citations": c}
-            for m, c in sorted(counts.items())
-        ]
+        return [{"month": m, "citations": c} for m, c in sorted(counts.items())]
 
     def get_trending(self, top_n: int = 10, years: int = 3) -> list[dict]:
         """Papers ranked by citation growth rate in recent N years.
@@ -461,9 +446,7 @@ class KnowledgeGraph:
             total = len(citing_dois)
             recent = 0
             for citing_doi in citing_dois:
-                pub_date = (
-                    self._paper_data.get(citing_doi, {}).get("publication_date") or ""
-                )[:7]
+                pub_date = (self._paper_data.get(citing_doi, {}).get("publication_date") or "")[:7]
                 if pub_date >= cutoff_month:
                     recent += 1
 
@@ -483,12 +466,14 @@ class KnowledgeGraph:
             recent_rate = recent / years
             velocity_ratio = recent_rate / lifetime_rate if lifetime_rate > 0 else 0
 
-            results.append({
-                **self._paper_data[doi],
-                "velocity_ratio": round(velocity_ratio, 2),
-                "recent_citations": recent,
-                "total_citations": total,
-            })
+            results.append(
+                {
+                    **self._paper_data[doi],
+                    "velocity_ratio": round(velocity_ratio, 2),
+                    "recent_citations": recent,
+                    "total_citations": total,
+                }
+            )
 
         results.sort(key=lambda x: x["velocity_ratio"], reverse=True)
         return results[:top_n]

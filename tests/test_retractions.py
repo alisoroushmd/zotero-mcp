@@ -6,7 +6,7 @@ from unittest.mock import MagicMock, patch
 import httpx
 import respx
 
-from zotero_mcp.web_client import WebClient, WEB_BASE
+from zotero_mcp.web_client import WebClient
 
 USER_ID = "12345"
 API_KEY = "testapikey"

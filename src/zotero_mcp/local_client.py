@@ -21,13 +21,13 @@ class LocalClient:
             # when Zotero desktop is not running (avoids 5s timeout per call)
             try:
                 self._client.get("/users/0/items", params={"limit": 0})
-            except httpx.ConnectError:
+            except httpx.ConnectError as err:
                 raise RuntimeError(
                     "Local Read mode requires Zotero desktop running at localhost:23119. "
                     "Start Zotero and enable: Settings > Advanced > General > "
                     "'Allow other applications on this computer to communicate with Zotero'. "
                     "Call server_status to check which modes are available."
-                )
+                ) from err
 
     def _get(self, path: str, params: dict | None = None) -> httpx.Response:
         """GET request to local API with connection error handling."""
@@ -35,13 +35,13 @@ class LocalClient:
             resp = self._client.get(path, params=params)
             resp.raise_for_status()
             return resp
-        except httpx.ConnectError:
+        except httpx.ConnectError as err:
             raise RuntimeError(
                 "Local Read mode requires Zotero desktop running at localhost:23119. "
                 "Start Zotero and enable: Settings > Advanced > General > "
                 "'Allow other applications on this computer to communicate with Zotero'. "
                 "Call server_status to check which modes are available."
-            )
+            ) from err
 
     def search_items(
         self,

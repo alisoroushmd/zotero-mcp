@@ -11,11 +11,11 @@ import re
 import tempfile
 import threading
 import time
+from datetime import UTC
+from typing import TYPE_CHECKING
 
 import httpx
 from fastmcp import FastMCP
-
-from typing import TYPE_CHECKING
 
 from zotero_mcp.capabilities import check_capabilities, format_status
 from zotero_mcp.config import get_config
@@ -109,9 +109,7 @@ def _validate_path(file_path: str, name: str = "path") -> str:
 
     resolved = str(pathlib.Path(file_path).resolve())
     allowed = _get_allowed_path_roots()
-    if not any(
-        resolved.startswith(root + os.sep) or resolved == root for root in allowed
-    ):
+    if not any(resolved.startswith(root + os.sep) or resolved == root for root in allowed):
         raise ValueError(
             f"{name} must be within the working directory, home directory, "
             f"or temp directory. Got: {file_path!r}"
@@ -140,18 +138,12 @@ def _get_local() -> LocalClient:
     """
     global _local, _local_failed_at
     now = time.monotonic()
-    if (
-        _local_failed_at is not None
-        and (now - _local_failed_at) < _LOCAL_RETRY_INTERVAL
-    ):
+    if _local_failed_at is not None and (now - _local_failed_at) < _LOCAL_RETRY_INTERVAL:
         raise RuntimeError("Local API unavailable (cached)")
     if _local is None:
         with _init_lock:
             now = time.monotonic()
-            if (
-                _local_failed_at is not None
-                and (now - _local_failed_at) < _LOCAL_RETRY_INTERVAL
-            ):
+            if _local_failed_at is not None and (now - _local_failed_at) < _LOCAL_RETRY_INTERVAL:
                 raise RuntimeError("Local API unavailable (cached)")
             if _local is None:
                 try:
@@ -375,9 +367,7 @@ def get_notes(parent_key: str) -> str:
 def get_item_attachments(parent_key: str) -> str:
     """Get attachments for a parent item with availability classification."""
     _validate_key(parent_key, "parent_key")
-    attachments = _read_local_or_web(
-        "get_children", parent_key.strip(), item_type="attachment"
-    )
+    attachments = _read_local_or_web("get_children", parent_key.strip(), item_type="attachment")
 
     link_mode_map = {
         "imported_url": "stored_remote_available",
@@ -472,9 +462,7 @@ def get_pdf_content(item_key: str, extract_text: bool = False) -> str:
                         }
                     )
             except Exception as exc:
-                logger.warning(
-                    "PMCID lookup failed for item %s PMID %s: %s", item_key, pmid, exc
-                )
+                logger.warning("PMCID lookup failed for item %s PMID %s: %s", item_key, pmid, exc)
 
     # Step 2: Check for PDF attachments
     try:
@@ -503,9 +491,7 @@ def get_pdf_content(item_key: str, extract_text: bool = False) -> str:
                 }
                 return json.dumps(_maybe_extract(local_path, result))
         except Exception as exc:
-            logger.warning(
-                "Local attachment path lookup failed for %s: %s", att_key, exc
-            )
+            logger.warning("Local attachment path lookup failed for %s: %s", att_key, exc)
 
         # Step 4: Download from web API
         try:
@@ -518,9 +504,7 @@ def get_pdf_content(item_key: str, extract_text: bool = False) -> str:
                     "attachment_key": att_key,
                 }
                 return json.dumps(_maybe_extract(pdf_bytes, result))
-            tmp = tempfile.NamedTemporaryFile(
-                prefix="zotero_mcp_", suffix=".pdf", delete=False
-            )
+            tmp = tempfile.NamedTemporaryFile(prefix="zotero_mcp_", suffix=".pdf", delete=False)
             try:
                 tmp.write(pdf_bytes)
                 tmp.close()
@@ -539,9 +523,7 @@ def get_pdf_content(item_key: str, extract_text: bool = False) -> str:
                 }
             )
         except Exception as exc:
-            logger.warning(
-                "Web PDF download failed for attachment %s: %s", att_key, exc
-            )
+            logger.warning("Web PDF download failed for attachment %s: %s", att_key, exc)
 
     # Step 5: No stored PDF — try free PDF via DOI (Unpaywall / PMC / bioRxiv)
     if doi:
@@ -555,9 +537,7 @@ def get_pdf_content(item_key: str, extract_text: bool = False) -> str:
                         "doi": doi,
                     }
                     return json.dumps(_maybe_extract(pdf_bytes, result))
-                tmp = tempfile.NamedTemporaryFile(
-                    prefix="zotero_mcp_", suffix=".pdf", delete=False
-                )
+                tmp = tempfile.NamedTemporaryFile(prefix="zotero_mcp_", suffix=".pdf", delete=False)
                 try:
                     tmp.write(pdf_bytes)
                     tmp.close()
@@ -696,9 +676,7 @@ def check_retractions(item_keys: str | list[str]) -> str:
     annotations={"readOnlyHint": True},
 )
 @_handle_tool_errors
-def get_citation_graph(
-    item_key: str, direction: str = "both", limit: str | int = 20
-) -> str:
+def get_citation_graph(item_key: str, direction: str = "both", limit: str | int = 20) -> str:
     """Get citing and/or referenced works for a Zotero item.
 
     Args:
@@ -1081,9 +1059,7 @@ def manage_tags(
             raise ValueError("'rename' action requires both tag and new_tag parameters")
         result = web.rename_tag(tag.strip(), new_tag.strip())
     else:
-        raise ValueError(
-            f"Unknown action: {action!r}. Must be: list, remove, rename"
-        )
+        raise ValueError(f"Unknown action: {action!r}. Must be: list, remove, rename")
     return json.dumps(result, ensure_ascii=False)
 
 
@@ -1273,11 +1249,11 @@ def insert_citations(document_path: str, output_path: str | None = None) -> str:
     if output_path:
         output_path = _validate_path(output_path, "output_path")
 
-    from zotero_mcp.citation_writer import insert_citations as _insert_citations
-    from zotero_mcp.citation_writer import parse_citations
-
     # Read the document to find all citation keys
     from docx import Document as _Document
+
+    from zotero_mcp.citation_writer import insert_citations as _insert_citations
+    from zotero_mcp.citation_writer import parse_citations
 
     doc = _Document(document_path)
     all_text: list[str] = []
@@ -1311,9 +1287,7 @@ def insert_citations(document_path: str, output_path: str | None = None) -> str:
 
     user_id = get_config().zotero_user_id or "0"
 
-    result_path, citation_count = _insert_citations(
-        document_path, item_data, user_id, output_path
-    )
+    result_path, citation_count = _insert_citations(document_path, item_data, user_id, output_path)
 
     result = {
         "output_path": result_path,
@@ -1399,9 +1373,7 @@ def _get_or_build_kg() -> KnowledgeGraph:
 
         store = GraphStore()
         if store.get_last_sync() is None:
-            raise RuntimeError(
-                "Knowledge graph not yet built. Run build_knowledge_graph first."
-            )
+            raise RuntimeError("Knowledge graph not yet built. Run build_knowledge_graph first.")
         kg = KnowledgeGraph()
         kg.build_from_store(store)
         _kg_cache = kg
@@ -1443,9 +1415,7 @@ def _index_works(works, key_by_doi, store, openalex):
         if not doi:
             continue
         authorships = work.get("authorships", [])
-        authors = "; ".join(
-            a.get("author", {}).get("display_name", "") for a in authorships[:3]
-        )
+        authors = "; ".join(a.get("author", {}).get("display_name", "") for a in authorships[:3])
         pub_date = (work.get("publication_date") or "")[:7]  # YYYY-MM
         abstract = OpenAlexClient.reconstruct_abstract(work)
         store.upsert_paper(
@@ -1478,9 +1448,7 @@ def _index_works(works, key_by_doi, store, openalex):
             )
             authors_indexed += 1
 
-        ref_ids = [
-            _extract_openalex_id(url) for url in work.get("referenced_works", [])
-        ]
+        ref_ids = [_extract_openalex_id(url) for url in work.get("referenced_works", [])]
         if ref_ids:
             work_refs[doi] = ref_ids
             all_ref_ids.update(ref_ids)
@@ -1528,7 +1496,7 @@ def _index_works(works, key_by_doi, store, openalex):
 
 def _build_knowledge_graph(full_rebuild: bool = False) -> dict:
     """Build or incrementally update the knowledge graph. Returns stats dict."""
-    from datetime import datetime, timezone
+    from datetime import datetime
 
     from zotero_mcp.graph_store import GraphStore
     from zotero_mcp.openalex_client import OpenAlexClient
@@ -1561,7 +1529,7 @@ def _build_knowledge_graph(full_rebuild: bool = False) -> dict:
     works = openalex.bulk_get_works(doi_list)
     counts = _index_works(works, key_by_doi, store, openalex)
 
-    store.set_last_sync(datetime.now(timezone.utc).isoformat())
+    store.set_last_sync(datetime.now(UTC).isoformat())
     _invalidate_kg_cache()
     kg = _get_or_build_kg()
     stats = kg.get_stats()
@@ -1611,15 +1579,11 @@ def _build_fulltext_index(full_rebuild: bool = False, limit: int = 0) -> dict:
         item_doi = item["DOI"]
 
         try:
-            children = _read_local_or_web(
-                "get_children", item_key, item_type="attachment"
-            )
+            children = _read_local_or_web("get_children", item_key, item_type="attachment")
         except Exception:
             return {"doi": item_doi, "status": "failed", "reason": "no_attachments"}
 
-        pdf_atts = [
-            c for c in children if c.get("contentType") == "application/pdf"
-        ]
+        pdf_atts = [c for c in children if c.get("contentType") == "application/pdf"]
         if not pdf_atts:
             return {"doi": item_doi, "status": "failed", "reason": "no_pdf"}
 
@@ -1695,9 +1659,7 @@ def build_index(
     """
     type = type.strip().lower()
     if type not in ("graph", "fulltext", "both"):
-        raise ValueError(
-            f"Unknown type: {type!r}. Must be: graph, fulltext, both"
-        )
+        raise ValueError(f"Unknown type: {type!r}. Must be: graph, fulltext, both")
 
     result: dict = {}
     if type in ("graph", "both"):
@@ -2148,22 +2110,23 @@ def search_entities(
         results = []
         for ent in entities:
             papers = store.get_papers_for_entity(ent["entity_id"])
-            results.append({
-                **ent,
-                "paper_count": len(papers),
-                "papers": [
-                    {"doi": p["doi"], "title": p["title"], "year": p["year"]}
-                    for p in papers[:limit_int]
-                ],
-            })
+            results.append(
+                {
+                    **ent,
+                    "paper_count": len(papers),
+                    "papers": [
+                        {"doi": p["doi"], "title": p["title"], "year": p["year"]}
+                        for p in papers[:limit_int]
+                    ],
+                }
+            )
         return json.dumps({"query": "by_name", "results": results}, ensure_ascii=False)
 
     elif query_type == "by_type":
         if entity_type:
             results = store.get_entities_by_type(entity_type, limit=limit_int)
             return json.dumps(
-                {"query": "by_type", "entity_type": entity_type,
-                 "results": results},
+                {"query": "by_type", "entity_type": entity_type, "results": results},
                 ensure_ascii=False,
             )
         else:
@@ -2185,8 +2148,7 @@ def search_entities(
         entity_id = matches[0]["entity_id"]
         co_occurring = store.get_entity_co_occurrence(entity_id, limit=limit_int)
         return json.dumps(
-            {"query": "co_occurrence", "entity": matches[0],
-             "co_occurring": co_occurring},
+            {"query": "co_occurrence", "entity": matches[0], "co_occurring": co_occurring},
             ensure_ascii=False,
         )
 
@@ -2195,8 +2157,7 @@ def search_entities(
             raise ValueError("shared_entities query requires doi_a and doi_b")
         shared = store.get_shared_entities(doi_a, doi_b)
         return json.dumps(
-            {"query": "shared_entities", "doi_a": doi_a, "doi_b": doi_b,
-             "shared": shared},
+            {"query": "shared_entities", "doi_a": doi_a, "doi_b": doi_b, "shared": shared},
             ensure_ascii=False,
         )
 

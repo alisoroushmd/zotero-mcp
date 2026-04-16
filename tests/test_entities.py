@@ -17,6 +17,7 @@ def tmp_db(monkeypatch):
     monkeypatch.setenv("ZOTERO_MCP_GRAPH_DB", path)
     # Reset config singleton so it picks up the new env var
     from zotero_mcp.config import _reset_config
+
     _reset_config()
     yield path
     _reset_config()
@@ -28,18 +29,30 @@ def populated_store(tmp_db):
     """A GraphStore with papers and entities pre-populated."""
     store = GraphStore(tmp_db)
     store.upsert_paper(
-        doi="10.1/a", zotero_key="A", title="Paper about gastric cancer",
-        year=2024, authors="Smith J", openalex_id="W1",
+        doi="10.1/a",
+        zotero_key="A",
+        title="Paper about gastric cancer",
+        year=2024,
+        authors="Smith J",
+        openalex_id="W1",
         abstract="This paper studies CDX2 in gastric cancer.",
     )
     store.upsert_paper(
-        doi="10.1/b", zotero_key="B", title="Paper about CDX2 biomarker",
-        year=2023, authors="Lee A", openalex_id="W2",
+        doi="10.1/b",
+        zotero_key="B",
+        title="Paper about CDX2 biomarker",
+        year=2023,
+        authors="Lee A",
+        openalex_id="W2",
         abstract="CDX2 expression in intestinal metaplasia.",
     )
     store.upsert_paper(
-        doi="10.1/c", zotero_key="C", title="Paper with no entities yet",
-        year=2022, authors="Kim B", openalex_id="W3",
+        doi="10.1/c",
+        zotero_key="C",
+        title="Paper with no entities yet",
+        year=2022,
+        authors="Kim B",
+        openalex_id="W3",
         abstract="A study on H. pylori eradication.",
     )
     # Pre-extract entities for papers a and b
@@ -63,18 +76,26 @@ class TestStoreEntities:
 
         store = GraphStore(tmp_db)
         store.upsert_paper(
-            doi="10.1/x", zotero_key="X", title="Test",
-            year=2024, authors="X", openalex_id="W1",
+            doi="10.1/x",
+            zotero_key="X",
+            title="Test",
+            year=2024,
+            authors="X",
+            openalex_id="W1",
         )
         store.close()
 
-        payload = json.dumps([{
-            "doi": "10.1/x",
-            "entities": [
-                {"name": "CDX2", "type": "biomarker"},
-                {"name": "Gastric Cancer", "type": "condition"},
-            ],
-        }])
+        payload = json.dumps(
+            [
+                {
+                    "doi": "10.1/x",
+                    "entities": [
+                        {"name": "CDX2", "type": "biomarker"},
+                        {"name": "Gastric Cancer", "type": "condition"},
+                    ],
+                }
+            ]
+        )
         result = json.loads(store_entities(payload))
         assert result["stored"] == 1
         assert result["entities_created"] == 2
@@ -92,17 +113,23 @@ class TestStoreEntities:
 
         store = GraphStore(tmp_db)
         store.upsert_paper(
-            doi="10.1/y", zotero_key="Y", title="Test2",
-            year=2024, authors="Y", openalex_id="W2",
+            doi="10.1/y",
+            zotero_key="Y",
+            title="Test2",
+            year=2024,
+            authors="Y",
+            openalex_id="W2",
         )
         store.close()
 
-        payload = [{
-            "doi": "10.1/y",
-            "entities": [
-                {"name": "metformin", "type": "drug"},
-            ],
-        }]
+        payload = [
+            {
+                "doi": "10.1/y",
+                "entities": [
+                    {"name": "metformin", "type": "drug"},
+                ],
+            }
+        ]
         result = json.loads(store_entities(payload))
         assert result["stored"] == 1
         assert result["entities_created"] == 1
@@ -113,28 +140,52 @@ class TestStoreEntities:
 
         store = GraphStore(tmp_db)
         store.upsert_paper(
-            doi="10.1/a", zotero_key="A", title="Paper A",
-            year=2024, authors="X", openalex_id="W1",
+            doi="10.1/a",
+            zotero_key="A",
+            title="Paper A",
+            year=2024,
+            authors="X",
+            openalex_id="W1",
         )
         store.upsert_paper(
-            doi="10.1/b", zotero_key="B", title="Paper B",
-            year=2024, authors="Y", openalex_id="W2",
+            doi="10.1/b",
+            zotero_key="B",
+            title="Paper B",
+            year=2024,
+            authors="Y",
+            openalex_id="W2",
         )
         store.close()
 
         # First call creates the entity
-        result1 = json.loads(store_entities(json.dumps([{
-            "doi": "10.1/a",
-            "entities": [{"name": "CDX2", "type": "biomarker"}],
-        }])))
+        result1 = json.loads(
+            store_entities(
+                json.dumps(
+                    [
+                        {
+                            "doi": "10.1/a",
+                            "entities": [{"name": "CDX2", "type": "biomarker"}],
+                        }
+                    ]
+                )
+            )
+        )
         assert result1["entities_created"] == 1
         assert result1["entities_reused"] == 0
 
         # Second call reuses it
-        result2 = json.loads(store_entities(json.dumps([{
-            "doi": "10.1/b",
-            "entities": [{"name": "cdx2", "type": "biomarker"}],
-        }])))
+        result2 = json.loads(
+            store_entities(
+                json.dumps(
+                    [
+                        {
+                            "doi": "10.1/b",
+                            "entities": [{"name": "cdx2", "type": "biomarker"}],
+                        }
+                    ]
+                )
+            )
+        )
         assert result2["entities_created"] == 0
         assert result2["entities_reused"] == 1
 
@@ -142,11 +193,13 @@ class TestStoreEntities:
         """Empty DOIs and empty entity names are skipped."""
         from zotero_mcp.server import store_entities
 
-        payload = json.dumps([
-            {"doi": "", "entities": [{"name": "test", "type": "condition"}]},
-            {"doi": "10.1/z", "entities": [{"name": "", "type": "condition"}]},
-            {"doi": "10.1/z", "entities": []},
-        ])
+        payload = json.dumps(
+            [
+                {"doi": "", "entities": [{"name": "test", "type": "condition"}]},
+                {"doi": "10.1/z", "entities": [{"name": "", "type": "condition"}]},
+                {"doi": "10.1/z", "entities": []},
+            ]
+        )
         result = json.loads(store_entities(payload))
         assert result["stored"] == 0
 
@@ -165,9 +218,12 @@ class TestSearchEntities:
         """by_name returns matching entities with their papers."""
         from zotero_mcp.server import search_entities
 
-        result = json.loads(search_entities(
-            query_type="by_name", entity_name="cdx2",
-        ))
+        result = json.loads(
+            search_entities(
+                query_type="by_name",
+                entity_name="cdx2",
+            )
+        )
         assert result["query"] == "by_name"
         assert len(result["results"]) == 1
         assert result["results"][0]["name"] == "cdx2"
@@ -177,9 +233,12 @@ class TestSearchEntities:
         """by_type with entity_type returns entities of that type."""
         from zotero_mcp.server import search_entities
 
-        result = json.loads(search_entities(
-            query_type="by_type", entity_type="condition",
-        ))
+        result = json.loads(
+            search_entities(
+                query_type="by_type",
+                entity_type="condition",
+            )
+        )
         assert result["query"] == "by_type"
         assert result["entity_type"] == "condition"
         assert len(result["results"]) == 2  # gastric cancer + intestinal metaplasia
@@ -199,9 +258,12 @@ class TestSearchEntities:
         """co_occurrence returns entities that share papers with the given entity."""
         from zotero_mcp.server import search_entities
 
-        result = json.loads(search_entities(
-            query_type="co_occurrence", entity_name="cdx2",
-        ))
+        result = json.loads(
+            search_entities(
+                query_type="co_occurrence",
+                entity_name="cdx2",
+            )
+        )
         assert result["query"] == "co_occurrence"
         co_names = {e["name"] for e in result["co_occurring"]}
         assert "gastric cancer" in co_names
@@ -211,9 +273,13 @@ class TestSearchEntities:
         """shared_entities returns entities common to two papers."""
         from zotero_mcp.server import search_entities
 
-        result = json.loads(search_entities(
-            query_type="shared_entities", doi_a="10.1/a", doi_b="10.1/b",
-        ))
+        result = json.loads(
+            search_entities(
+                query_type="shared_entities",
+                doi_a="10.1/a",
+                doi_b="10.1/b",
+            )
+        )
         assert result["query"] == "shared_entities"
         shared_names = {e["name"] for e in result["shared"]}
         assert "cdx2" in shared_names
@@ -223,9 +289,12 @@ class TestSearchEntities:
         """paper_entities returns all entities for a specific paper."""
         from zotero_mcp.server import search_entities
 
-        result = json.loads(search_entities(
-            query_type="paper_entities", doi="10.1/a",
-        ))
+        result = json.loads(
+            search_entities(
+                query_type="paper_entities",
+                doi="10.1/a",
+            )
+        )
         assert result["query"] == "paper_entities"
         assert result["doi"] == "10.1/a"
         entity_names = {e["name"] for e in result["entities"]}
@@ -235,9 +304,12 @@ class TestSearchEntities:
         """co_occurrence returns error when entity is not found."""
         from zotero_mcp.server import search_entities
 
-        result = json.loads(search_entities(
-            query_type="co_occurrence", entity_name="nonexistent_entity_xyz",
-        ))
+        result = json.loads(
+            search_entities(
+                query_type="co_occurrence",
+                entity_name="nonexistent_entity_xyz",
+            )
+        )
         assert "error" in result
 
     def test_invalid_query_type(self, populated_store):
@@ -260,9 +332,12 @@ class TestSearchEntities:
         assert "error" in result
 
         # shared_entities without both dois
-        result = json.loads(search_entities(
-            query_type="shared_entities", doi_a="10.1/a",
-        ))
+        result = json.loads(
+            search_entities(
+                query_type="shared_entities",
+                doi_a="10.1/a",
+            )
+        )
         assert "error" in result
 
 
@@ -285,8 +360,12 @@ class TestGetUnextractedAbstracts:
         store = GraphStore(tmp_db)
         for i in range(5):
             store.upsert_paper(
-                doi=f"10.1/{i}", zotero_key=f"K{i}", title=f"Paper {i}",
-                year=2024, authors="X", openalex_id=f"W{i}",
+                doi=f"10.1/{i}",
+                zotero_key=f"K{i}",
+                title=f"Paper {i}",
+                year=2024,
+                authors="X",
+                openalex_id=f"W{i}",
                 abstract=f"Abstract {i}",
             )
         store.close()

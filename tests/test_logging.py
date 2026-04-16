@@ -1,12 +1,13 @@
 """Tests that silent exception blocks emit log warnings."""
 
 import logging
+from unittest.mock import patch
+
 import httpx
-import pytest
 import respx
-from unittest.mock import MagicMock, patch
-from zotero_mcp.web_client import WebClient
+
 from zotero_mcp.openalex_client import OpenAlexClient
+from zotero_mcp.web_client import WebClient
 
 WEB_BASE = "https://api.zotero.org"
 PUBMED_BASE = "https://eutils.ncbi.nlm.nih.gov/entrez/eutils"
@@ -20,17 +21,12 @@ def make_client():
 @respx.mock
 def test_resolve_pmid_to_pmcid_logs_on_failure(caplog):
     """PMCID lookup failure should log a warning, not swallow silently."""
-    respx.get(f"{PUBMED_BASE}/esearch.fcgi").mock(
-        side_effect=httpx.ConnectError("network down")
-    )
+    respx.get(f"{PUBMED_BASE}/esearch.fcgi").mock(side_effect=httpx.ConnectError("network down"))
     client = make_client()
     with caplog.at_level(logging.WARNING, logger="zotero_mcp.web_client"):
         result = client.resolve_pmid_to_pmcid("12345678")
     assert result is None
-    assert any(
-        "pmcid" in r.message.lower() or "pmid" in r.message.lower()
-        for r in caplog.records
-    )
+    assert any("pmcid" in r.message.lower() or "pmid" in r.message.lower() for r in caplog.records)
 
 
 @respx.mock
@@ -84,14 +80,12 @@ def test_openalex_get_references_logs_on_fetch_failure(caplog):
         "id": "https://openalex.org/W123",
         "referenced_works": ["https://openalex.org/W456"],
     }
-    with patch.object(client, "get_work", return_value=fake_work):
-        with patch.object(
-            client._client,
-            "get",
-            side_effect=httpx.ConnectError("down"),
-        ):
-            with caplog.at_level(logging.WARNING, logger="zotero_mcp.openalex_client"):
-                result = client.get_references("10.1234/test")
+    with patch.object(client, "get_work", return_value=fake_work), patch.object(
+        client._client,
+        "get",
+        side_effect=httpx.ConnectError("down"),
+    ), caplog.at_level(logging.WARNING, logger="zotero_mcp.openalex_client"):
+        result = client.get_references("10.1234/test")
     assert result == []
     assert any(
         "openalex" in r.message.lower()

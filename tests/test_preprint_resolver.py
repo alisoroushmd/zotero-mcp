@@ -3,11 +3,10 @@
 from __future__ import annotations
 
 import json
+from unittest.mock import MagicMock, patch
 
 import httpx
-import pytest
 import respx
-from unittest.mock import MagicMock, patch
 
 from zotero_mcp.openalex_client import OpenAlexClient
 from zotero_mcp.web_client import WebClient
@@ -198,9 +197,7 @@ def test_check_crossref_published_returns_none_when_no_relation():
 def test_check_crossref_published_handles_network_error():
     """Network failure returns published_doi=None without raising."""
     doi = "10.1101/2024.01.01.111111"
-    respx.get(f"{CROSSREF_BASE}/works/{doi}").mock(
-        side_effect=httpx.ConnectError("down")
-    )
+    respx.get(f"{CROSSREF_BASE}/works/{doi}").mock(side_effect=httpx.ConnectError("down"))
     client = make_web_client()
     result = client.check_crossref_published(doi)
     assert result["published_doi"] is None
@@ -222,9 +219,7 @@ def test_check_published_versions_tool_finds_published_preprint():
         "DOI": "10.1101/2024.01.01.123456",
         "extra": "",
     }
-    mock_web.check_crossref_published.return_value = {
-        "published_doi": "10.1038/s41591-024-01234-5"
-    }
+    mock_web.check_crossref_published.return_value = {"published_doi": "10.1038/s41591-024-01234-5"}
     mock_web._check_duplicate_doi.return_value = None  # not in library
 
     mock_oa = MagicMock()
@@ -259,9 +254,7 @@ def test_check_published_versions_tool_flags_in_library():
         "DOI": "10.1101/2024.01.01.654321",
         "extra": "",
     }
-    mock_web.check_crossref_published.return_value = {
-        "published_doi": "10.1016/j.cell.2024.01.001"
-    }
+    mock_web.check_crossref_published.return_value = {"published_doi": "10.1016/j.cell.2024.01.001"}
     # Published version IS in library
     mock_web._check_duplicate_doi.return_value = {
         "key": "PUB00001",
@@ -324,9 +317,7 @@ def test_check_published_versions_crossref_fallback_when_openalex_empty():
         "DOI": "10.1101/2024.06.01.000001",
         "extra": "",
     }
-    mock_web.check_crossref_published.return_value = {
-        "published_doi": "10.1056/NEJMoa2024001"
-    }
+    mock_web.check_crossref_published.return_value = {"published_doi": "10.1056/NEJMoa2024001"}
     mock_web._check_duplicate_doi.return_value = None
 
     mock_oa = MagicMock()

@@ -6,14 +6,14 @@ import tempfile
 
 import pytest
 
+from zotero_mcp.graph_renderer import (
+    _render_html,
+    render_authors_view,
+    render_citations_view,
+    render_full_view,
+)
 from zotero_mcp.graph_store import GraphStore
 from zotero_mcp.knowledge_graph import KnowledgeGraph
-from zotero_mcp.graph_renderer import (
-    render_citations_view,
-    render_authors_view,
-    render_full_view,
-    _render_html,
-)
 
 
 @pytest.fixture
@@ -31,8 +31,12 @@ def kg_with_data():
         ("10.1/e", "E", "Paper E", 2021),
     ]:
         store.upsert_paper(
-            doi=doi, zotero_key=key, title=title, year=year,
-            authors="Author", openalex_id=f"W{key}",
+            doi=doi,
+            zotero_key=key,
+            title=title,
+            year=year,
+            authors="Author",
+            openalex_id=f"W{key}",
         )
 
     store.upsert_citation("10.1/a", "10.1/b")
@@ -45,15 +49,23 @@ def kg_with_data():
     # Topics
     for doi in ["10.1/a", "10.1/b", "10.1/d"]:
         store.upsert_topic(
-            doi=doi, topic_id="T1", topic_name="GI Cancer",
-            subfield="Gastroenterology", field="Medicine",
-            domain="Health Sciences", score=0.9,
+            doi=doi,
+            topic_id="T1",
+            topic_name="GI Cancer",
+            subfield="Gastroenterology",
+            field="Medicine",
+            domain="Health Sciences",
+            score=0.9,
         )
     for doi in ["10.1/c", "10.1/e"]:
         store.upsert_topic(
-            doi=doi, topic_id="T2", topic_name="Tumor Biology",
-            subfield="Oncology", field="Medicine",
-            domain="Health Sciences", score=0.85,
+            doi=doi,
+            topic_id="T2",
+            topic_name="Tumor Biology",
+            subfield="Oncology",
+            field="Medicine",
+            domain="Health Sciences",
+            score=0.85,
         )
 
     # Authors

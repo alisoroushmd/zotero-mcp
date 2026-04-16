@@ -233,9 +233,7 @@ def test_create_item_translation_server_down_falls_back_to_pubmed():
     respx.post(TRANSLATE_URL).mock(side_effect=httpx.ConnectError("Connection refused"))
     # Mock PubMed DOI search
     respx.get(f"{PUBMED_BASE}/esearch.fcgi").mock(
-        return_value=httpx.Response(
-            200, json={"esearchresult": {"idlist": ["12345678"]}}
-        )
+        return_value=httpx.Response(200, json={"esearchresult": {"idlist": ["12345678"]}})
     )
     # Mock PubMed efetch XML (replaces old esummary mock)
     respx.get(f"{PUBMED_BASE}/efetch.fcgi").mock(
@@ -344,9 +342,7 @@ def test_add_to_collection():
             },
         )
     )
-    respx.patch(f"{WEB_BASE}/users/12345/items/ITEM1").mock(
-        return_value=httpx.Response(204)
-    )
+    respx.patch(f"{WEB_BASE}/users/12345/items/ITEM1").mock(return_value=httpx.Response(204))
 
     from zotero_mcp.local_client import LocalClient
 
@@ -374,9 +370,7 @@ def test_update_item():
             },
         )
     )
-    respx.patch(f"{WEB_BASE}/users/12345/items/ITEM1").mock(
-        return_value=httpx.Response(204)
-    )
+    respx.patch(f"{WEB_BASE}/users/12345/items/ITEM1").mock(return_value=httpx.Response(204))
 
     from zotero_mcp.local_client import LocalClient
 
@@ -402,9 +396,7 @@ def test_update_item_version_conflict():
             },
         )
     )
-    respx.patch(f"{WEB_BASE}/users/12345/items/ITEM1").mock(
-        return_value=httpx.Response(412)
-    )
+    respx.patch(f"{WEB_BASE}/users/12345/items/ITEM1").mock(return_value=httpx.Response(412))
 
     from zotero_mcp.local_client import LocalClient
 
@@ -445,9 +437,7 @@ def test_pubmed_fallback_includes_abstract():
     """PubMed efetch fallback includes abstractNote in metadata."""
     respx.post(TRANSLATE_URL).mock(side_effect=httpx.ConnectError("down"))
     respx.get(f"{PUBMED_BASE}/esearch.fcgi").mock(
-        return_value=httpx.Response(
-            200, json={"esearchresult": {"idlist": ["12345678"]}}
-        )
+        return_value=httpx.Response(200, json={"esearchresult": {"idlist": ["12345678"]}})
     )
     respx.get(f"{PUBMED_BASE}/efetch.fcgi").mock(
         return_value=httpx.Response(200, text=SAMPLE_EFETCH_XML)
@@ -473,9 +463,7 @@ def test_pubmed_fallback_detects_preprint_type():
     """PubMed efetch maps PublicationType 'Preprint' to Zotero preprint."""
     respx.post(TRANSLATE_URL).mock(side_effect=httpx.ConnectError("down"))
     respx.get(f"{PUBMED_BASE}/esearch.fcgi").mock(
-        return_value=httpx.Response(
-            200, json={"esearchresult": {"idlist": ["99999999"]}}
-        )
+        return_value=httpx.Response(200, json={"esearchresult": {"idlist": ["99999999"]}})
     )
     respx.get(f"{PUBMED_BASE}/efetch.fcgi").mock(
         return_value=httpx.Response(200, text=SAMPLE_PREPRINT_XML)
@@ -499,9 +487,7 @@ def test_parse_pubmed_xml_handles_structured_abstract():
     """_parse_pubmed_xml concatenates labeled abstract sections."""
     result = WebClient._parse_pubmed_xml(SAMPLE_PREPRINT_XML, "99999")
     assert result is not None
-    assert (
-        result["abstractNote"] == "BACKGROUND: Background info.\nMETHODS: Methods info."
-    )
+    assert result["abstractNote"] == "BACKGROUND: Background info.\nMETHODS: Methods info."
 
 
 def test_parse_pubmed_xml_returns_none_on_invalid_xml():
@@ -678,10 +664,7 @@ def test_extract_doi_from_url_patterns():
     """_extract_doi_from_url handles doi.org, arxiv, biorxiv patterns."""
     extract = WebClient._extract_doi_from_url
 
-    assert (
-        extract("https://doi.org/10.1038/s41586-020-2012-7")
-        == "10.1038/s41586-020-2012-7"
-    )
+    assert extract("https://doi.org/10.1038/s41586-020-2012-7") == "10.1038/s41586-020-2012-7"
     assert extract("https://arxiv.org/abs/2301.08243") == "10.48550/arXiv.2301.08243"
     assert (
         extract("https://www.biorxiv.org/content/10.1101/2024.01.15.123456")
@@ -698,10 +681,7 @@ def test_parse_crossref_work_returns_none_without_title():
     """_parse_crossref_work returns None when title is missing."""
     assert WebClient._parse_crossref_work({"type": "journal-article"}, "10.1/x") is None
     assert (
-        WebClient._parse_crossref_work(
-            {"type": "journal-article", "title": []}, "10.1/x"
-        )
-        is None
+        WebClient._parse_crossref_work({"type": "journal-article", "title": []}, "10.1/x") is None
     )
 
 
@@ -812,13 +792,9 @@ def test_get_tags_passes_prefix_as_q():
 def test_remove_tag_sends_delete():
     """remove_tag DELETEs the tag and returns status removed."""
     respx.get(f"{BASE_TAG}/items").mock(
-        return_value=httpx.Response(
-            200, json=[], headers={"Last-Modified-Version": "5"}
-        )
+        return_value=httpx.Response(200, json=[], headers={"Last-Modified-Version": "5"})
     )
-    delete_route = respx.delete(f"{BASE_TAG}/tags/old-tag").mock(
-        return_value=httpx.Response(204)
-    )
+    delete_route = respx.delete(f"{BASE_TAG}/tags/old-tag").mock(return_value=httpx.Response(204))
     client = WebClient(api_key="k", user_id="12345")
     result = client.remove_tag("old-tag")
     assert result["status"] == "removed"
@@ -835,12 +811,8 @@ def test_rename_tag_patches_all_items():
             "tags": [{"tag": "old"}, {"tag": "keep"}],
         }
     }
-    respx.get(f"{BASE_TAG}/items").mock(
-        return_value=httpx.Response(200, json=[item_data])
-    )
-    patch_route = respx.patch(f"{BASE_TAG}/items/ITEM001").mock(
-        return_value=httpx.Response(204)
-    )
+    respx.get(f"{BASE_TAG}/items").mock(return_value=httpx.Response(200, json=[item_data]))
+    patch_route = respx.patch(f"{BASE_TAG}/items/ITEM001").mock(return_value=httpx.Response(204))
     client = WebClient(api_key="k", user_id="12345")
     result = client.rename_tag("old", "new")
     assert result["updated"] == 1
@@ -877,15 +849,11 @@ def test_get_all_items_with_dois_paginates():
     respx.get(
         url__regex=r".*/items/top.*",
         params__contains={"start": "0"},
-    ).mock(
-        return_value=httpx.Response(200, json=page1, headers={"Total-Results": "101"})
-    )
+    ).mock(return_value=httpx.Response(200, json=page1, headers={"Total-Results": "101"}))
     respx.get(
         url__regex=r".*/items/top.*",
         params__contains={"start": "100"},
-    ).mock(
-        return_value=httpx.Response(200, json=page2, headers={"Total-Results": "101"})
-    )
+    ).mock(return_value=httpx.Response(200, json=page2, headers={"Total-Results": "101"}))
 
     client = WebClient(api_key="test", user_id="123")
     items = client.get_all_items_with_dois()

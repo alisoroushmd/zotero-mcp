@@ -2,6 +2,7 @@
 
 import os
 import tempfile
+
 import pytest
 
 from zotero_mcp.graph_store import GraphStore
@@ -390,8 +391,12 @@ def test_upsert_and_get_entities_for_doi(tmp_db):
     """Store entities for a paper, retrieve them."""
     store = GraphStore(tmp_db)
     store.upsert_paper(
-        doi="10.1/a", zotero_key="A", title="Paper A",
-        year=2024, authors="X", openalex_id="W1",
+        doi="10.1/a",
+        zotero_key="A",
+        title="Paper A",
+        year=2024,
+        authors="X",
+        openalex_id="W1",
     )
     eid1 = store.upsert_entity("gastric cancer", "condition")
     eid2 = store.upsert_entity("CDX2", "biomarker")
@@ -411,12 +416,20 @@ def test_get_papers_for_entity(tmp_db):
     """Store entities across papers, query by entity_id."""
     store = GraphStore(tmp_db)
     store.upsert_paper(
-        doi="10.1/a", zotero_key="A", title="Paper A",
-        year=2024, authors="X", openalex_id="W1",
+        doi="10.1/a",
+        zotero_key="A",
+        title="Paper A",
+        year=2024,
+        authors="X",
+        openalex_id="W1",
     )
     store.upsert_paper(
-        doi="10.1/b", zotero_key="B", title="Paper B",
-        year=2023, authors="Y", openalex_id="W2",
+        doi="10.1/b",
+        zotero_key="B",
+        title="Paper B",
+        year=2023,
+        authors="Y",
+        openalex_id="W2",
     )
     eid = store.upsert_entity("h. pylori", "organism")
     store.upsert_paper_entity("10.1/a", eid)
@@ -433,22 +446,34 @@ def test_get_unextracted_dois(tmp_db):
     store = GraphStore(tmp_db)
     # Paper with abstract and no entities
     store.upsert_paper(
-        doi="10.1/a", zotero_key="A", title="Paper A",
-        year=2024, authors="X", openalex_id="W1",
+        doi="10.1/a",
+        zotero_key="A",
+        title="Paper A",
+        year=2024,
+        authors="X",
+        openalex_id="W1",
         abstract="This paper studies gastric cancer.",
     )
     # Paper with abstract and entities (should be excluded)
     store.upsert_paper(
-        doi="10.1/b", zotero_key="B", title="Paper B",
-        year=2023, authors="Y", openalex_id="W2",
+        doi="10.1/b",
+        zotero_key="B",
+        title="Paper B",
+        year=2023,
+        authors="Y",
+        openalex_id="W2",
         abstract="This paper studies CDX2 expression.",
     )
     eid = store.upsert_entity("cdx2", "biomarker")
     store.upsert_paper_entity("10.1/b", eid)
     # Paper with no abstract (should be excluded)
     store.upsert_paper(
-        doi="10.1/c", zotero_key="C", title="Paper C",
-        year=2022, authors="Z", openalex_id="W3",
+        doi="10.1/c",
+        zotero_key="C",
+        title="Paper C",
+        year=2022,
+        authors="Z",
+        openalex_id="W3",
     )
 
     unextracted = store.get_unextracted_dois()
@@ -461,8 +486,12 @@ def test_entity_co_occurrence(tmp_db):
     """Entities that share papers are returned."""
     store = GraphStore(tmp_db)
     store.upsert_paper(
-        doi="10.1/a", zotero_key="A", title="Paper A",
-        year=2024, authors="X", openalex_id="W1",
+        doi="10.1/a",
+        zotero_key="A",
+        title="Paper A",
+        year=2024,
+        authors="X",
+        openalex_id="W1",
     )
     eid1 = store.upsert_entity("gastric cancer", "condition")
     eid2 = store.upsert_entity("cdx2", "biomarker")
@@ -484,12 +513,20 @@ def test_get_shared_entities(tmp_db):
     """Entities common to two papers are returned."""
     store = GraphStore(tmp_db)
     store.upsert_paper(
-        doi="10.1/a", zotero_key="A", title="Paper A",
-        year=2024, authors="X", openalex_id="W1",
+        doi="10.1/a",
+        zotero_key="A",
+        title="Paper A",
+        year=2024,
+        authors="X",
+        openalex_id="W1",
     )
     store.upsert_paper(
-        doi="10.1/b", zotero_key="B", title="Paper B",
-        year=2023, authors="Y", openalex_id="W2",
+        doi="10.1/b",
+        zotero_key="B",
+        title="Paper B",
+        year=2023,
+        authors="Y",
+        openalex_id="W2",
     )
     eid_shared = store.upsert_entity("gastric cancer", "condition")
     eid_only_a = store.upsert_entity("cdx2", "biomarker")

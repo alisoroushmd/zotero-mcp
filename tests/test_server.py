@@ -78,7 +78,7 @@ def test_local_failed_ttl_allows_retry_after_interval():
         patch("zotero_mcp.server.LocalClient") as mock_lc,
     ):
         mock_lc.return_value = MagicMock()
-        result = srv._get_local()
+        srv._get_local()
         mock_lc.assert_called_once()
 
 
@@ -122,6 +122,7 @@ def test_read_local_or_web_httpx_timeout():
 def test_handle_tool_errors_catches_value_error():
     """_handle_tool_errors converts ValueError to structured JSON error."""
     import json as _json
+
     import zotero_mcp.server as srv
 
     @srv._handle_tool_errors
@@ -136,6 +137,7 @@ def test_handle_tool_errors_catches_value_error():
 def test_handle_tool_errors_catches_runtime_error():
     """_handle_tool_errors converts RuntimeError to structured JSON error."""
     import json as _json
+
     import zotero_mcp.server as srv
 
     @srv._handle_tool_errors
@@ -164,6 +166,7 @@ def test_handle_tool_errors_passes_through_success():
 def test_manage_tags_list_calls_get_tags():
     """manage_tags(action='list') delegates to WebClient.get_tags."""
     import json as _json
+
     import zotero_mcp.server as srv
 
     with patch.object(srv, "_get_web") as mock_web:
@@ -176,6 +179,7 @@ def test_manage_tags_list_calls_get_tags():
 def test_manage_tags_remove_calls_remove_tag():
     """manage_tags(action='remove') delegates to WebClient.remove_tag."""
     import json as _json
+
     import zotero_mcp.server as srv
 
     with patch.object(srv, "_get_web") as mock_web:
@@ -188,6 +192,7 @@ def test_manage_tags_remove_calls_remove_tag():
 def test_manage_tags_rename_calls_rename_tag():
     """manage_tags(action='rename') delegates to WebClient.rename_tag."""
     import json as _json
+
     import zotero_mcp.server as srv
 
     with patch.object(srv, "_get_web") as mock_web:
@@ -200,6 +205,7 @@ def test_manage_tags_rename_calls_rename_tag():
 def test_manage_tags_remove_requires_tag():
     """manage_tags(action='remove') with empty tag returns error."""
     import json as _json
+
     import zotero_mcp.server as srv
 
     with patch.object(srv, "_get_web") as mock_web:
@@ -211,6 +217,7 @@ def test_manage_tags_remove_requires_tag():
 def test_manage_tags_rename_requires_both_tags():
     """manage_tags(action='rename') with missing new_tag returns error."""
     import json as _json
+
     import zotero_mcp.server as srv
 
     with patch.object(srv, "_get_web") as mock_web:
@@ -222,9 +229,10 @@ def test_manage_tags_rename_requires_both_tags():
 def test_manage_tags_invalid_action():
     """manage_tags with unknown action returns error."""
     import json as _json
+
     import zotero_mcp.server as srv
 
-    with patch.object(srv, "_get_web") as mock_web:
+    with patch.object(srv, "_get_web"):
         result = _json.loads(srv.manage_tags(action="delete"))
         assert result["error"] == "invalid_input"
 
@@ -235,6 +243,7 @@ def test_manage_tags_invalid_action():
 def test_build_index_invalid_type_fails_fast():
     """build_index with invalid type raises ValueError before any work."""
     import json as _json
+
     import zotero_mcp.server as srv
 
     result = _json.loads(srv.build_index(type="invalid"))
@@ -245,6 +254,7 @@ def test_build_index_invalid_type_fails_fast():
 def test_build_index_graph_delegates():
     """build_index(type='graph') calls _build_knowledge_graph."""
     import json as _json
+
     import zotero_mcp.server as srv
 
     with patch.object(srv, "_build_knowledge_graph", return_value={"papers": 5}):
@@ -257,6 +267,7 @@ def test_build_index_graph_delegates():
 def test_build_index_fulltext_delegates():
     """build_index(type='fulltext') calls _build_fulltext_index."""
     import json as _json
+
     import zotero_mcp.server as srv
 
     with patch.object(srv, "_build_fulltext_index", return_value={"indexed": 3}):
@@ -269,6 +280,7 @@ def test_build_index_fulltext_delegates():
 def test_build_index_both_delegates_to_both():
     """build_index(type='both') calls both helpers."""
     import json as _json
+
     import zotero_mcp.server as srv
 
     with (

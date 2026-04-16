@@ -12,7 +12,6 @@ from typing import TYPE_CHECKING
 from urllib.parse import urlencode, urlparse
 
 import defusedxml.ElementTree as ElementTree
-
 import httpx
 
 if TYPE_CHECKING:
@@ -63,17 +62,21 @@ def _validate_url(url: str) -> None:
             raise
         # Not an IP literal — hostname is a domain name, allow it
 
+
 WEB_BASE = "https://api.zotero.org"
 TRANSLATE_URL = "https://translate.zotero.org/search"
 TRANSLATE_WEB_URL = "https://translate.zotero.org/web"
 TIMEOUT = httpx.Timeout(10.0, connect=5.0)
+
+
 def _get_polite_email() -> str:
     """Get polite email from config (lazy to avoid import-time env read)."""
     from zotero_mcp.config import get_config
+
     return get_config().polite_email
-SEARCH_TIMEOUT = httpx.Timeout(
-    45.0, connect=5.0
-)  # searches can be slow on large libraries
+
+
+SEARCH_TIMEOUT = httpx.Timeout(45.0, connect=5.0)  # searches can be slow on large libraries
 
 
 # medRxiv/bioRxiv DOI prefixes (medRxiv migrated from 10.1101 to 10.64898)
@@ -112,9 +115,7 @@ def _retry_request(
     for attempt in range(1, max_attempts):
         if resp.status_code != 429:
             return resp
-        retry_after = float(
-            resp.headers.get("Retry-After", base_delay * (2 ** (attempt - 1)))
-        )
+        retry_after = float(resp.headers.get("Retry-After", base_delay * (2 ** (attempt - 1))))
         delay = min(retry_after, 30.0)
         logger.warning(
             "Rate limited (429), retrying in %.1fs (attempt %d/%d)",
@@ -127,13 +128,13 @@ def _retry_request(
     if resp.status_code == 429:
         try:
             resp.raise_for_status()
-        except RuntimeError:
+        except RuntimeError as err:
             # Response has no request attached (e.g. in tests); raise directly
             raise httpx.HTTPStatusError(
                 f"429 Too Many Requests after {max_attempts} attempts",
                 request=httpx.Request("GET", ""),
                 response=resp,
-            )
+            ) from err
     return resp
 
 
@@ -248,9 +249,7 @@ class WebClient:
         params = {}
         if item_type:
             params["itemType"] = item_type
-        resp = self._web_client.get(
-            f"/items/{parent_key}/children", params=params or None
-        )
+        resp = self._web_client.get(f"/items/{parent_key}/children", params=params or None)
         resp.raise_for_status()
         return [item.get("data", item) for item in resp.json()]
 
@@ -325,9 +324,7 @@ class WebClient:
         try:
             resp = httpx.get(
                 f"https://api.crossref.org/works/{doi}",
-                headers={
-                    "User-Agent": f"zotero-mcp/1.0 (mailto:{_get_polite_email()})"
-                },
+                headers={"User-Agent": f"zotero-mcp/1.0 (mailto:{_get_polite_email()})"},
                 timeout=TIMEOUT,
             )
             if resp.status_code != 200:
@@ -375,18 +372,14 @@ class WebClient:
         try:
             resp = httpx.get(
                 f"https://api.crossref.org/works/{doi}",
-                headers={
-                    "User-Agent": f"zotero-mcp/1.0 (mailto:{_get_polite_email()})"
-                },
+                headers={"User-Agent": f"zotero-mcp/1.0 (mailto:{_get_polite_email()})"},
                 timeout=TIMEOUT,
             )
             if resp.status_code != 200:
                 return result
             work = resp.json().get("message", {})
         except Exception as exc:
-            logger.warning(
-                "CrossRef published-version check failed for %s: %s", doi, exc
-            )
+            logger.warning("CrossRef published-version check failed for %s: %s", doi, exc)
             return result
 
         for item in work.get("relation", {}).get("is-preprint-of", []):
@@ -430,9 +423,7 @@ class WebClient:
             logger.warning("Duplicate DOI check failed for %s: %s", doi, exc)
         return None
 
-    def _check_duplicate_title(
-        self, title: str, threshold: float = 0.90
-    ) -> dict | None:
+    def _check_duplicate_title(self, title: str, threshold: float = 0.90) -> dict | None:
         """Check if a similar title already exists in the library.
 
         Normalizes both titles (lowercase, strip punctuation) and uses
@@ -733,9 +724,7 @@ class WebClient:
             if match:
                 pmid = match.group(1)
         elif identifier.startswith("10.") or "doi.org" in identifier:
-            doi = identifier.replace("https://doi.org/", "").replace(
-                "http://doi.org/", ""
-            )
+            doi = identifier.replace("https://doi.org/", "").replace("http://doi.org/", "")
             try:
                 search_resp = self._pubmed_client.get(
                     "/esearch.fcgi",
@@ -816,9 +805,7 @@ class WebClient:
                 last = author.findtext("LastName", "")
                 first = author.findtext("ForeName", "")
                 if last:
-                    creators.append(
-                        {"creatorType": "author", "lastName": last, "firstName": first}
-                    )
+                    creators.append({"creatorType": "author", "lastName": last, "firstName": first})
 
         # Journal
         journal_el = art.find("Journal")
@@ -859,10 +846,7 @@ class WebClient:
         pub_types: list[str] = []
         pub_type_list = art.find("PublicationTypeList")
         if pub_type_list is not None:
-            pub_types = [
-                (pt.text or "").lower()
-                for pt in pub_type_list.findall("PublicationType")
-            ]
+            pub_types = [(pt.text or "").lower() for pt in pub_type_list.findall("PublicationType")]
         if "preprint" in pub_types:
             item_type = "preprint"
         elif any("congress" in pt for pt in pub_types):
@@ -908,9 +892,7 @@ class WebClient:
         try:
             resp = httpx.get(
                 f"https://api.crossref.org/works/{doi}",
-                headers={
-                    "User-Agent": f"zotero-mcp/1.0 (mailto:{_get_polite_email()})"
-                },
+                headers={"User-Agent": f"zotero-mcp/1.0 (mailto:{_get_polite_email()})"},
                 timeout=TIMEOUT,
             )
             if resp.status_code != 200:
@@ -961,9 +943,7 @@ class WebClient:
             last = author.get("family", "")
             first = author.get("given", "")
             if last:
-                creators.append(
-                    {"creatorType": "author", "lastName": last, "firstName": first}
-                )
+                creators.append({"creatorType": "author", "lastName": last, "firstName": first})
 
         # Date -- prefer published-print, then published-online, then created
         date = ""
@@ -979,9 +959,7 @@ class WebClient:
 
         # Abstract (CrossRef provides HTML, strip tags for plain text)
         abstract_html = work.get("abstract", "")
-        abstract = (
-            re.sub(r"<[^>]+>", "", abstract_html).strip() if abstract_html else ""
-        )
+        abstract = re.sub(r"<[^>]+>", "", abstract_html).strip() if abstract_html else ""
 
         volume = work.get("volume", "")
         issue = work.get("issue", "")
@@ -1359,17 +1337,13 @@ class WebClient:
                     if tags:
                         existing_tags = item.get("tags", [])
                         existing_tag_names = {t.get("tag", "") for t in existing_tags}
-                        new_tags = [
-                            {"tag": t} for t in tags if t not in existing_tag_names
-                        ]
+                        new_tags = [{"tag": t} for t in tags if t not in existing_tag_names]
                         if new_tags:
                             new_patch["tags"] = existing_tags + new_tags
                     if collection_key:
                         existing_collections = item.get("collections", [])
                         if collection_key not in existing_collections:
-                            new_patch["collections"] = existing_collections + [
-                                collection_key
-                            ]
+                            new_patch["collections"] = existing_collections + [collection_key]
                     if new_patch:
                         resp = self._web_client.patch(
                             f"/items/{key}",
@@ -1413,9 +1387,7 @@ class WebClient:
             Dict with "key", "name", and "parent_key".
         """
         payload = [{"name": name, "parentCollection": parent_key or False}]
-        resp = _retry_request(
-            lambda: self._web_client.post("/collections", json=payload)
-        )
+        resp = _retry_request(lambda: self._web_client.post("/collections", json=payload))
         resp.raise_for_status()
 
         key = self._extract_created_key(resp.json())
@@ -1858,9 +1830,7 @@ class WebClient:
                     params={"itemKey": attach_key},
                     headers={"If-Unmodified-Since-Version": version},
                 )
-                logger.warning(
-                    "Cleaned up orphan attachment %s after upload failure", attach_key
-                )
+                logger.warning("Cleaned up orphan attachment %s after upload failure", attach_key)
             except Exception as cleanup_exc:
                 logger.warning(
                     "Failed to clean up orphan attachment %s: %s",
@@ -1924,12 +1894,8 @@ class WebClient:
                     if ids:
                         pmc_id = ids[0]
                         pdf_url = f"https://www.ncbi.nlm.nih.gov/pmc/articles/PMC{pmc_id}/pdf/"
-                        pdf_resp = httpx.get(
-                            pdf_url, timeout=30.0, follow_redirects=True
-                        )
-                        if pdf_resp.status_code == 200 and _is_valid_pdf(
-                            pdf_resp.content
-                        ):
+                        pdf_resp = httpx.get(pdf_url, timeout=30.0, follow_redirects=True)
+                        if pdf_resp.status_code == 200 and _is_valid_pdf(pdf_resp.content):
                             return pdf_resp.content, f"PMC{pmc_id}.pdf", "pmc"
             except Exception as exc:
                 logger.warning("PMC PDF download failed for %s: %s", doi, exc)
@@ -1959,8 +1925,6 @@ class WebClient:
                     if pdf_resp.status_code == 200 and _is_valid_pdf(pdf_resp.content):
                         return pdf_resp.content, f"{safe_doi}.pdf", server
                 except Exception as exc:
-                    logger.warning(
-                        "%s PDF download failed for %s: %s", server, doi, exc
-                    )
+                    logger.warning("%s PDF download failed for %s: %s", server, doi, exc)
 
         return None, "", ""

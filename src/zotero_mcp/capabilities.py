@@ -142,8 +142,7 @@ def format_status(caps: ServerCapabilities) -> dict:
         "local_read": {
             "available": caps.local_read,
             "description": (
-                "Optional speedup — reads use local Zotero desktop API "
-                "(faster, no rate limits)"
+                "Optional speedup — reads use local Zotero desktop API (faster, no rate limits)"
             ),
             "requires": "Zotero 7 desktop running with local API enabled",
         },

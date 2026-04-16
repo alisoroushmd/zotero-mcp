@@ -1,9 +1,10 @@
 """Tests for the _retry_request backoff helper and its application to write ops."""
 
+from unittest.mock import patch
+
 import httpx
 import pytest
 import respx
-from unittest.mock import patch
 
 from zotero_mcp.web_client import WebClient, _retry_request
 
@@ -53,9 +54,8 @@ def test_retry_request_raises_after_max_attempts():
     def always_429():
         return httpx.Response(429, headers={"Retry-After": "0"})
 
-    with patch("time.sleep"):
-        with pytest.raises(httpx.HTTPStatusError):
-            _retry_request(always_429, max_attempts=3)
+    with patch("time.sleep"), pytest.raises(httpx.HTTPStatusError):
+        _retry_request(always_429, max_attempts=3)
 
 
 def test_retry_request_caps_sleep_at_30s():

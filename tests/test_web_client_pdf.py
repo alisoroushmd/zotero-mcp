@@ -55,9 +55,7 @@ def test_attach_pdf_cleans_up_orphan_on_s3_failure():
         return_value=httpx.Response(
             200,
             json={
-                "successful": {
-                    "0": {"key": attach_key, "data": {"key": attach_key, "version": 1}}
-                }
+                "successful": {"0": {"key": attach_key, "data": {"key": attach_key, "version": 1}}}
             },
         )
     )
@@ -80,9 +78,7 @@ def test_attach_pdf_cleans_up_orphan_on_s3_failure():
     )
     # Cleanup: GET version + DELETE orphan
     respx.get(f"{BASE}/items").mock(
-        return_value=httpx.Response(
-            200, json=[], headers={"Last-Modified-Version": "10"}
-        )
+        return_value=httpx.Response(200, json=[], headers={"Last-Modified-Version": "10"})
     )
     delete_route = respx.delete(f"{BASE}/items").mock(return_value=httpx.Response(204))
 

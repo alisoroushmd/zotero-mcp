@@ -1,6 +1,5 @@
 """Tests for centralized Config module."""
 
-import os
 
 import pytest
 

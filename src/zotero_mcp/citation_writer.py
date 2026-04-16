@@ -358,9 +358,7 @@ def build_document(
         blocks, _ = parse_citations(raw_para)
         for block in blocks:
             if block.kind == "citation":
-                block.numbers = [
-                    key_to_number[k] for k in block.keys if k in key_to_number
-                ]
+                block.numbers = [key_to_number[k] for k in block.keys if k in key_to_number]
 
         paragraph = doc.add_paragraph()
 
@@ -497,8 +495,7 @@ def _rebuild_paragraph_with_citations(
                 },
                 "citationItems": citation_items,
                 "schema": (
-                    "https://github.com/citation-style-language"
-                    "/schema/raw/master/csl-citation.json"
+                    "https://github.com/citation-style-language/schema/raw/master/csl-citation.json"
                 ),
             }
             add_citation_field(paragraph, citation_json, display)
@@ -564,9 +561,7 @@ def insert_citations(
         # Remap to global numbering
         for block in blocks:
             if block.kind == "citation":
-                block.numbers = [
-                    key_to_number[k] for k in block.keys if k in key_to_number
-                ]
+                block.numbers = [key_to_number[k] for k in block.keys if k in key_to_number]
         _rebuild_paragraph_with_citations(paragraph, blocks, item_data, user_id)
 
     for paragraph in doc.paragraphs:

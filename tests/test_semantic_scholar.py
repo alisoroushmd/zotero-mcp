@@ -50,9 +50,7 @@ def test_get_recommendations_handles_empty():
 @respx.mock
 def test_get_recommendations_handles_error():
     """get_recommendations returns empty list on API error."""
-    respx.post(url__regex=r".*/recommendations/v1/papers/.*").mock(
-        return_value=httpx.Response(500)
-    )
+    respx.post(url__regex=r".*/recommendations/v1/papers/.*").mock(return_value=httpx.Response(500))
     client = SemanticScholarClient()
     results = client.get_recommendations(["10.1/seed"])
     assert results == []

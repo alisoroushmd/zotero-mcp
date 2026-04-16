@@ -243,12 +243,13 @@ def render_citations_view(kg: KnowledgeGraph) -> tuple[str, dict]:
         group = doi_to_group.get(doi, 0)
         nodes.append(_paper_node(doi, paper, pr.get(doi, 0), group))
 
-    edges = [
-        {"source": u, "target": v, "type": "citation"}
-        for u, v in graph.edges()
-    ]
+    edges = [{"source": u, "target": v, "type": "citation"} for u, v in graph.edges()]
 
-    data = {"nodes": nodes, "edges": edges, "group_labels": {str(k): v for k, v in group_labels.items()}}
+    data = {
+        "nodes": nodes,
+        "edges": edges,
+        "group_labels": {str(k): v for k, v in group_labels.items()},
+    }
     stats = {"nodes": len(nodes), "edges": len(edges), "view": "citations"}
     return _render_html(data), stats
 
@@ -297,7 +298,11 @@ def render_authors_view(kg: KnowledgeGraph) -> tuple[str, dict]:
         for u, v, d in coauthor.edges(data=True)
     ]
 
-    data = {"nodes": nodes, "edges": edges, "group_labels": {str(k): v for k, v in group_labels.items()}}
+    data = {
+        "nodes": nodes,
+        "edges": edges,
+        "group_labels": {str(k): v for k, v in group_labels.items()},
+    }
     stats = {"nodes": len(nodes), "edges": len(edges), "view": "authors"}
     return _render_html(data), stats
 
@@ -366,14 +371,20 @@ def render_full_view(kg: KnowledgeGraph, max_papers: int = 200) -> tuple[str, di
             edges.append({"source": u, "target": v, "type": "citation"})
 
     for u, v, d in coauthor.edges(data=True):
-        edges.append({
-            "source": u,
-            "target": v,
-            "type": "coauthor",
-            "weight": d.get("weight", 1),
-        })
+        edges.append(
+            {
+                "source": u,
+                "target": v,
+                "type": "coauthor",
+                "weight": d.get("weight", 1),
+            }
+        )
 
-    data = {"nodes": nodes, "edges": edges, "group_labels": {str(k): v for k, v in group_labels.items()}}
+    data = {
+        "nodes": nodes,
+        "edges": edges,
+        "group_labels": {str(k): v for k, v in group_labels.items()},
+    }
     stats = {"nodes": len(nodes), "edges": len(edges), "view": "full"}
     return _render_html(data), stats
 

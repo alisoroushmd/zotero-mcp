@@ -109,18 +109,11 @@ class GraphStore:
 
     def _migrate(self) -> None:
         """Add columns introduced after the initial schema."""
-        cols = {
-            row[1]
-            for row in self._conn.execute("PRAGMA table_info(papers)").fetchall()
-        }
+        cols = {row[1] for row in self._conn.execute("PRAGMA table_info(papers)").fetchall()}
         if "publication_date" not in cols:
-            self._conn.execute(
-                "ALTER TABLE papers ADD COLUMN publication_date TEXT"
-            )
+            self._conn.execute("ALTER TABLE papers ADD COLUMN publication_date TEXT")
         if "abstract" not in cols:
-            self._conn.execute(
-                "ALTER TABLE papers ADD COLUMN abstract TEXT"
-            )
+            self._conn.execute("ALTER TABLE papers ADD COLUMN abstract TEXT")
         self._conn.commit()
 
     def upsert_paper(
@@ -148,8 +141,7 @@ class GraphStore:
                    publication_date=excluded.publication_date,
                    abstract=COALESCE(excluded.abstract, papers.abstract),
                    updated_at=CURRENT_TIMESTAMP""",
-            (doi, zotero_key, title, year, authors, openalex_id,
-             publication_date, abstract),
+            (doi, zotero_key, title, year, authors, openalex_id, publication_date, abstract),
         )
         self._conn.commit()
 
@@ -161,9 +153,7 @@ class GraphStore:
         self._conn.commit()
 
     def get_paper(self, doi: str) -> dict | None:
-        row = self._conn.execute(
-            "SELECT * FROM papers WHERE doi = ?", (doi,)
-        ).fetchone()
+        row = self._conn.execute("SELECT * FROM papers WHERE doi = ?", (doi,)).fetchone()
         return dict(row) if row else None
 
     def get_references(self, doi: str) -> list[dict]:
@@ -189,9 +179,7 @@ class GraphStore:
         return [dict(r) for r in rows]
 
     def get_all_citations(self) -> list[tuple[str, str]]:
-        rows = self._conn.execute(
-            "SELECT citing_doi, cited_doi FROM citations"
-        ).fetchall()
+        rows = self._conn.execute("SELECT citing_doi, cited_doi FROM citations").fetchall()
         return [(r[0], r[1]) for r in rows]
 
     def get_doi_set(self) -> set[str]:
@@ -201,9 +189,7 @@ class GraphStore:
 
     def get_last_sync(self) -> dict | None:
         """Return last sync metadata, or None if never synced."""
-        ts = self._conn.execute(
-            "SELECT value FROM sync_state WHERE key = 'last_sync'"
-        ).fetchone()
+        ts = self._conn.execute("SELECT value FROM sync_state WHERE key = 'last_sync'").fetchone()
         ver = self._conn.execute(
             "SELECT value FROM sync_state WHERE key = 'library_version'"
         ).fetchone()
@@ -319,9 +305,7 @@ class GraphStore:
         Returns:
             List of topic dicts for the paper.
         """
-        rows = self._conn.execute(
-            "SELECT * FROM paper_topics WHERE doi = ?", (doi,)
-        ).fetchall()
+        rows = self._conn.execute("SELECT * FROM paper_topics WHERE doi = ?", (doi,)).fetchall()
         return [dict(r) for r in rows]
 
     def get_all_topics(self) -> list[dict]:
@@ -369,9 +353,7 @@ class GraphStore:
             char_count: Character count of the extracted text.
         """
         # Delete existing FTS entry if present (FTS5 doesn't support ON CONFLICT)
-        self._conn.execute(
-            "DELETE FROM paper_fulltext WHERE doi = ?", (doi,)
-        )
+        self._conn.execute("DELETE FROM paper_fulltext WHERE doi = ?", (doi,))
         self._conn.execute(
             "INSERT INTO paper_fulltext(doi, content) VALUES (?, ?)",
             (doi, content),
@@ -425,12 +407,8 @@ class GraphStore:
         Args:
             doi: Paper DOI to remove.
         """
-        self._conn.execute(
-            "DELETE FROM paper_fulltext WHERE doi = ?", (doi,)
-        )
-        self._conn.execute(
-            "DELETE FROM fulltext_state WHERE doi = ?", (doi,)
-        )
+        self._conn.execute("DELETE FROM paper_fulltext WHERE doi = ?", (doi,))
+        self._conn.execute("DELETE FROM fulltext_state WHERE doi = ?", (doi,))
         self._conn.commit()
 
     # -- Entity CRUD methods --
@@ -617,9 +595,7 @@ class GraphStore:
         ).fetchone()
         return row is not None
 
-    def get_entities_by_type(
-        self, entity_type: str, limit: int = 20
-    ) -> list[dict]:
+    def get_entities_by_type(self, entity_type: str, limit: int = 20) -> list[dict]:
         """Return entities of a specific type, ranked by paper count.
 
         Args:

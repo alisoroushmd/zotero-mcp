@@ -8,12 +8,12 @@ from docx.oxml.ns import qn
 
 from zotero_mcp.citation_writer import (
     TextBlock,
-    parse_citations,
-    zotero_to_csl_json,
-    add_citation_field,
     add_bibliography_field,
+    add_citation_field,
     build_document,
     insert_citations,
+    parse_citations,
+    zotero_to_csl_json,
 )
 
 # -- Parser tests --
@@ -163,9 +163,7 @@ def test_citation_instrtext_valid_json():
             "plainCitation": "1",
             "noteIndex": 0,
         },
-        "citationItems": [
-            {"id": 1, "uris": ["http://example.com"], "itemData": csl_data}
-        ],
+        "citationItems": [{"id": 1, "uris": ["http://example.com"], "itemData": csl_data}],
         "schema": "https://github.com/citation-style-language/schema/raw/master/csl-citation.json",
     }
     add_citation_field(para, citation_json, "1")
@@ -223,9 +221,7 @@ def test_build_simple_document(tmp_path):
             "key": "ABC",
             "itemType": "journalArticle",
             "title": "Test Paper",
-            "creators": [
-                {"creatorType": "author", "firstName": "J", "lastName": "Doe"}
-            ],
+            "creators": [{"creatorType": "author", "firstName": "J", "lastName": "Doe"}],
             "date": "2024",
             "DOI": "10.1/test",
             "publicationTitle": "Test Journal",
@@ -358,9 +354,7 @@ SAMPLE_ITEM_DATA = {
         "key": "ABC",
         "itemType": "journalArticle",
         "title": "Test Paper",
-        "creators": [
-            {"creatorType": "author", "firstName": "J", "lastName": "Doe"}
-        ],
+        "creators": [{"creatorType": "author", "firstName": "J", "lastName": "Doe"}],
         "date": "2024",
         "DOI": "10.1/test",
         "publicationTitle": "Test Journal",
@@ -372,9 +366,7 @@ SAMPLE_ITEM_DATA = {
         "key": "DEF",
         "itemType": "journalArticle",
         "title": "Another Paper",
-        "creators": [
-            {"creatorType": "author", "firstName": "A", "lastName": "Smith"}
-        ],
+        "creators": [{"creatorType": "author", "firstName": "A", "lastName": "Smith"}],
         "date": "2023",
         "DOI": "10.2/test",
         "publicationTitle": "Other Journal",
@@ -399,13 +391,14 @@ def _create_existing_doc(path, paragraphs, heading=None):
 
 def test_insert_citations_replaces_markers(tmp_path):
     doc_path = tmp_path / "existing.docx"
-    _create_existing_doc(doc_path, [
-        ("This is background text [@ABC].", None),
-    ])
-
-    result_path, count = insert_citations(
-        str(doc_path), SAMPLE_ITEM_DATA, "12345"
+    _create_existing_doc(
+        doc_path,
+        [
+            ("This is background text [@ABC].", None),
+        ],
     )
+
+    result_path, count = insert_citations(str(doc_path), SAMPLE_ITEM_DATA, "12345")
     assert count == 1
 
     doc = Document(result_path)
@@ -418,15 +411,16 @@ def test_insert_citations_replaces_markers(tmp_path):
 
 def test_insert_citations_preserves_unmarked_paragraphs(tmp_path):
     doc_path = tmp_path / "mixed.docx"
-    _create_existing_doc(doc_path, [
-        ("This paragraph has no citations.", None),
-        ("This one does [@ABC].", None),
-        ("This one is also plain.", None),
-    ])
-
-    result_path, count = insert_citations(
-        str(doc_path), SAMPLE_ITEM_DATA, "12345"
+    _create_existing_doc(
+        doc_path,
+        [
+            ("This paragraph has no citations.", None),
+            ("This one does [@ABC].", None),
+            ("This one is also plain.", None),
+        ],
     )
+
+    result_path, count = insert_citations(str(doc_path), SAMPLE_ITEM_DATA, "12345")
     assert count == 1
 
     doc = Document(result_path)
@@ -446,9 +440,7 @@ def test_insert_citations_preserves_heading_style(tmp_path):
     doc.add_paragraph("We used standard methods.")
     doc.save(str(doc_path))
 
-    result_path, _ = insert_citations(
-        str(doc_path), SAMPLE_ITEM_DATA, "12345"
-    )
+    result_path, _ = insert_citations(str(doc_path), SAMPLE_ITEM_DATA, "12345")
 
     doc = Document(result_path)
     # Headings should be preserved
@@ -460,13 +452,14 @@ def test_insert_citations_preserves_heading_style(tmp_path):
 
 def test_insert_citations_multiple_keys(tmp_path):
     doc_path = tmp_path / "multi.docx"
-    _create_existing_doc(doc_path, [
-        ("First ref [@ABC] and second ref [@DEF].", None),
-    ])
-
-    result_path, count = insert_citations(
-        str(doc_path), SAMPLE_ITEM_DATA, "12345"
+    _create_existing_doc(
+        doc_path,
+        [
+            ("First ref [@ABC] and second ref [@DEF].", None),
+        ],
     )
+
+    result_path, count = insert_citations(str(doc_path), SAMPLE_ITEM_DATA, "12345")
     assert count == 2
 
     doc = Document(result_path)
@@ -476,13 +469,14 @@ def test_insert_citations_multiple_keys(tmp_path):
 
 def test_insert_citations_adds_bibliography(tmp_path):
     doc_path = tmp_path / "nobib.docx"
-    _create_existing_doc(doc_path, [
-        ("Some text [@ABC].", None),
-    ])
-
-    result_path, _ = insert_citations(
-        str(doc_path), SAMPLE_ITEM_DATA, "12345"
+    _create_existing_doc(
+        doc_path,
+        [
+            ("Some text [@ABC].", None),
+        ],
     )
+
+    result_path, _ = insert_citations(str(doc_path), SAMPLE_ITEM_DATA, "12345")
 
     doc = Document(result_path)
     last_para = doc.paragraphs[-1]
@@ -491,13 +485,14 @@ def test_insert_citations_adds_bibliography(tmp_path):
 
 def test_insert_citations_no_markers_returns_zero(tmp_path):
     doc_path = tmp_path / "plain.docx"
-    _create_existing_doc(doc_path, [
-        ("Just plain text with no markers.", None),
-    ])
-
-    result_path, count = insert_citations(
-        str(doc_path), SAMPLE_ITEM_DATA, "12345"
+    _create_existing_doc(
+        doc_path,
+        [
+            ("Just plain text with no markers.", None),
+        ],
     )
+
+    result_path, count = insert_citations(str(doc_path), SAMPLE_ITEM_DATA, "12345")
     assert count == 0
 
     # Document should be unchanged (no bibliography added)
@@ -508,13 +503,14 @@ def test_insert_citations_no_markers_returns_zero(tmp_path):
 def test_insert_citations_saves_to_different_path(tmp_path):
     doc_path = tmp_path / "original.docx"
     out_path = tmp_path / "output.docx"
-    _create_existing_doc(doc_path, [
-        ("Text [@ABC].", None),
-    ])
-
-    result_path, count = insert_citations(
-        str(doc_path), SAMPLE_ITEM_DATA, "12345", str(out_path)
+    _create_existing_doc(
+        doc_path,
+        [
+            ("Text [@ABC].", None),
+        ],
     )
+
+    result_path, count = insert_citations(str(doc_path), SAMPLE_ITEM_DATA, "12345", str(out_path))
     assert count == 1
     assert Path(result_path) == out_path.resolve()
     assert out_path.exists()
@@ -530,9 +526,7 @@ def test_insert_citations_table_cells(tmp_path):
     table.cell(0, 1).text = "Plain cell."
     doc.save(str(doc_path))
 
-    result_path, count = insert_citations(
-        str(doc_path), SAMPLE_ITEM_DATA, "12345"
-    )
+    result_path, count = insert_citations(str(doc_path), SAMPLE_ITEM_DATA, "12345")
     assert count == 1
 
     doc = Document(result_path)

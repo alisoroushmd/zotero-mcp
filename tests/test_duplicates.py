@@ -222,8 +222,6 @@ def test_find_duplicates_groups_by_title_similarity():
     with mock.patch.object(client, "search_items", return_value=items):
         result = client.find_duplicates(limit=100)
 
-    title_groups = [
-        g for g in result["duplicate_groups"] if g["match_type"] == "title_similarity"
-    ]
+    title_groups = [g for g in result["duplicate_groups"] if g["match_type"] == "title_similarity"]
     assert len(title_groups) == 1
     assert len(title_groups[0]["items"]) == 2

@@ -1,7 +1,6 @@
 """Tests for OpenAlexClient — OpenAlex API wrapper."""
 
 import httpx
-import pytest
 import respx
 
 from zotero_mcp.openalex_client import OpenAlexClient
@@ -189,17 +188,29 @@ def test_extract_topics():
             {
                 "id": "https://openalex.org/T10234",
                 "display_name": "Gastric Cancer Risk Factors",
-                "subfield": {"id": "https://openalex.org/subfields/2721", "display_name": "Gastroenterology"},
+                "subfield": {
+                    "id": "https://openalex.org/subfields/2721",
+                    "display_name": "Gastroenterology",
+                },
                 "field": {"id": "https://openalex.org/fields/27", "display_name": "Medicine"},
-                "domain": {"id": "https://openalex.org/domains/4", "display_name": "Health Sciences"},
+                "domain": {
+                    "id": "https://openalex.org/domains/4",
+                    "display_name": "Health Sciences",
+                },
                 "score": 0.95,
             },
             {
                 "id": "https://openalex.org/T20456",
                 "display_name": "Helicobacter pylori Pathogenesis",
-                "subfield": {"id": "https://openalex.org/subfields/2726", "display_name": "Microbiology"},
+                "subfield": {
+                    "id": "https://openalex.org/subfields/2726",
+                    "display_name": "Microbiology",
+                },
                 "field": {"id": "https://openalex.org/fields/27", "display_name": "Medicine"},
-                "domain": {"id": "https://openalex.org/domains/4", "display_name": "Health Sciences"},
+                "domain": {
+                    "id": "https://openalex.org/domains/4",
+                    "display_name": "Health Sciences",
+                },
                 "score": 0.82,
             },
         ]

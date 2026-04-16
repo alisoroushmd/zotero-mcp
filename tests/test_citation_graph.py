@@ -88,9 +88,7 @@ def test_get_references_returns_list():
 @respx.mock
 def test_get_citing_works_returns_empty_for_unknown_doi():
     """get_citing_works returns empty list when DOI not found."""
-    respx.get(f"{OPENALEX_BASE}/works/doi:10.1234/unknown").mock(
-        return_value=httpx.Response(404)
-    )
+    respx.get(f"{OPENALEX_BASE}/works/doi:10.1234/unknown").mock(return_value=httpx.Response(404))
     client = OpenAlexClient()
     results = client.get_citing_works("10.1234/unknown", limit=10)
     assert results == []

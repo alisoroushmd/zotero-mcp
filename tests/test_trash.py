@@ -18,9 +18,7 @@ def _make_client() -> WebClient:
 def test_trash_items_single():
     """trash_items moves a single item to trash."""
     respx.get(f"{BASE}/items").mock(
-        return_value=httpx.Response(
-            200, json=[], headers={"Last-Modified-Version": "10"}
-        )
+        return_value=httpx.Response(200, json=[], headers={"Last-Modified-Version": "10"})
     )
     respx.delete(f"{BASE}/items").mock(
         return_value=httpx.Response(204, headers={"Last-Modified-Version": "11"})
@@ -36,9 +34,7 @@ def test_trash_items_batch_chunking():
     """trash_items chunks >50 keys into multiple requests."""
     keys = [f"KEY{i:04d}" for i in range(55)]
     respx.get(f"{BASE}/items").mock(
-        return_value=httpx.Response(
-            200, json=[], headers={"Last-Modified-Version": "100"}
-        )
+        return_value=httpx.Response(200, json=[], headers={"Last-Modified-Version": "100"})
     )
     delete_route = respx.delete(f"{BASE}/items").mock(
         return_value=httpx.Response(204, headers={"Last-Modified-Version": "101"})
@@ -53,9 +49,7 @@ def test_trash_items_batch_chunking():
 def test_empty_trash():
     """empty_trash permanently deletes all trashed items."""
     respx.get(f"{BASE}/items").mock(
-        return_value=httpx.Response(
-            200, json=[], headers={"Last-Modified-Version": "50"}
-        )
+        return_value=httpx.Response(200, json=[], headers={"Last-Modified-Version": "50"})
     )
     respx.delete(f"{BASE}/items/trash").mock(return_value=httpx.Response(204))
     client = _make_client()

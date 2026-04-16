@@ -22,9 +22,7 @@ class OpenAlexClient:
     https://openalex.org/users/me and set OPENALEX_API_KEY env var.
     """
 
-    def __init__(
-        self, api_key: str = "", email: str = ""
-    ) -> None:
+    def __init__(self, api_key: str = "", email: str = "") -> None:
         cfg = get_config()
         api_key = api_key or cfg.openalex_api_key
         email = email or cfg.polite_email
@@ -73,9 +71,7 @@ class OpenAlexClient:
         """
         doi = (work.get("doi") or "").replace("https://doi.org/", "")
         authorships = work.get("authorships", [])
-        authors = "; ".join(
-            a.get("author", {}).get("display_name", "") for a in authorships[:3]
-        )
+        authors = "; ".join(a.get("author", {}).get("display_name", "") for a in authorships[:3])
         if len(authorships) > 3:
             authors += " et al."
         return {
@@ -149,9 +145,7 @@ class OpenAlexClient:
                 if resp.status_code == 200:
                     return self._format_work_summary(resp.json())
             except Exception as exc:
-                logger.warning(
-                    "OpenAlex reference fetch failed for %s: %s", ref_id, exc
-                )
+                logger.warning("OpenAlex reference fetch failed for %s: %s", ref_id, exc)
             return None
 
         with ThreadPoolExecutor(max_workers=5) as pool:
@@ -234,9 +228,7 @@ class OpenAlexClient:
                 logger.warning("OpenAlex bulk query failed for batch %d: %s", i, exc)
         return all_works
 
-    def resolve_ids_to_dois(
-        self, openalex_ids: list[str], batch_size: int = 50
-    ) -> dict[str, str]:
+    def resolve_ids_to_dois(self, openalex_ids: list[str], batch_size: int = 50) -> dict[str, str]:
         """Resolve OpenAlex work IDs to DOIs.
 
         ``referenced_works`` from OpenAlex are IDs like ``https://openalex.org/W123``,
@@ -287,14 +279,16 @@ class OpenAlexClient:
             topic_id = (t.get("id") or "").split("/")[-1]  # Extract ID from URL
             if not topic_id:
                 continue
-            topics.append({
-                "topic_id": topic_id,
-                "topic_name": t.get("display_name", ""),
-                "subfield": (t.get("subfield") or {}).get("display_name", ""),
-                "field": (t.get("field") or {}).get("display_name", ""),
-                "domain": (t.get("domain") or {}).get("display_name", ""),
-                "score": t.get("score", 0.0),
-            })
+            topics.append(
+                {
+                    "topic_id": topic_id,
+                    "topic_name": t.get("display_name", ""),
+                    "subfield": (t.get("subfield") or {}).get("display_name", ""),
+                    "field": (t.get("field") or {}).get("display_name", ""),
+                    "domain": (t.get("domain") or {}).get("display_name", ""),
+                    "score": t.get("score", 0.0),
+                }
+            )
         return topics
 
     @staticmethod
@@ -337,11 +331,13 @@ class OpenAlexClient:
                 continue
             institutions = a.get("institutions", [])
             institution = institutions[0].get("display_name", "") if institutions else ""
-            authors.append({
-                "openalex_author_id": author_id,
-                "display_name": author.get("display_name", ""),
-                "orcid": (author.get("orcid") or "").replace("https://orcid.org/", ""),
-                "institution": institution,
-                "position": i,
-            })
+            authors.append(
+                {
+                    "openalex_author_id": author_id,
+                    "display_name": author.get("display_name", ""),
+                    "orcid": (author.get("orcid") or "").replace("https://orcid.org/", ""),
+                    "institution": institution,
+                    "position": i,
+                }
+            )
         return authors
