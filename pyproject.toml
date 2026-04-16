@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "zotero-mcp"
-version = "0.6.0"
+version = "0.7.0"
 description = "MCP server for Zotero — search, organize, cite, and analyze your library"
 license = "MIT"
 requires-python = ">=3.11"
@@ -29,6 +29,7 @@ graph = [
     "numpy>=1.26",
     "scipy>=1.12",
 ]
+fulltext = ["pypdf>=4.0"]
 
 [tool.hatch.build.targets.wheel]
 packages = ["src/zotero_mcp"]

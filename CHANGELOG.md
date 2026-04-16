@@ -6,6 +6,45 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/).
 
 ## [Unreleased]
 
+## [0.7.0] - 2026-04-15
+
+### Added
+
+- **Temporal analytics** — 4 new `query_knowledge_graph` query types:
+  - `timeline` — papers per month, filterable by topic and year range
+  - `topic_evolution` — per-subfield monthly publication counts over time
+  - `citation_velocity` — month-by-month citation accumulation for a paper
+  - `trending` — papers with accelerating recent citation rates (velocity ratio)
+- **Full-text PDF search** — 2 new tools:
+  - `build_fulltext_index` — bulk-extract text from library PDFs using pypdf and index
+    in SQLite FTS5 with BM25 ranking. Hybrid approach: pypdf for keyword search index,
+    LLM reads PDFs natively for deep understanding of tables/figures
+  - `search_fulltext` — search indexed full text with highlighted snippets
+- **Entity extraction** — 3 new tools (two-tool LLM-in-the-loop pattern):
+  - `get_unextracted_abstracts` — returns papers with abstracts not yet entity-extracted
+  - `store_entities` — persist typed entities (biomarker, drug, gene, etc.) extracted
+    by the calling LLM from abstracts
+  - `search_entities` — query entity index: by_name, by_type, by_doi, co_occurrence,
+    shared_entities, entity_network, paper_entities
+- `publication_date TEXT` column in papers table (YYYY-MM granularity) — populated from
+  OpenAlex, enables month-level temporal analytics
+- `abstract TEXT` column in papers table — reconstructed from OpenAlex inverted index
+  via `OpenAlexClient.reconstruct_abstract()`. COALESCE prevents NULL overwrites
+- `entities` + `paper_entities` tables in GraphStore for entity persistence
+- `paper_fulltext` FTS5 virtual table + `fulltext_state` tracking table
+- `text_extractor.py` module — PDF text extraction via pypdf + FTS5 indexing helpers
+- `_migrate()` method in GraphStore for transparent schema upgrade from v0.6.0 databases
+- `[fulltext]` optional extra: `pip install zotero-mcp[fulltext]` adds pypdf
+- `get_pdf_content` gains `extract_text` parameter for inline text extraction
+
+### Changed
+
+- Tool count increased from 32 to 37
+- `_index_works()` now captures `publication_date` and `abstract` from OpenAlex responses
+- `query_knowledge_graph` description updated with temporal query types and new parameters
+  (`topic`, `start_year`, `end_year`, `years`)
+- KnowledgeGraph `build_from_store()` loads `publication_date` into paper node data
+
 ## [0.6.0] - 2026-04-15
 
 ### Added

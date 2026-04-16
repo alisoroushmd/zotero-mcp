@@ -2,7 +2,7 @@
   "manifest_version": "0.3",
   "name": "zotero-mcp",
   "display_name": "Zotero",
-  "version": "0.6.0",
+  "version": "0.7.0",
   "description": "Search, organize, cite, and analyze your Zotero library",
   "author": {
     "name": "Ali Soroush",

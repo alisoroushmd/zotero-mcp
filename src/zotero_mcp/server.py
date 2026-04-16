@@ -376,15 +376,16 @@ def get_item_attachments(parent_key: str) -> str:
 
 
 @mcp.tool(
-    description="Route to best full-text source (PMCID, local PDF, DOI)",
+    description="Route to best full-text source (PMCID, local PDF, DOI). Set extract_text=true to extract and return the text content directly.",
     annotations={"readOnlyHint": True},
 )
 @_handle_tool_errors
-def get_pdf_content(item_key: str) -> str:
+def get_pdf_content(item_key: str, extract_text: bool = False) -> str:
     """Route to the best available content source for a Zotero item.
 
     Args:
         item_key: Zotero item key.
+        extract_text: If True, extract text from the PDF and return it inline.
 
     Returns:
         JSON with content_source and the relevant identifier or path.
@@ -407,26 +408,42 @@ def get_pdf_content(item_key: str) -> str:
     extra = item.get("extra", "")
     url = item.get("url", "")
 
-    # Step 1: Check for PMCID via PMID
-    pmid_match = re.search(r"PMID:\s*(\d+)", extra)
-    if pmid_match:
-        pmid = pmid_match.group(1)
-        try:
-            pmcid = _get_web().resolve_pmid_to_pmcid(pmid)
-            if pmcid:
-                return json.dumps(
-                    {
-                        "item_key": item_key,
-                        "content_source": "pmc",
-                        "pmcid": pmcid,
-                        "pmid": pmid,
-                        "message": "Use PubMed MCP get_full_text_article(pmcid)",
-                    }
+    def _maybe_extract(source, result_dict):
+        """If extract_text is requested, extract text from PDF source and add to result."""
+        if not extract_text:
+            return result_dict
+        from zotero_mcp.text_extractor import extract_text_from_pdf
+
+        text = extract_text_from_pdf(source)
+        if text:
+            result_dict["content_source"] = "extracted_text"
+            result_dict["text"] = text
+            result_dict["page_count"] = text.count("\n\n") + 1
+            result_dict["char_count"] = len(text)
+            result_dict.pop("message", None)
+        return result_dict
+
+    # Step 1: Check for PMCID via PMID (skip when extracting — need actual PDF)
+    if not extract_text:
+        pmid_match = re.search(r"PMID:\s*(\d+)", extra)
+        if pmid_match:
+            pmid = pmid_match.group(1)
+            try:
+                pmcid = _get_web().resolve_pmid_to_pmcid(pmid)
+                if pmcid:
+                    return json.dumps(
+                        {
+                            "item_key": item_key,
+                            "content_source": "pmc",
+                            "pmcid": pmcid,
+                            "pmid": pmid,
+                            "message": "Use PubMed MCP get_full_text_article(pmcid)",
+                        }
+                    )
+            except Exception as exc:
+                logger.warning(
+                    "PMCID lookup failed for item %s PMID %s: %s", item_key, pmid, exc
                 )
-        except Exception as exc:
-            logger.warning(
-                "PMCID lookup failed for item %s PMID %s: %s", item_key, pmid, exc
-            )
 
     # Step 2: Check for PDF attachments
     try:
@@ -446,15 +463,14 @@ def get_pdf_content(item_key: str) -> str:
             local = _get_local()
             local_path = local.get_attachment_path(att_key)
             if local_path:
-                return json.dumps(
-                    {
-                        "item_key": item_key,
-                        "content_source": "local_pdf",
-                        "pdf_path": local_path,
-                        "attachment_key": att_key,
-                        "message": "Read this PDF path",
-                    }
-                )
+                result = {
+                    "item_key": item_key,
+                    "content_source": "local_pdf",
+                    "pdf_path": local_path,
+                    "attachment_key": att_key,
+                    "message": "Read this PDF path",
+                }
+                return json.dumps(_maybe_extract(local_path, result))
         except Exception as exc:
             logger.warning(
                 "Local attachment path lookup failed for %s: %s", att_key, exc
@@ -464,6 +480,13 @@ def get_pdf_content(item_key: str) -> str:
         try:
             web = _get_web()
             pdf_bytes = web.download_attachment(att_key)
+            if extract_text:
+                result = {
+                    "item_key": item_key,
+                    "content_source": "web_pdf",
+                    "attachment_key": att_key,
+                }
+                return json.dumps(_maybe_extract(pdf_bytes, result))
             tmp = tempfile.NamedTemporaryFile(
                 prefix="zotero_mcp_", suffix=".pdf", delete=False
             )
@@ -494,6 +517,13 @@ def get_pdf_content(item_key: str) -> str:
         try:
             pdf_bytes, _, source = _get_web()._download_free_pdf(doi)
             if pdf_bytes:
+                if extract_text:
+                    result = {
+                        "item_key": item_key,
+                        "content_source": f"free_pdf_{source}",
+                        "doi": doi,
+                    }
+                    return json.dumps(_maybe_extract(pdf_bytes, result))
                 tmp = tempfile.NamedTemporaryFile(
                     prefix="zotero_mcp_", suffix=".pdf", delete=False
                 )
@@ -1298,6 +1328,8 @@ def _index_works(works, key_by_doi, store, openalex):
         authors = "; ".join(
             a.get("author", {}).get("display_name", "") for a in authorships[:3]
         )
+        pub_date = (work.get("publication_date") or "")[:7]  # YYYY-MM
+        abstract = OpenAlexClient.reconstruct_abstract(work)
         store.upsert_paper(
             doi=doi,
             zotero_key=key_by_doi.get(doi, ""),
@@ -1305,6 +1337,8 @@ def _index_works(works, key_by_doi, store, openalex):
             year=work.get("publication_year", 0),
             authors=authors,
             openalex_id=work.get("id", ""),
+            publication_date=pub_date,
+            abstract=abstract,
         )
         papers_added += 1
 
@@ -1445,7 +1479,11 @@ def build_knowledge_graph(full_rebuild: bool = False) -> str:
         "'bridges' (papers connecting different clusters), "
         "'path' (shortest citation path between two DOIs — requires doi_a and doi_b), "
         "'neighborhood' (papers within N hops of a DOI — requires doi and optional depth), "
-        "'stats' (graph summary). "
+        "'stats' (graph summary), "
+        "'timeline' (papers per month — optional topic filter, start_year, end_year), "
+        "'topic_evolution' (per-subfield paper counts by month — optional start_year, end_year), "
+        "'citation_velocity' (month-by-month citation count for a DOI — requires doi), "
+        "'trending' (papers with accelerating citation rates — optional limit, years window). "
         "Requires build_knowledge_graph to be run first."
     ),
     annotations={"readOnlyHint": True},
@@ -1458,6 +1496,10 @@ def query_knowledge_graph(
     doi_b: str = "",
     depth: int = 1,
     limit: int = 10,
+    topic: str = "",
+    start_year: int = 0,
+    end_year: int = 0,
+    years: int = 3,
 ) -> str:
     """Query the knowledge graph (uses cached graph)."""
     kg = _get_or_build_kg()
@@ -1478,10 +1520,29 @@ def query_knowledge_graph(
         result = kg.get_neighborhood(doi, depth=depth)
     elif query_type == "stats":
         result = kg.get_stats()
+    elif query_type == "timeline":
+        result = kg.get_timeline(
+            topic=topic or None,
+            start_year=start_year or None,
+            end_year=end_year or None,
+        )
+    elif query_type == "topic_evolution":
+        result = kg.get_topic_evolution(
+            start_year=start_year or None,
+            end_year=end_year or None,
+            limit=limit,
+        )
+    elif query_type == "citation_velocity":
+        if not doi:
+            raise ValueError("citation_velocity query requires doi")
+        result = kg.get_citation_velocity(doi)
+    elif query_type == "trending":
+        result = kg.get_trending(top_n=limit, years=years)
     else:
         raise ValueError(
             f"Unknown query_type: {query_type!r}. "
-            "Must be: influential, clusters, bridges, path, neighborhood, stats"
+            "Must be: influential, clusters, bridges, path, neighborhood, "
+            "stats, timeline, topic_evolution, citation_velocity, trending"
         )
 
     return json.dumps(result, ensure_ascii=False)
@@ -1553,6 +1614,155 @@ def find_related_papers(
         ensure_ascii=False,
     )
 
+
+# -- Full-text search tools --
+
+
+@mcp.tool(
+    description=(
+        "Build or update the full-text search index from PDF attachments "
+        "in your library. Extracts text from PDFs and indexes for search. "
+        "Incremental by default — set full_rebuild=true to re-extract all."
+    ),
+)
+@_handle_tool_errors
+def build_fulltext_index(full_rebuild: bool = False, limit: int = 0) -> str:
+    """Build or update the full-text search index from PDFs.
+
+    Args:
+        full_rebuild: If True, re-extract all PDFs. Otherwise incremental.
+        limit: If > 0, cap the number of papers to process.
+
+    Returns:
+        JSON with indexed, skipped, failed, total counts.
+    """
+    from concurrent.futures import ThreadPoolExecutor, as_completed
+
+    from zotero_mcp.graph_store import GraphStore
+    from zotero_mcp.text_extractor import extract_text_from_pdf, index_paper_text
+
+    web = _get_web()
+    store = GraphStore()
+
+    items = web.get_all_items_with_dois()
+    if not items:
+        return json.dumps({"error": "No items with DOIs found in library"})
+
+    already_indexed = store.get_indexed_dois()
+    total = len(items)
+
+    if not full_rebuild:
+        items = [it for it in items if it["DOI"] not in already_indexed]
+    skipped = total - len(items)
+
+    if limit > 0:
+        items = items[:limit]
+
+    indexed = 0
+    failed = 0
+
+    def _process_one(item: dict) -> dict:
+        """Extract and index text for a single item."""
+        item_key = item["key"]
+        item_doi = item["DOI"]
+
+        # Get PDF attachments
+        try:
+            children = _read_local_or_web(
+                "get_children", item_key, item_type="attachment"
+            )
+        except Exception:
+            return {"doi": item_doi, "status": "failed", "reason": "no_attachments"}
+
+        pdf_atts = [
+            c for c in children if c.get("contentType") == "application/pdf"
+        ]
+        if not pdf_atts:
+            return {"doi": item_doi, "status": "failed", "reason": "no_pdf"}
+
+        att = pdf_atts[0]
+        att_key = att.get("key", "")
+        pdf_source = None
+
+        # Try local path first
+        try:
+            local = _get_local()
+            local_path = local.get_attachment_path(att_key)
+            if local_path:
+                pdf_source = local_path
+        except Exception:
+            pass
+
+        # Fall back to web download
+        if pdf_source is None:
+            try:
+                pdf_source = web.download_attachment(att_key)
+            except Exception:
+                return {"doi": item_doi, "status": "failed", "reason": "download_failed"}
+
+        # Extract text
+        text = extract_text_from_pdf(pdf_source)
+        if not text:
+            return {"doi": item_doi, "status": "failed", "reason": "no_text_extracted"}
+
+        # Index
+        index_paper_text(store, item_doi, text)
+        return {"doi": item_doi, "status": "indexed"}
+
+    with ThreadPoolExecutor(max_workers=4) as pool:
+        futures = {pool.submit(_process_one, it): it for it in items}
+        for future in as_completed(futures):
+            try:
+                result = future.result()
+                if result["status"] == "indexed":
+                    indexed += 1
+                else:
+                    failed += 1
+            except Exception:
+                failed += 1
+
+    return json.dumps(
+        {
+            "indexed": indexed,
+            "skipped": skipped,
+            "failed": failed,
+            "total": total,
+        },
+        ensure_ascii=False,
+    )
+
+
+@mcp.tool(
+    description=(
+        "Search the full text of indexed PDFs in your library. "
+        "Returns matching papers with highlighted text snippets. "
+        "Requires build_fulltext_index to be run first."
+    ),
+    annotations={"readOnlyHint": True},
+)
+@_handle_tool_errors
+def search_fulltext(query: str, limit: str | int = 20) -> str:
+    """Search full-text index for matching papers.
+
+    Args:
+        query: FTS5 search query string.
+        limit: Maximum results to return.
+
+    Returns:
+        JSON with matching papers and highlighted snippets.
+    """
+    from zotero_mcp.graph_store import GraphStore
+
+    if not query or not query.strip():
+        raise ValueError("query must not be empty")
+
+    limit_int = _clamp_limit(limit, lo=1, hi=100)
+    store = GraphStore()
+    results = store.search_fulltext(query.strip(), limit_int)
+    return json.dumps(
+        {"query": query.strip(), "results": results, "count": len(results)},
+        ensure_ascii=False,
+    )
 
 
 @mcp.tool(
@@ -1649,3 +1859,239 @@ def export_knowledge_graph(
         f.write(html)
 
     return json.dumps({"path": path, **stats}, ensure_ascii=False)
+
+
+# -- Entity extraction tools --
+
+
+@mcp.tool(
+    description=(
+        "Get papers that have abstracts but no extracted entities yet. "
+        "Returns abstracts for the calling LLM to extract biomedical "
+        "entities from. Call store_entities with the results."
+    ),
+    annotations={"readOnlyHint": True},
+)
+@_handle_tool_errors
+def get_unextracted_abstracts(limit: str | int = 50) -> str:
+    """Get papers with abstracts that haven't had entities extracted.
+
+    Args:
+        limit: Maximum number of papers to return.
+
+    Returns:
+        JSON with papers list and remaining count.
+    """
+    from zotero_mcp.graph_store import GraphStore
+
+    limit_int = _clamp_limit(limit, lo=1, hi=200)
+    store = GraphStore()
+    all_unextracted = store.get_unextracted_dois()
+    batch = all_unextracted[:limit_int]
+    remaining = len(all_unextracted) - len(batch)
+    return json.dumps(
+        {"papers": batch, "remaining": remaining},
+        ensure_ascii=False,
+    )
+
+
+@mcp.tool(
+    description=(
+        "Store extracted entities for papers. Call this whenever you "
+        "encounter paper abstracts and can identify biomedical entities. "
+        "Entity types: condition, biomarker, drug, method, gene, organism, "
+        "outcome, dataset. Input: list of {doi, entities: [{name, type}]}"
+    ),
+)
+@_handle_tool_errors
+def store_entities(results: str | list) -> str:
+    """Store extracted entities for one or more papers.
+
+    Args:
+        results: JSON list of {doi, entities: [{name, type}]}.
+            May be a JSON string or a parsed list.
+
+    Returns:
+        JSON with stored paper count and entity creation stats.
+    """
+    from zotero_mcp.graph_store import GraphStore
+
+    if isinstance(results, str):
+        results = json.loads(results)
+    if not isinstance(results, list):
+        raise ValueError("results must be a list of {doi, entities: [{name, type}]}")
+
+    store = GraphStore()
+    papers_stored = 0
+    entities_created = 0
+    entities_reused = 0
+
+    for item in results:
+        doi = item.get("doi", "").strip()
+        if not doi:
+            continue
+        entities = item.get("entities", [])
+        if not entities:
+            continue
+
+        entities_stored_for_paper = 0
+        for ent in entities:
+            ent_name = ent.get("name", "").strip()
+            ent_type = ent.get("type", "").strip()
+            if not ent_name or not ent_type:
+                continue
+
+            # Check if entity already exists before upserting
+            normalized = ent_name.strip().lower()
+            existing = store._conn.execute(
+                "SELECT entity_id FROM entities WHERE name = ? AND entity_type = ?",
+                (normalized, ent_type),
+            ).fetchone()
+
+            entity_id = store.upsert_entity(ent_name, ent_type)
+
+            if existing:
+                entities_reused += 1
+            else:
+                entities_created += 1
+
+            store.upsert_paper_entity(doi, entity_id)
+            entities_stored_for_paper += 1
+
+        if entities_stored_for_paper > 0:
+            papers_stored += 1
+
+    _invalidate_kg_cache()
+    return json.dumps(
+        {
+            "stored": papers_stored,
+            "entities_created": entities_created,
+            "entities_reused": entities_reused,
+        },
+        ensure_ascii=False,
+    )
+
+
+@mcp.tool(
+    description=(
+        "Search the entity graph. Query types: "
+        "'by_name' (papers with entity), "
+        "'by_type' (common entities of a type), "
+        "'co_occurrence' (entities that co-occur with given entity), "
+        "'shared_entities' (entities shared by two papers), "
+        "'paper_entities' (all entities for a paper)."
+    ),
+    annotations={"readOnlyHint": True},
+)
+@_handle_tool_errors
+def search_entities(
+    query_type: str,
+    entity_name: str = "",
+    entity_type: str = "",
+    doi: str = "",
+    doi_a: str = "",
+    doi_b: str = "",
+    limit: str | int = 20,
+) -> str:
+    """Search the entity graph with various query types.
+
+    Args:
+        query_type: One of by_name, by_type, co_occurrence,
+            shared_entities, paper_entities.
+        entity_name: Entity name for by_name/co_occurrence queries.
+        entity_type: Entity type filter for by_type queries.
+        doi: Paper DOI for paper_entities query.
+        doi_a: First DOI for shared_entities query.
+        doi_b: Second DOI for shared_entities query.
+        limit: Maximum results.
+
+    Returns:
+        JSON with query results.
+    """
+    from zotero_mcp.graph_store import GraphStore
+
+    limit_int = _clamp_limit(limit, lo=1, hi=100)
+    store = GraphStore()
+
+    if query_type == "by_name":
+        if not entity_name:
+            raise ValueError("by_name query requires entity_name")
+        entities = store.search_entities_by_name(entity_name, limit=limit_int)
+        results = []
+        for ent in entities:
+            papers = store.get_papers_for_entity(ent["entity_id"])
+            results.append({
+                **ent,
+                "paper_count": len(papers),
+                "papers": [
+                    {"doi": p["doi"], "title": p["title"], "year": p["year"]}
+                    for p in papers[:limit_int]
+                ],
+            })
+        return json.dumps({"query": "by_name", "results": results}, ensure_ascii=False)
+
+    elif query_type == "by_type":
+        if entity_type:
+            rows = store._conn.execute(
+                """SELECT entity_id, name, entity_type,
+                          (SELECT COUNT(*) FROM paper_entities pe
+                           WHERE pe.entity_id = e.entity_id) as paper_count
+                   FROM entities e
+                   WHERE entity_type = ?
+                   ORDER BY paper_count DESC
+                   LIMIT ?""",
+                (entity_type, limit_int),
+            ).fetchall()
+            return json.dumps(
+                {"query": "by_type", "entity_type": entity_type,
+                 "results": [dict(r) for r in rows]},
+                ensure_ascii=False,
+            )
+        else:
+            types = store.get_all_entity_types()
+            return json.dumps(
+                {"query": "by_type", "entity_types": types},
+                ensure_ascii=False,
+            )
+
+    elif query_type == "co_occurrence":
+        if not entity_name:
+            raise ValueError("co_occurrence query requires entity_name")
+        matches = store.search_entities_by_name(entity_name, limit=1)
+        if not matches:
+            return json.dumps(
+                {"query": "co_occurrence", "error": f"Entity not found: {entity_name}"},
+                ensure_ascii=False,
+            )
+        entity_id = matches[0]["entity_id"]
+        co_occurring = store.get_entity_co_occurrence(entity_id, limit=limit_int)
+        return json.dumps(
+            {"query": "co_occurrence", "entity": matches[0],
+             "co_occurring": co_occurring},
+            ensure_ascii=False,
+        )
+
+    elif query_type == "shared_entities":
+        if not doi_a or not doi_b:
+            raise ValueError("shared_entities query requires doi_a and doi_b")
+        shared = store.get_shared_entities(doi_a, doi_b)
+        return json.dumps(
+            {"query": "shared_entities", "doi_a": doi_a, "doi_b": doi_b,
+             "shared": shared},
+            ensure_ascii=False,
+        )
+
+    elif query_type == "paper_entities":
+        if not doi:
+            raise ValueError("paper_entities query requires doi")
+        entities = store.get_entities_for_doi(doi)
+        return json.dumps(
+            {"query": "paper_entities", "doi": doi, "entities": entities},
+            ensure_ascii=False,
+        )
+
+    else:
+        raise ValueError(
+            f"Unknown query_type: {query_type!r}. "
+            "Must be: by_name, by_type, co_occurrence, shared_entities, paper_entities"
+        )

@@ -407,3 +407,150 @@ def test_empty_graph():
     assert kg.get_influential_papers() == []
     assert kg.get_clusters() == []
     assert kg.get_bridge_papers() == []
+
+
+# -- Temporal analytics tests --
+
+
+@pytest.fixture
+def temporal_store():
+    """GraphStore with papers having publication_date for temporal tests.
+
+    Papers span 2022-01 to 2024-06, with citations:
+        B(2023-03) -> A(2022-01)
+        C(2023-08) -> A(2022-01)
+        D(2024-01) -> A(2022-01)
+        D(2024-01) -> B(2023-03)
+        E(2024-06) -> A(2022-01)
+
+    A has 4 citations. B has 1.
+    """
+    fd, path = tempfile.mkstemp(suffix=".db")
+    os.close(fd)
+    store = GraphStore(path)
+
+    papers = [
+        ("10.1/a", "A", "Paper A", 2022, "2022-01"),
+        ("10.1/b", "B", "Paper B", 2023, "2023-03"),
+        ("10.1/c", "C", "Paper C", 2023, "2023-08"),
+        ("10.1/d", "D", "Paper D", 2024, "2024-01"),
+        ("10.1/e", "E", "Paper E", 2024, "2024-06"),
+    ]
+    for doi, key, title, year, pub_date in papers:
+        store.upsert_paper(
+            doi=doi, zotero_key=key, title=title, year=year,
+            authors="Author", openalex_id=f"W{key}",
+            publication_date=pub_date,
+        )
+
+    # Topics: A, B = Gastroenterology; C, D, E = Oncology
+    for doi in ["10.1/a", "10.1/b"]:
+        store.upsert_topic(
+            doi=doi, topic_id="T1", topic_name="GI Cancer",
+            subfield="Gastroenterology", field="Medicine",
+            domain="Health Sciences", score=0.9,
+        )
+    for doi in ["10.1/c", "10.1/d", "10.1/e"]:
+        store.upsert_topic(
+            doi=doi, topic_id="T2", topic_name="Tumor Biology",
+            subfield="Oncology", field="Medicine",
+            domain="Health Sciences", score=0.85,
+        )
+
+    # Citations: B, C, D, E all cite A; D also cites B
+    store.upsert_citation("10.1/b", "10.1/a")
+    store.upsert_citation("10.1/c", "10.1/a")
+    store.upsert_citation("10.1/d", "10.1/a")
+    store.upsert_citation("10.1/d", "10.1/b")
+    store.upsert_citation("10.1/e", "10.1/a")
+
+    yield store
+    os.unlink(path)
+
+
+def test_get_timeline(temporal_store):
+    """Timeline returns papers per month sorted chronologically."""
+    kg = KnowledgeGraph()
+    kg.build_from_store(temporal_store)
+    timeline = kg.get_timeline()
+    assert len(timeline) == 5
+    assert timeline[0] == {"month": "2022-01", "count": 1}
+    assert timeline[-1] == {"month": "2024-06", "count": 1}
+
+
+def test_get_timeline_with_topic_filter(temporal_store):
+    """Timeline filtered by topic only includes matching papers."""
+    kg = KnowledgeGraph()
+    kg.build_from_store(temporal_store)
+    timeline = kg.get_timeline(topic="Gastroenterology")
+    assert len(timeline) == 2
+    months = {t["month"] for t in timeline}
+    assert months == {"2022-01", "2023-03"}
+
+
+def test_get_timeline_with_year_range(temporal_store):
+    """Timeline respects start_year and end_year filters."""
+    kg = KnowledgeGraph()
+    kg.build_from_store(temporal_store)
+    timeline = kg.get_timeline(start_year=2023, end_year=2023)
+    assert len(timeline) == 2
+    months = {t["month"] for t in timeline}
+    assert months == {"2023-03", "2023-08"}
+
+
+def test_get_topic_evolution(temporal_store):
+    """Topic evolution returns per-subfield monthly counts."""
+    kg = KnowledgeGraph()
+    kg.build_from_store(temporal_store)
+    result = kg.get_topic_evolution()
+    assert "Gastroenterology" in result
+    assert "Oncology" in result
+    # Gastroenterology: 2022-01 and 2023-03
+    gi_months = {e["month"] for e in result["Gastroenterology"]}
+    assert gi_months == {"2022-01", "2023-03"}
+    # Oncology: 2023-08, 2024-01, 2024-06
+    onc_months = {e["month"] for e in result["Oncology"]}
+    assert onc_months == {"2023-08", "2024-01", "2024-06"}
+
+
+def test_get_citation_velocity(temporal_store):
+    """Citation velocity for paper A shows monthly citation pattern."""
+    kg = KnowledgeGraph()
+    kg.build_from_store(temporal_store)
+    velocity = kg.get_citation_velocity("10.1/a")
+    # A is cited by B(2023-03), C(2023-08), D(2024-01), E(2024-06)
+    assert len(velocity) == 4
+    months = [v["month"] for v in velocity]
+    assert months == ["2023-03", "2023-08", "2024-01", "2024-06"]
+    assert all(v["citations"] == 1 for v in velocity)
+
+
+def test_get_citation_velocity_nonexistent(temporal_store):
+    """Citation velocity for unknown DOI returns empty list."""
+    kg = KnowledgeGraph()
+    kg.build_from_store(temporal_store)
+    assert kg.get_citation_velocity("10.999/none") == []
+
+
+def test_get_trending(temporal_store):
+    """Trending returns papers with recent citation acceleration."""
+    kg = KnowledgeGraph()
+    kg.build_from_store(temporal_store)
+    # Use a large window to capture all citations
+    trending = kg.get_trending(top_n=5, years=5)
+    # Paper A has 4 citations, B has 1 (but needs >=2)
+    # So only A should appear
+    assert len(trending) >= 1
+    assert trending[0]["doi"] == "10.1/a"
+    assert trending[0]["total_citations"] == 4
+    assert "velocity_ratio" in trending[0]
+    assert "recent_citations" in trending[0]
+
+
+def test_temporal_methods_on_empty_graph():
+    """Temporal methods return empty results on empty graph."""
+    kg = KnowledgeGraph()
+    assert kg.get_timeline() == []
+    assert kg.get_topic_evolution() == {}
+    assert kg.get_citation_velocity("10.1/a") == []
+    assert kg.get_trending() == []

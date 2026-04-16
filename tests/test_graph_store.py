@@ -323,3 +323,255 @@ def test_get_topics_for_doi_filters(tmp_db):
     topics_b = store.get_topics_for_doi("10.1/b")
     assert len(topics_b) == 1
     assert topics_b[0]["topic_id"] == "T2"
+
+
+def test_upsert_paper_with_publication_date(tmp_db):
+    """Papers can store and retrieve publication_date and abstract."""
+    store = GraphStore(tmp_db)
+    store.upsert_paper(
+        doi="10.1234/test",
+        zotero_key="ABC123",
+        title="Test Paper",
+        year=2024,
+        authors="Smith J",
+        openalex_id="W12345",
+        publication_date="2024-03",
+        abstract="This is a test abstract.",
+    )
+    paper = store.get_paper("10.1234/test")
+    assert paper["publication_date"] == "2024-03"
+    assert paper["abstract"] == "This is a test abstract."
+
+
+def test_upsert_paper_abstract_coalesce(tmp_db):
+    """Abstract uses COALESCE — NULL update preserves existing abstract."""
+    store = GraphStore(tmp_db)
+    store.upsert_paper(
+        doi="10.1/a",
+        zotero_key="A",
+        title="A",
+        year=2024,
+        authors="X",
+        openalex_id="W1",
+        abstract="Original abstract",
+    )
+    # Upsert again with abstract=None should preserve original
+    store.upsert_paper(
+        doi="10.1/a",
+        zotero_key="A",
+        title="A",
+        year=2024,
+        authors="X",
+        openalex_id="W1",
+        abstract=None,
+    )
+    paper = store.get_paper("10.1/a")
+    assert paper["abstract"] == "Original abstract"
+
+
+def test_upsert_entity_normalization(tmp_db):
+    """'CDX2' and 'cdx2' with same type map to the same entity_id."""
+    store = GraphStore(tmp_db)
+    id1 = store.upsert_entity("CDX2", "biomarker")
+    id2 = store.upsert_entity("cdx2", "biomarker")
+    id3 = store.upsert_entity("  Cdx2  ", "biomarker")
+    assert id1 == id2 == id3
+
+
+def test_upsert_entity_different_types(tmp_db):
+    """Same name with different types creates separate entities."""
+    store = GraphStore(tmp_db)
+    id1 = store.upsert_entity("p53", "gene")
+    id2 = store.upsert_entity("p53", "biomarker")
+    assert id1 != id2
+
+
+def test_upsert_and_get_entities_for_doi(tmp_db):
+    """Store entities for a paper, retrieve them."""
+    store = GraphStore(tmp_db)
+    store.upsert_paper(
+        doi="10.1/a", zotero_key="A", title="Paper A",
+        year=2024, authors="X", openalex_id="W1",
+    )
+    eid1 = store.upsert_entity("gastric cancer", "condition")
+    eid2 = store.upsert_entity("CDX2", "biomarker")
+    store.upsert_paper_entity("10.1/a", eid1, confidence=0.95)
+    store.upsert_paper_entity("10.1/a", eid2, confidence=0.8)
+
+    entities = store.get_entities_for_doi("10.1/a")
+    assert len(entities) == 2
+    names = {e["name"] for e in entities}
+    assert names == {"gastric cancer", "cdx2"}
+    # Check confidence is returned
+    conf_map = {e["name"]: e["confidence"] for e in entities}
+    assert conf_map["gastric cancer"] == 0.95
+
+
+def test_get_papers_for_entity(tmp_db):
+    """Store entities across papers, query by entity_id."""
+    store = GraphStore(tmp_db)
+    store.upsert_paper(
+        doi="10.1/a", zotero_key="A", title="Paper A",
+        year=2024, authors="X", openalex_id="W1",
+    )
+    store.upsert_paper(
+        doi="10.1/b", zotero_key="B", title="Paper B",
+        year=2023, authors="Y", openalex_id="W2",
+    )
+    eid = store.upsert_entity("h. pylori", "organism")
+    store.upsert_paper_entity("10.1/a", eid)
+    store.upsert_paper_entity("10.1/b", eid)
+
+    papers = store.get_papers_for_entity(eid)
+    assert len(papers) == 2
+    dois = {p["doi"] for p in papers}
+    assert dois == {"10.1/a", "10.1/b"}
+
+
+def test_get_unextracted_dois(tmp_db):
+    """Papers with abstracts but no entities are returned; papers with entities are excluded."""
+    store = GraphStore(tmp_db)
+    # Paper with abstract and no entities
+    store.upsert_paper(
+        doi="10.1/a", zotero_key="A", title="Paper A",
+        year=2024, authors="X", openalex_id="W1",
+        abstract="This paper studies gastric cancer.",
+    )
+    # Paper with abstract and entities (should be excluded)
+    store.upsert_paper(
+        doi="10.1/b", zotero_key="B", title="Paper B",
+        year=2023, authors="Y", openalex_id="W2",
+        abstract="This paper studies CDX2 expression.",
+    )
+    eid = store.upsert_entity("cdx2", "biomarker")
+    store.upsert_paper_entity("10.1/b", eid)
+    # Paper with no abstract (should be excluded)
+    store.upsert_paper(
+        doi="10.1/c", zotero_key="C", title="Paper C",
+        year=2022, authors="Z", openalex_id="W3",
+    )
+
+    unextracted = store.get_unextracted_dois()
+    assert len(unextracted) == 1
+    assert unextracted[0]["doi"] == "10.1/a"
+    assert unextracted[0]["abstract"] == "This paper studies gastric cancer."
+
+
+def test_entity_co_occurrence(tmp_db):
+    """Entities that share papers are returned."""
+    store = GraphStore(tmp_db)
+    store.upsert_paper(
+        doi="10.1/a", zotero_key="A", title="Paper A",
+        year=2024, authors="X", openalex_id="W1",
+    )
+    eid1 = store.upsert_entity("gastric cancer", "condition")
+    eid2 = store.upsert_entity("cdx2", "biomarker")
+    eid3 = store.upsert_entity("metformin", "drug")
+    store.upsert_paper_entity("10.1/a", eid1)
+    store.upsert_paper_entity("10.1/a", eid2)
+    store.upsert_paper_entity("10.1/a", eid3)
+
+    co = store.get_entity_co_occurrence(eid1)
+    assert len(co) == 2
+    co_names = {e["name"] for e in co}
+    assert co_names == {"cdx2", "metformin"}
+    # Each co-occurrence should have shared_papers = 1
+    for entry in co:
+        assert entry["shared_papers"] == 1
+
+
+def test_get_shared_entities(tmp_db):
+    """Entities common to two papers are returned."""
+    store = GraphStore(tmp_db)
+    store.upsert_paper(
+        doi="10.1/a", zotero_key="A", title="Paper A",
+        year=2024, authors="X", openalex_id="W1",
+    )
+    store.upsert_paper(
+        doi="10.1/b", zotero_key="B", title="Paper B",
+        year=2023, authors="Y", openalex_id="W2",
+    )
+    eid_shared = store.upsert_entity("gastric cancer", "condition")
+    eid_only_a = store.upsert_entity("cdx2", "biomarker")
+    eid_only_b = store.upsert_entity("metformin", "drug")
+    store.upsert_paper_entity("10.1/a", eid_shared)
+    store.upsert_paper_entity("10.1/a", eid_only_a)
+    store.upsert_paper_entity("10.1/b", eid_shared)
+    store.upsert_paper_entity("10.1/b", eid_only_b)
+
+    shared = store.get_shared_entities("10.1/a", "10.1/b")
+    assert len(shared) == 1
+    assert shared[0]["name"] == "gastric cancer"
+
+
+def test_get_all_entity_types(tmp_db):
+    """Entity types are grouped and counted correctly."""
+    store = GraphStore(tmp_db)
+    store.upsert_entity("gastric cancer", "condition")
+    store.upsert_entity("crohn's disease", "condition")
+    store.upsert_entity("cdx2", "biomarker")
+
+    types = store.get_all_entity_types()
+    type_map = {t["entity_type"]: t["count"] for t in types}
+    assert type_map["condition"] == 2
+    assert type_map["biomarker"] == 1
+
+
+def test_search_entities_by_name(tmp_db):
+    """Case-insensitive name search works."""
+    store = GraphStore(tmp_db)
+    store.upsert_entity("gastric cancer", "condition")
+    store.upsert_entity("gastric intestinal metaplasia", "condition")
+    store.upsert_entity("cdx2", "biomarker")
+
+    results = store.search_entities_by_name("gastric")
+    assert len(results) == 2
+    names = {r["name"] for r in results}
+    assert "gastric cancer" in names
+    assert "gastric intestinal metaplasia" in names
+
+
+def test_migration_adds_columns(tmp_db):
+    """Migration adds publication_date and abstract columns to existing DBs."""
+    import sqlite3
+
+    # Create a v0.6.0-style database without the new columns
+    conn = sqlite3.connect(tmp_db)
+    conn.executescript("""
+        CREATE TABLE papers (
+            doi TEXT PRIMARY KEY,
+            zotero_key TEXT,
+            title TEXT,
+            year INTEGER,
+            authors TEXT,
+            openalex_id TEXT,
+            updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+        );
+    """)
+    conn.execute(
+        "INSERT INTO papers (doi, zotero_key, title, year, authors, openalex_id) "
+        "VALUES ('10.1/old', 'OLD', 'Old Paper', 2020, 'X', 'W1')"
+    )
+    conn.commit()
+    conn.close()
+
+    # Opening with GraphStore should migrate transparently
+    store = GraphStore(tmp_db)
+    paper = store.get_paper("10.1/old")
+    assert paper is not None
+    assert paper["publication_date"] is None  # not backfilled yet
+
+    # Can now upsert with new columns
+    store.upsert_paper(
+        doi="10.1/new",
+        zotero_key="NEW",
+        title="New Paper",
+        year=2024,
+        authors="Y",
+        openalex_id="W2",
+        publication_date="2024-06",
+        abstract="Test abstract",
+    )
+    new_paper = store.get_paper("10.1/new")
+    assert new_paper["publication_date"] == "2024-06"
+    assert new_paper["abstract"] == "Test abstract"

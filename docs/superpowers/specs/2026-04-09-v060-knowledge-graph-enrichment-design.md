@@ -1,7 +1,7 @@
 # v0.6.0 Design Spec — Knowledge Graph Enrichment
 
 **Date:** 2026-04-09
-**Status:** Draft
+**Status:** Completed
 **Builds on:** v0.5.0 (knowledge graph foundation — GraphStore, KnowledgeGraph, SemanticScholarClient, OpenAlex bulk queries)
 
 ## Goal

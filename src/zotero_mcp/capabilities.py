@@ -72,6 +72,11 @@ TOOL_MODES: dict[str, list[str]] = {
     "find_related_papers": ["cloud_crud"],
     "query_authors": ["any_read"],
     "export_knowledge_graph": ["any_read"],
+    "build_fulltext_index": ["cloud_crud"],
+    "search_fulltext": ["any_read"],
+    "get_unextracted_abstracts": ["any_read"],
+    "store_entities": ["cloud_crud"],
+    "search_entities": ["any_read"],
 }
 
 

@@ -8,7 +8,7 @@ import pytest
 
 
 def test_server_has_all_tools():
-    """Server exposes all 32 tools."""
+    """Server exposes all 37 tools."""
     from zotero_mcp.server import mcp
 
     tools = asyncio.run(mcp.list_tools())
@@ -45,11 +45,16 @@ def test_server_has_all_tools():
         "find_related_papers",
         "query_authors",
         "export_knowledge_graph",
+        "get_unextracted_abstracts",
+        "search_entities",
+        "store_entities",
+        "build_fulltext_index",
+        "search_fulltext",
     }
     actual = {t.name for t in tools}
     missing = expected - actual
     assert not missing, f"Missing tools: {missing}"
-    assert len(tools) == 32
+    assert len(tools) == 37
 
 
 def test_local_failed_ttl_allows_retry_after_interval():

@@ -297,3 +297,42 @@ def test_extract_authorships_handles_missing_fields():
     assert authors[0]["orcid"] == ""
     assert authors[0]["institution"] == ""
     assert authors[0]["position"] == 0
+
+
+def test_reconstruct_abstract():
+    """reconstruct_abstract rebuilds plain text from inverted index."""
+    work = {
+        "abstract_inverted_index": {
+            "Background:": [0],
+            "Helicobacter": [1],
+            "pylori": [2],
+            "infection": [3],
+            "is": [4],
+            "a": [5],
+            "risk": [6],
+            "factor.": [7],
+        }
+    }
+    result = OpenAlexClient.reconstruct_abstract(work)
+    assert result == "Background: Helicobacter pylori infection is a risk factor."
+
+
+def test_reconstruct_abstract_handles_repeated_words():
+    """Words appearing at multiple positions are placed correctly."""
+    work = {
+        "abstract_inverted_index": {
+            "the": [0, 3],
+            "cat": [1],
+            "and": [2],
+            "dog": [4],
+        }
+    }
+    result = OpenAlexClient.reconstruct_abstract(work)
+    assert result == "the cat and the dog"
+
+
+def test_reconstruct_abstract_returns_none_for_missing():
+    """Returns None when abstract_inverted_index is missing or empty."""
+    assert OpenAlexClient.reconstruct_abstract({}) is None
+    assert OpenAlexClient.reconstruct_abstract({"abstract_inverted_index": None}) is None
+    assert OpenAlexClient.reconstruct_abstract({"abstract_inverted_index": {}}) is None

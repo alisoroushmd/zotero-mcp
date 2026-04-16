@@ -297,6 +297,27 @@ class OpenAlexClient:
         return topics
 
     @staticmethod
+    def reconstruct_abstract(work: dict) -> str | None:
+        """Convert OpenAlex abstract_inverted_index to plain text.
+
+        Args:
+            work: Raw OpenAlex work dict.
+
+        Returns:
+            Reconstructed abstract string, or None if not available.
+        """
+        inv_index = work.get("abstract_inverted_index")
+        if not inv_index:
+            return None
+        positions: dict[int, str] = {}
+        for word, pos_list in inv_index.items():
+            for pos in pos_list:
+                positions[pos] = word
+        if not positions:
+            return None
+        return " ".join(positions[i] for i in sorted(positions))
+
+    @staticmethod
     def extract_authorships(work: dict) -> list[dict]:
         """Extract structured author records from an OpenAlex work.
 

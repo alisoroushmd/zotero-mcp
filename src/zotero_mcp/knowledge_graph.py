@@ -3,7 +3,8 @@
 from __future__ import annotations
 
 import logging
-from collections import Counter
+from collections import Counter, defaultdict
+from datetime import datetime
 from typing import TYPE_CHECKING
 
 try:
@@ -75,8 +76,6 @@ class KnowledgeGraph:
             self._author_papers.setdefault(author_id, set()).add(doi)
 
         # Build co-authorship edges (for each paper, connect all co-author pairs)
-        from collections import defaultdict
-
         papers_to_authors: dict[str, list[str]] = defaultdict(list)
         for doi, author_id, _ in store.get_all_paper_authors():
             papers_to_authors[doi].append(author_id)
@@ -318,3 +317,178 @@ class KnowledgeGraph:
             for u, v, d in subgraph.edges(data=True)
         ]
         return {"center": author_id, "authors": authors, "edges": edges}
+
+    # -- Temporal analytics methods --
+
+    def _filter_by_date_range(
+        self,
+        start_year: int | None = None,
+        end_year: int | None = None,
+    ) -> list[str]:
+        """Return DOIs of papers within the given year range."""
+        dois = []
+        for doi, data in self._paper_data.items():
+            pub_date = data.get("publication_date", "") or ""
+            year = data.get("year", 0) or 0
+            if pub_date:
+                try:
+                    y = int(pub_date[:4])
+                except (ValueError, IndexError):
+                    y = year
+            else:
+                y = year
+            if start_year and y < start_year:
+                continue
+            if end_year and y > end_year:
+                continue
+            dois.append(doi)
+        return dois
+
+    def get_timeline(
+        self,
+        topic: str | None = None,
+        start_year: int | None = None,
+        end_year: int | None = None,
+    ) -> list[dict]:
+        """Count papers per month, optionally filtered by subfield.
+
+        Args:
+            topic: Subfield name to filter by (case-insensitive substring match).
+            start_year: Earliest year to include.
+            end_year: Latest year to include.
+
+        Returns:
+            List of {month, count} dicts sorted chronologically.
+        """
+        counts: Counter[str] = Counter()
+        for doi in self._filter_by_date_range(start_year, end_year):
+            if topic:
+                topics = self._topic_data.get(doi, [])
+                match = any(
+                    topic.lower() in (t.get("subfield") or "").lower()
+                    for t in topics
+                )
+                if not match:
+                    continue
+            pub_date = (self._paper_data[doi].get("publication_date") or "")[:7]
+            if pub_date:
+                counts[pub_date] += 1
+        return [
+            {"month": m, "count": c}
+            for m, c in sorted(counts.items())
+        ]
+
+    def get_topic_evolution(
+        self,
+        start_year: int | None = None,
+        end_year: int | None = None,
+        limit: int = 10,
+    ) -> dict[str, list[dict]]:
+        """Per-subfield paper counts by month.
+
+        Args:
+            start_year: Earliest year to include.
+            end_year: Latest year to include.
+            limit: Max number of subfields to return (ranked by total count).
+
+        Returns:
+            Dict mapping subfield name to list of {month, count} dicts.
+        """
+        subfield_month: dict[str, Counter[str]] = defaultdict(Counter)
+        subfield_totals: Counter[str] = Counter()
+
+        for doi in self._filter_by_date_range(start_year, end_year):
+            pub_date = (self._paper_data[doi].get("publication_date") or "")[:7]
+            if not pub_date:
+                continue
+            for t in self._topic_data.get(doi, []):
+                sf = t.get("subfield")
+                if sf:
+                    subfield_month[sf][pub_date] += 1
+                    subfield_totals[sf] += 1
+
+        top_subfields = [sf for sf, _ in subfield_totals.most_common(limit)]
+        return {
+            sf: [{"month": m, "count": c} for m, c in sorted(subfield_month[sf].items())]
+            for sf in top_subfields
+        }
+
+    def get_citation_velocity(self, doi: str) -> list[dict]:
+        """Month-by-month citation count for a specific paper.
+
+        Args:
+            doi: DOI of the paper to analyze.
+
+        Returns:
+            List of {month, citations} dicts sorted chronologically.
+        """
+        if doi not in self._graph:
+            return []
+        citing_dois = list(self._graph.predecessors(doi))
+        counts: Counter[str] = Counter()
+        for citing_doi in citing_dois:
+            pub_date = (self._paper_data.get(citing_doi, {}).get("publication_date") or "")[:7]
+            if pub_date:
+                counts[pub_date] += 1
+        return [
+            {"month": m, "citations": c}
+            for m, c in sorted(counts.items())
+        ]
+
+    def get_trending(self, top_n: int = 10, years: int = 3) -> list[dict]:
+        """Papers ranked by citation growth rate in recent N years.
+
+        Compares citation rate in the recent window to lifetime average.
+        Papers with fewer than 2 total citations are excluded.
+
+        Args:
+            top_n: Number of trending papers to return.
+            years: Size of the recent window in years.
+
+        Returns:
+            List of paper dicts with velocity_ratio, recent_citations,
+            total_citations fields, sorted by velocity_ratio descending.
+        """
+        now_year = datetime.now().year
+        cutoff_month = f"{now_year - years}-01"
+
+        results = []
+        for doi in self._paper_data:
+            citing_dois = list(self._graph.predecessors(doi))
+            if len(citing_dois) < 2:
+                continue
+
+            total = len(citing_dois)
+            recent = 0
+            for citing_doi in citing_dois:
+                pub_date = (
+                    self._paper_data.get(citing_doi, {}).get("publication_date") or ""
+                )[:7]
+                if pub_date >= cutoff_month:
+                    recent += 1
+
+            if recent == 0:
+                continue
+
+            # Velocity ratio: recent per-year rate / lifetime per-year rate
+            paper_date = (self._paper_data[doi].get("publication_date") or "")[:7]
+            if not paper_date:
+                continue
+            try:
+                paper_year = int(paper_date[:4])
+            except (ValueError, IndexError):
+                continue
+            lifetime_years = max(now_year - paper_year, 1)
+            lifetime_rate = total / lifetime_years
+            recent_rate = recent / years
+            velocity_ratio = recent_rate / lifetime_rate if lifetime_rate > 0 else 0
+
+            results.append({
+                **self._paper_data[doi],
+                "velocity_ratio": round(velocity_ratio, 2),
+                "recent_citations": recent,
+                "total_citations": total,
+            })
+
+        results.sort(key=lambda x: x["velocity_ratio"], reverse=True)
+        return results[:top_n]
