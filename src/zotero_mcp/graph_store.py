@@ -6,16 +6,10 @@ survives between MCP sessions and supports incremental updates.
 
 from __future__ import annotations
 
-import os
 import sqlite3
 from pathlib import Path
 
-
-_DEFAULT_DB_PATH = os.path.join(
-    os.environ.get("XDG_DATA_HOME", os.path.expanduser("~/.local/share")),
-    "zotero-mcp",
-    "knowledge_graph.db",
-)
+from zotero_mcp.config import get_config
 
 
 class GraphStore:
@@ -26,9 +20,7 @@ class GraphStore:
     """
 
     def __init__(self, db_path: str | None = None) -> None:
-        self._db_path = db_path or os.environ.get(
-            "ZOTERO_MCP_GRAPH_DB", _DEFAULT_DB_PATH
-        )
+        self._db_path = db_path or get_config().effective_graph_db_path
         Path(self._db_path).parent.mkdir(parents=True, exist_ok=True)
         self._conn = sqlite3.connect(self._db_path)
         self._conn.row_factory = sqlite3.Row
@@ -605,6 +597,47 @@ class GraphStore:
                FROM entities
                GROUP BY entity_type
                ORDER BY count DESC"""
+        ).fetchall()
+        return [dict(r) for r in rows]
+
+    def entity_exists(self, name: str, entity_type: str) -> bool:
+        """Check whether an entity already exists (by normalized name + type).
+
+        Args:
+            name: Entity name (will be lowercased/stripped).
+            entity_type: Entity category.
+
+        Returns:
+            True if the entity is already stored.
+        """
+        normalized = name.strip().lower()
+        row = self._conn.execute(
+            "SELECT 1 FROM entities WHERE name = ? AND entity_type = ?",
+            (normalized, entity_type),
+        ).fetchone()
+        return row is not None
+
+    def get_entities_by_type(
+        self, entity_type: str, limit: int = 20
+    ) -> list[dict]:
+        """Return entities of a specific type, ranked by paper count.
+
+        Args:
+            entity_type: Entity category to filter by.
+            limit: Max results.
+
+        Returns:
+            List of dicts with entity_id, name, entity_type, paper_count.
+        """
+        rows = self._conn.execute(
+            """SELECT entity_id, name, entity_type,
+                      (SELECT COUNT(*) FROM paper_entities pe
+                       WHERE pe.entity_id = e.entity_id) as paper_count
+               FROM entities e
+               WHERE entity_type = ?
+               ORDER BY paper_count DESC
+               LIMIT ?""",
+            (entity_type, limit),
         ).fetchall()
         return [dict(r) for r in rows]
 

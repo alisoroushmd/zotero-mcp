@@ -6,6 +6,30 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/).
 
 ## [Unreleased]
 
+### Added
+
+- Centralized configuration module (`config.py`) — all environment variables read once, exposed as typed attributes with validation properties
+- 4 MCP prompts for guided multi-tool workflows: `literature_audit`, `build_and_explore`, `add_and_verify`, `extract_entities`
+
+### Changed
+
+- Tool count reduced from 37 to 34 via consolidation:
+  - `get_tags` + `remove_tag` + `rename_tag` → `manage_tags(action="list|remove|rename")`
+  - `build_knowledge_graph` + `build_fulltext_index` → `build_index(type="graph|fulltext|both")`
+- All 34 tool descriptions rewritten to be LLM-actionable ("Use this when...") per MCP best practices
+- Environment variable reads centralized: `capabilities.py`, `openalex_client.py`, `web_client.py`, `graph_store.py`, and `server.py` now use `config.py` instead of scattered `os.environ.get()` calls
+- `store_entities` and `search_entities` now use `GraphStore` public methods (`entity_exists`, `get_entities_by_type`) instead of reaching into `store._conn` directly
+
+### Fixed
+
+- `export_knowledge_graph` missing `@_handle_tool_errors` — errors now return structured JSON instead of propagating to MCP transport
+- `build_index` validated `type` parameter after execution; now fails fast before any work
+
+### Removed
+
+- `get_tags`, `remove_tag`, `rename_tag` tools (replaced by `manage_tags`)
+- `build_knowledge_graph`, `build_fulltext_index` tools (replaced by `build_index`)
+
 ## [0.7.0] - 2026-04-15
 
 ### Added
@@ -15,11 +39,10 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/).
   - `topic_evolution` — per-subfield monthly publication counts over time
   - `citation_velocity` — month-by-month citation accumulation for a paper
   - `trending` — papers with accelerating recent citation rates (velocity ratio)
-- **Full-text PDF search** — 2 new tools:
-  - `build_fulltext_index` — bulk-extract text from library PDFs using pypdf and index
-    in SQLite FTS5 with BM25 ranking. Hybrid approach: pypdf for keyword search index,
-    LLM reads PDFs natively for deep understanding of tables/figures
-  - `search_fulltext` — search indexed full text with highlighted snippets
+- **Full-text PDF search** — `search_fulltext` tool for searching indexed full text with
+  highlighted snippets. Build the index with `build_index(type='fulltext')`. Uses pypdf
+  for bulk text extraction and SQLite FTS5 with BM25 ranking. Hybrid approach: pypdf for
+  keyword search index, LLM reads PDFs natively for deep understanding of tables/figures
 - **Entity extraction** — 3 new tools (two-tool LLM-in-the-loop pattern):
   - `get_unextracted_abstracts` — returns papers with abstracts not yet entity-extracted
   - `store_entities` — persist typed entities (biomarker, drug, gene, etc.) extracted
@@ -39,7 +62,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/).
 
 ### Changed
 
-- Tool count increased from 32 to 37
+- Tool count changed from 32 to 34 (5 new tools added, 3 consolidated away)
 - `_index_works()` now captures `publication_date` and `abstract` from OpenAlex responses
 - `query_knowledge_graph` description updated with temporal query types and new parameters
   (`topic`, `start_year`, `end_year`, `years`)

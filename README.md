@@ -25,7 +25,7 @@ Get your API key and user ID at [zotero.org/settings/keys](https://www.zotero.or
 
 ## Operating modes
 
-**All 37 tools work with just API credentials** — Zotero desktop does not need to be running.
+**All 34 tools work with just API credentials** — Zotero desktop does not need to be running.
 
 | Mode | What it provides | Requirements |
 | --- | --- | --- |
@@ -50,7 +50,6 @@ Call `server_status` to check which modes are available.
 | `get_notes`            | List child notes on an item                                               |
 | `get_item_attachments` | List attachments with availability status                                 |
 | `get_pdf_content`      | Find best path to a paper's full text (PMCID, local PDF, or web download). Pass `extract_text=true` for inline text |
-| `get_tags`             | List all tags in the library, optionally filtered by prefix               |
 
 ### Write tools
 
@@ -66,8 +65,7 @@ Call `server_status` to check which modes are available.
 | `attach_pdf`                  | Attach a local or auto-downloaded PDF                                |
 | `trash_items`                 | Move items to trash (reversible)                                     |
 | `empty_trash`                 | Permanently delete all trashed items                                 |
-| `remove_tag`                  | Remove a tag from every item in the library                          |
-| `rename_tag`                  | Rename a tag across every item in the library                        |
+| `manage_tags`                 | List, remove, or rename tags library-wide (`action="list\|remove\|rename"`) |
 
 ### Citation tools
 
@@ -91,7 +89,7 @@ Requires `pip install zotero-mcp[graph]` (adds networkx) and `OPENALEX_API_KEY` 
 
 | Tool                       | Description                                                                       |
 | -------------------------- | --------------------------------------------------------------------------------- |
-| `build_knowledge_graph`    | Build or sync citation network via OpenAlex (auto-detects full vs incremental)    |
+| `build_index`              | Build or update citation graph and/or fulltext index (`type="graph\|fulltext\|both"`) |
 | `query_knowledge_graph`    | PageRank, clusters, bridge papers, shortest paths, neighborhood, timeline, topic evolution, citation velocity, trending |
 | `find_related_papers`      | Semantic Scholar recommendations from library seeds (like Connected Papers)        |
 | `query_authors`            | Prolific/influential authors, co-author lookup, ego network, author clusters      |
@@ -103,8 +101,9 @@ Requires `pip install zotero-mcp[fulltext]` (adds pypdf).
 
 | Tool                       | Description                                                                       |
 | -------------------------- | --------------------------------------------------------------------------------- |
-| `build_fulltext_index`     | Extract text from library PDFs and build FTS5 search index (incremental by default) |
 | `search_fulltext`          | Search indexed full text with BM25 ranking and highlighted snippets               |
+
+Use `build_index(type='fulltext')` to extract text from library PDFs and build the FTS5 search index.
 
 ### Entity extraction tools
 
@@ -115,6 +114,17 @@ Two-tool pattern: the MCP server provides abstracts, the calling LLM extracts en
 | `get_unextracted_abstracts`| Get papers with abstracts not yet entity-extracted                                |
 | `store_entities`           | Persist typed entities (biomarker, drug, gene, etc.) extracted by the LLM         |
 | `search_entities`          | Query entity index: by name, type, DOI, co-occurrence, shared entities, network   |
+
+### MCP Prompts
+
+Pre-built multi-tool workflows that guide the AI through common tasks:
+
+| Prompt                | Description                                                                     |
+| --------------------- | ------------------------------------------------------------------------------- |
+| `literature_audit`    | Check retractions, verify preprint publication status, scan for duplicates       |
+| `build_and_explore`   | Build indexes and explore research landscape (influential papers, clusters, trends) |
+| `add_and_verify`      | Add a paper, check retractions, attach PDF, find related work                   |
+| `extract_entities`    | Extract biomedical entities from unprocessed abstracts and store them            |
 
 ## Writing with live citations
 
@@ -196,7 +206,7 @@ OpenAlex requires a free API key as of Feb 2026:
 pip install zotero-mcp[graph]
 ```
 
-This adds networkx (plus numpy and scipy for PageRank) for `build_knowledge_graph`, `query_knowledge_graph`, `query_authors`, and `export_knowledge_graph`. The `find_related_papers` tool works without it (uses Semantic Scholar API directly).
+This adds networkx (plus numpy and scipy for PageRank) for `build_index(type='graph')`, `query_knowledge_graph`, `query_authors`, and `export_knowledge_graph`. The `find_related_papers` tool works without it (uses Semantic Scholar API directly).
 
 Optionally set `SEMANTIC_SCHOLAR_API_KEY` for improved rate limits.
 
@@ -206,7 +216,7 @@ Optionally set `SEMANTIC_SCHOLAR_API_KEY` for improved rate limits.
 pip install zotero-mcp[fulltext]
 ```
 
-This adds pypdf for extracting text from PDFs. Used by `build_fulltext_index` to create a searchable FTS5 index across your library. Without it, `search_fulltext` and `build_fulltext_index` will return an install prompt.
+This adds pypdf for extracting text from PDFs. Used by `build_index(type='fulltext')` to create a searchable FTS5 index across your library. Without it, `search_fulltext` and `build_index(type='fulltext')` will return an install prompt.
 
 ## Troubleshooting
 

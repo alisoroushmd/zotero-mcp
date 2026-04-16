@@ -3,17 +3,15 @@
 from __future__ import annotations
 
 import logging
-import os
 
 import httpx
+
+from zotero_mcp.config import get_config
 
 logger = logging.getLogger(__name__)
 
 OPENALEX_BASE = "https://api.openalex.org"
-OPENALEX_API_KEY = os.environ.get("OPENALEX_API_KEY", "")
-POLITE_EMAIL = "zotero-mcp@example.com"
 TIMEOUT = 10.0
-POLITE_EMAIL = os.environ.get("ZOTERO_MCP_EMAIL", "zotero-mcp@example.com")
 
 
 class OpenAlexClient:
@@ -25,8 +23,11 @@ class OpenAlexClient:
     """
 
     def __init__(
-        self, api_key: str = OPENALEX_API_KEY, email: str = POLITE_EMAIL
+        self, api_key: str = "", email: str = ""
     ) -> None:
+        cfg = get_config()
+        api_key = api_key or cfg.openalex_api_key
+        email = email or cfg.polite_email
         headers = {"User-Agent": f"zotero-mcp/1.0 (mailto:{email})"}
         if api_key:
             headers["Authorization"] = f"Bearer {api_key}"

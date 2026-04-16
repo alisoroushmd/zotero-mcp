@@ -5,7 +5,6 @@ from __future__ import annotations
 import hashlib
 import ipaddress
 import logging
-import os
 import re
 import time
 from pathlib import Path
@@ -68,7 +67,10 @@ WEB_BASE = "https://api.zotero.org"
 TRANSLATE_URL = "https://translate.zotero.org/search"
 TRANSLATE_WEB_URL = "https://translate.zotero.org/web"
 TIMEOUT = httpx.Timeout(10.0, connect=5.0)
-POLITE_EMAIL = os.environ.get("ZOTERO_MCP_EMAIL", "zotero-mcp@example.com")
+def _get_polite_email() -> str:
+    """Get polite email from config (lazy to avoid import-time env read)."""
+    from zotero_mcp.config import get_config
+    return get_config().polite_email
 SEARCH_TIMEOUT = httpx.Timeout(
     45.0, connect=5.0
 )  # searches can be slow on large libraries
@@ -324,7 +326,7 @@ class WebClient:
             resp = httpx.get(
                 f"https://api.crossref.org/works/{doi}",
                 headers={
-                    "User-Agent": f"zotero-mcp/1.0 (mailto:{POLITE_EMAIL})"
+                    "User-Agent": f"zotero-mcp/1.0 (mailto:{_get_polite_email()})"
                 },
                 timeout=TIMEOUT,
             )
@@ -374,7 +376,7 @@ class WebClient:
             resp = httpx.get(
                 f"https://api.crossref.org/works/{doi}",
                 headers={
-                    "User-Agent": f"zotero-mcp/1.0 (mailto:{POLITE_EMAIL})"
+                    "User-Agent": f"zotero-mcp/1.0 (mailto:{_get_polite_email()})"
                 },
                 timeout=TIMEOUT,
             )
@@ -907,7 +909,7 @@ class WebClient:
             resp = httpx.get(
                 f"https://api.crossref.org/works/{doi}",
                 headers={
-                    "User-Agent": f"zotero-mcp/1.0 (mailto:{POLITE_EMAIL})"
+                    "User-Agent": f"zotero-mcp/1.0 (mailto:{_get_polite_email()})"
                 },
                 timeout=TIMEOUT,
             )
@@ -1895,7 +1897,7 @@ class WebClient:
         try:
             resp = httpx.get(
                 f"https://api.unpaywall.org/v2/{doi}",
-                params={"email": POLITE_EMAIL},
+                params={"email": _get_polite_email()},
                 timeout=TIMEOUT,
             )
             if resp.status_code == 200:

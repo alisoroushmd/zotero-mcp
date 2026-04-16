@@ -11,11 +11,15 @@ from zotero_mcp.graph_store import GraphStore
 
 @pytest.fixture
 def tmp_db(monkeypatch):
-    """Create a temporary database and point ZOTERO_MCP_GRAPH_DB at it."""
+    """Create a temporary database and point ZOTERO_GRAPH_DB at it."""
     fd, path = tempfile.mkstemp(suffix=".db")
     os.close(fd)
     monkeypatch.setenv("ZOTERO_MCP_GRAPH_DB", path)
+    # Reset config singleton so it picks up the new env var
+    from zotero_mcp.config import _reset_config
+    _reset_config()
     yield path
+    _reset_config()
     os.unlink(path)
 
 

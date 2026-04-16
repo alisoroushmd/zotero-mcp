@@ -15,9 +15,15 @@ import time
 import httpx
 from fastmcp import FastMCP
 
+from typing import TYPE_CHECKING
+
 from zotero_mcp.capabilities import check_capabilities, format_status
+from zotero_mcp.config import get_config
 from zotero_mcp.local_client import LocalClient
 from zotero_mcp.web_client import WebClient, _is_preprint_doi
+
+if TYPE_CHECKING:
+    from zotero_mcp.knowledge_graph import KnowledgeGraph
 
 logger = logging.getLogger(__name__)
 
@@ -27,7 +33,9 @@ mcp = FastMCP(
         "Zotero MCP server. All tools work with just API credentials "
         "(ZOTERO_API_KEY + ZOTERO_USER_ID). If Zotero desktop is also "
         "running, reads are faster via the local API. "
-        "Call server_status to check available modes."
+        "Call server_status to check available modes. "
+        "Use the prompts (literature_audit, build_and_explore, add_and_verify, "
+        "extract_entities) for guided multi-step workflows."
     ),
 )
 
@@ -169,18 +177,14 @@ def _get_web() -> WebClient:
     with _init_lock:
         if _web is not None:
             return _web
-        api_key = os.environ.get("ZOTERO_API_KEY", "")
-        user_id = os.environ.get("ZOTERO_USER_ID", "")
-        if not api_key or not user_id:
-            missing = []
-            if not api_key:
-                missing.append("ZOTERO_API_KEY")
-            if not user_id:
-                missing.append("ZOTERO_USER_ID")
+        cfg = get_config()
+        if not cfg.has_web_api:
             raise RuntimeError(
-                f"Cloud CRUD mode requires {', '.join(missing)}. "
+                f"Cloud CRUD mode requires {', '.join(cfg.missing_web_vars)}. "
                 f"Get your API key at https://www.zotero.org/settings/keys"
             )
+        api_key = cfg.zotero_api_key
+        user_id = cfg.zotero_user_id
         # Try to attach local client for faster reads, but don't fail without it
         local = None
         try:
@@ -250,7 +254,11 @@ def _handle_tool_errors(fn):
 
 
 @mcp.tool(
-    description="Check available operating modes and fix instructions",
+    description=(
+        "Check which Zotero MCP operating modes are available and get fix instructions "
+        "for any that are misconfigured. Use this first when tools return 'unavailable' errors "
+        "or when starting a new session to verify connectivity."
+    ),
     annotations={"readOnlyHint": True},
 )
 @_handle_tool_errors
@@ -281,9 +289,10 @@ def _read_local_or_web(local_method: str, *args, **kwargs):
 
 @mcp.tool(
     description=(
-        "Search items in Zotero library by keyword. "
-        "Optionally filter by item_type (e.g. 'journalArticle', 'book') "
-        "or tag (exact tag name)."
+        "Search Zotero library items by keyword. Use this when the user asks to "
+        "find papers, look up references, or search their library. Supports title, "
+        "author, and tag matching. Filter by item_type (e.g. 'journalArticle', "
+        "'book') or tag (exact tag name)."
     ),
     annotations={"readOnlyHint": True},
 )
@@ -306,7 +315,11 @@ def search_items(
 
 
 @mcp.tool(
-    description="Get detailed metadata for a single Zotero item",
+    description=(
+        "Get detailed metadata for a single Zotero item by its key. Use this when "
+        "you need full bibliographic details (title, authors, DOI, abstract, dates) "
+        "for a specific item. Set format='bibtex' for BibTeX export."
+    ),
     annotations={"readOnlyHint": True},
 )
 @_handle_tool_errors
@@ -320,7 +333,11 @@ def get_item(item_key: str, format: str = "json") -> str:
 
 
 @mcp.tool(
-    description="List all collections in the Zotero library",
+    description=(
+        "List all collections (folders) in the Zotero library with their keys, names, "
+        "parent relationships, and item counts. Use this when the user asks about their "
+        "library organization or wants to browse/find a collection."
+    ),
     annotations={"readOnlyHint": True},
 )
 @_handle_tool_errors
@@ -331,7 +348,10 @@ def get_collections() -> str:
 
 
 @mcp.tool(
-    description="Get child notes attached to a Zotero item",
+    description=(
+        "Get all notes attached to a Zotero item. Use this when the user wants to "
+        "read their annotations, reading notes, or comments on a paper."
+    ),
     annotations={"readOnlyHint": True},
 )
 @_handle_tool_errors
@@ -343,7 +363,12 @@ def get_notes(parent_key: str) -> str:
 
 
 @mcp.tool(
-    description="List attachments on a Zotero item with availability status",
+    description=(
+        "List file attachments (PDFs, etc.) on a Zotero item with availability status. "
+        "Use this to check whether a paper has a PDF before trying to read it. "
+        "Returns availability: stored_remote_available, stored_local_available, "
+        "linked_local_available, or metadata_only."
+    ),
     annotations={"readOnlyHint": True},
 )
 @_handle_tool_errors
@@ -376,7 +401,13 @@ def get_item_attachments(parent_key: str) -> str:
 
 
 @mcp.tool(
-    description="Route to best full-text source (PMCID, local PDF, DOI). Set extract_text=true to extract and return the text content directly.",
+    description=(
+        "Get the full text of a paper in the library. Routes to the best available source: "
+        "PubMed Central, local PDF, web PDF download, or free open-access PDF. "
+        "Use this when the user wants to read a paper's content. "
+        "Set extract_text=true to extract and return the text inline; "
+        "otherwise returns a file path or PMCID for the caller to read."
+    ),
     annotations={"readOnlyHint": True},
 )
 @_handle_tool_errors
@@ -561,7 +592,12 @@ def get_pdf_content(item_key: str, extract_text: bool = False) -> str:
 
 
 @mcp.tool(
-    description="Check items for retractions/corrections via CrossRef + OpenAlex",
+    description=(
+        "Check whether papers have been retracted or corrected. Uses CrossRef "
+        "(authoritative) and OpenAlex. Use this when the user asks about paper "
+        "validity, before citing papers, or as part of a literature audit. "
+        "Accepts one or more item keys."
+    ),
     annotations={"readOnlyHint": True},
 )
 @_handle_tool_errors
@@ -651,7 +687,12 @@ def check_retractions(item_keys: str | list[str]) -> str:
 
 
 @mcp.tool(
-    description="Get citing/referenced works for an item via OpenAlex",
+    description=(
+        "Get papers that cite or are cited by a Zotero item, via OpenAlex. "
+        "Use this when the user wants to explore a paper's citation network, "
+        "find related work, or trace the influence of a paper. Each result is "
+        "flagged with in_library (true/false). Direction: 'cited_by', 'references', or 'both'."
+    ),
     annotations={"readOnlyHint": True},
 )
 @_handle_tool_errors
@@ -728,7 +769,10 @@ def get_citation_graph(
 
 
 @mcp.tool(
-    description="List items in a specific Zotero collection",
+    description=(
+        "List all items in a specific Zotero collection by its key. Use this when "
+        "the user wants to see what's in a particular folder/collection."
+    ),
     annotations={"readOnlyHint": True},
 )
 @_handle_tool_errors
@@ -746,9 +790,10 @@ def get_collection_items(collection_key: str, limit: str | int = 100) -> str:
 
 @mcp.tool(
     description=(
-        "Create a Zotero item from any input: DOI, PMID, URL (webpage, "
-        "preprint, PubMed, etc.). Resolves metadata automatically. "
-        "Optional title is only used for bare URLs that can't be scraped."
+        "Add a paper to Zotero from any identifier: DOI, PMID, or URL (PubMed, "
+        "bioRxiv, arXiv, publisher pages). Resolves metadata automatically and "
+        "checks for duplicates. Use this when the user wants to save a paper to "
+        "their library. Optional title is only used for bare URLs that can't be scraped."
     )
 )
 @_handle_tool_errors
@@ -772,7 +817,13 @@ def create_item(
     return json.dumps(result, ensure_ascii=False)
 
 
-@mcp.tool(description="Create item with manually provided metadata")
+@mcp.tool(
+    description=(
+        "Create a Zotero item with manually provided metadata fields. Use this "
+        "instead of create_item when you have structured metadata already (e.g. from "
+        "a conversation) rather than a DOI/URL to resolve. Checks for duplicates."
+    ),
+)
 @_handle_tool_errors
 def create_item_manual(
     item_type: str,
@@ -815,7 +866,12 @@ def create_item_manual(
     return json.dumps(result, ensure_ascii=False)
 
 
-@mcp.tool(description="Create a note attached to a Zotero item (HTML or plain text)")
+@mcp.tool(
+    description=(
+        "Create a note attached to a Zotero item. Use this to save reading notes, "
+        "summaries, or annotations on a paper. Supports HTML or plain text content."
+    ),
+)
 @_handle_tool_errors
 def create_note(
     parent_key: str,
@@ -829,7 +885,13 @@ def create_note(
     return json.dumps(result, ensure_ascii=False)
 
 
-@mcp.tool(description="Add tags and/or collection to multiple items at once")
+@mcp.tool(
+    description=(
+        "Add tags and/or move multiple items to a collection in one operation. "
+        "Use this for bulk organization — e.g. tagging a set of search results or "
+        "grouping papers into a collection. Handles rate limiting and version conflicts."
+    ),
+)
 @_handle_tool_errors
 def batch_organize(
     item_keys: str | list[str],
@@ -844,7 +906,11 @@ def batch_organize(
 
 
 @mcp.tool(
-    description="Scan library for duplicate items (DOI match + title similarity)",
+    description=(
+        "Scan the Zotero library for duplicate items using DOI match and title "
+        "similarity (>85%). Use this when the user wants to clean up their library "
+        "or after bulk imports. Optionally scoped to a single collection."
+    ),
     annotations={"readOnlyHint": True},
 )
 @_handle_tool_errors
@@ -859,7 +925,10 @@ def find_duplicates(collection_key: str | None = None, limit: str | int = 100) -
 
 
 @mcp.tool(
-    description="Create a new collection (folder), optionally nested under a parent"
+    description=(
+        "Create a new collection (folder) in Zotero, optionally nested under a parent. "
+        "Use this when the user wants to organize papers into a new group."
+    )
 )
 @_handle_tool_errors
 def create_collection(name: str, parent_key: str | None = None) -> str:
@@ -868,7 +937,12 @@ def create_collection(name: str, parent_key: str | None = None) -> str:
     return json.dumps(result, ensure_ascii=False)
 
 
-@mcp.tool(description="Add a Zotero item to a collection")
+@mcp.tool(
+    description=(
+        "Add an existing Zotero item to a collection. Use this to organize a paper "
+        "into a folder without moving it from other collections."
+    ),
+)
 @_handle_tool_errors
 def add_to_collection(item_key: str, collection_key: str) -> str:
     """Add an existing item to a collection."""
@@ -915,7 +989,13 @@ _ALLOWED_UPDATE_FIELDS = {
 }
 
 
-@mcp.tool(description="Update metadata fields on an existing Zotero item")
+@mcp.tool(
+    description=(
+        "Update metadata fields on an existing Zotero item. Use this to correct "
+        "titles, authors, dates, DOIs, or other bibliographic fields. "
+        "Uses optimistic locking to prevent overwriting concurrent changes."
+    ),
+)
 @_handle_tool_errors
 def update_item(item_key: str, fields: dict) -> str:
     """Update item fields. Uses optimistic locking with version check."""
@@ -930,7 +1010,13 @@ def update_item(item_key: str, fields: dict) -> str:
     return json.dumps(result, ensure_ascii=False)
 
 
-@mcp.tool(description="Move items to trash (reversible). Accepts one or more keys.")
+@mcp.tool(
+    description=(
+        "Move Zotero items to trash (reversible). Use this when the user wants to "
+        "delete papers. Accepts one or more item keys. Items can be restored from "
+        "trash in Zotero. Confirm with user before trashing."
+    ),
+)
 @_handle_tool_errors
 def trash_items(item_keys: str | list[str]) -> str:
     """Move items to Zotero trash."""
@@ -944,7 +1030,10 @@ def trash_items(item_keys: str | list[str]) -> str:
 
 
 @mcp.tool(
-    description="Permanently delete ALL trashed items (IRREVERSIBLE)",
+    description=(
+        "Permanently delete ALL items in the Zotero trash. THIS IS IRREVERSIBLE. "
+        "Always confirm with the user before calling this tool."
+    ),
     annotations={"destructiveHint": True},
 )
 @_handle_tool_errors
@@ -955,44 +1044,55 @@ def empty_trash() -> str:
 
 
 @mcp.tool(
-    description="List all tags in the library, optionally filtered by prefix",
-    annotations={"readOnlyHint": True},
+    description=(
+        "Manage tags in your Zotero library. Use this when the user asks about tags, "
+        "wants to list/filter tags, remove a tag from all items, or rename a tag. "
+        "Actions: 'list' (browse tags, optional prefix filter), "
+        "'remove' (delete a tag from every item — requires tag), "
+        "'rename' (change a tag name library-wide — requires tag and new_tag)."
+    ),
 )
 @_handle_tool_errors
-def get_tags(prefix: str = "") -> str:
-    """Return all tags in the library."""
-    result = _get_web().get_tags(prefix=prefix or "")
-    return json.dumps(result, ensure_ascii=False)
+def manage_tags(
+    action: str = "list",
+    tag: str = "",
+    new_tag: str = "",
+    prefix: str = "",
+) -> str:
+    """Manage tags: list, remove, or rename.
 
+    Args:
+        action: One of 'list', 'remove', 'rename'.
+        tag: Tag name for remove/rename actions.
+        new_tag: New tag name for rename action.
+        prefix: Filter prefix for list action.
+    """
+    action = action.strip().lower()
+    web = _get_web()
 
-@mcp.tool(
-    description="Remove a tag from every item in the library",
-    annotations={"destructiveHint": True},
-)
-@_handle_tool_errors
-def remove_tag(tag: str) -> str:
-    """Remove a tag from the entire library."""
-    if not tag.strip():
-        raise ValueError("tag must not be empty")
-    result = _get_web().remove_tag(tag.strip())
-    return json.dumps(result, ensure_ascii=False)
-
-
-@mcp.tool(description="Rename a tag across every item in the library")
-@_handle_tool_errors
-def rename_tag(old_tag: str, new_tag: str) -> str:
-    """Rename a tag library-wide."""
-    if not old_tag.strip() or not new_tag.strip():
-        raise ValueError("old_tag and new_tag must not be empty")
-    result = _get_web().rename_tag(old_tag.strip(), new_tag.strip())
+    if action == "list":
+        result = web.get_tags(prefix=prefix or "")
+    elif action == "remove":
+        if not tag.strip():
+            raise ValueError("'remove' action requires tag parameter")
+        result = web.remove_tag(tag.strip())
+    elif action == "rename":
+        if not tag.strip() or not new_tag.strip():
+            raise ValueError("'rename' action requires both tag and new_tag parameters")
+        result = web.rename_tag(tag.strip(), new_tag.strip())
+    else:
+        raise ValueError(
+            f"Unknown action: {action!r}. Must be: list, remove, rename"
+        )
     return json.dumps(result, ensure_ascii=False)
 
 
 @mcp.tool(
     description=(
-        "Check if preprints in the library have been formally published in a peer-reviewed journal. "
-        "Uses CrossRef (authoritative) and OpenAlex. Reports published DOI, journal name, "
-        "and whether the published version is already in the library."
+        "Check if preprints have been formally published in a peer-reviewed journal. "
+        "Use this when the user has bioRxiv/medRxiv/arXiv papers and wants to know if "
+        "a final journal version exists. Reports published DOI, journal name, and "
+        "whether the published version is already in the library. Uses CrossRef and OpenAlex."
     ),
     annotations={"readOnlyHint": True},
 )
@@ -1081,7 +1181,13 @@ def check_published_versions(item_keys: str | list[str]) -> str:
     )
 
 
-@mcp.tool(description="Attach a PDF to an item (auto-downloads or accepts local path)")
+@mcp.tool(
+    description=(
+        "Attach a PDF to a Zotero item. Can auto-download a free PDF via "
+        "Unpaywall/PMC/bioRxiv, or accept a local file path. Use this when "
+        "the user wants to add a PDF to a paper that doesn't have one."
+    ),
+)
 @_handle_tool_errors
 def attach_pdf(
     parent_key: str,
@@ -1140,7 +1246,14 @@ def _fetch_item_metadata(item_keys: list[str]) -> tuple[dict[str, dict], list[st
     return item_data, missing_keys
 
 
-@mcp.tool(description="Insert live Zotero citations into an existing .docx")
+@mcp.tool(
+    description=(
+        "Insert live Zotero citation field codes into an existing Word document. "
+        "Finds [@ITEM_KEY] markers in the .docx and replaces them with Zotero "
+        "field codes. Use this to add citations to a document the user already has. "
+        "Preserves existing formatting, styles, images, and layout."
+    ),
+)
 @_handle_tool_errors
 def insert_citations(document_path: str, output_path: str | None = None) -> str:
     """Insert Zotero citation field codes into an existing Word document.
@@ -1196,7 +1309,7 @@ def insert_citations(document_path: str, output_path: str | None = None) -> str:
     # Fetch metadata for each item (local fast path, web fallback)
     item_data, missing_keys = _fetch_item_metadata(item_keys)
 
-    user_id = os.environ.get("ZOTERO_USER_ID", "0")
+    user_id = get_config().zotero_user_id or "0"
 
     result_path, citation_count = _insert_citations(
         document_path, item_data, user_id, output_path
@@ -1216,7 +1329,12 @@ def insert_citations(document_path: str, output_path: str | None = None) -> str:
 
 
 @mcp.tool(
-    description="Write a .docx with live Zotero citations from markdown + [@KEY] markers"
+    description=(
+        "Create a new Word document from markdown text with live Zotero citations. "
+        "Use [@ITEM_KEY] markers in the content for citations. Use this when writing "
+        "a new document from scratch (e.g. literature review, manuscript draft). "
+        "For adding citations to an existing document, use insert_citations instead."
+    )
 )
 @_handle_tool_errors
 def write_cited_document(content: str, output_path: str) -> str:
@@ -1247,7 +1365,7 @@ def write_cited_document(content: str, output_path: str) -> str:
     # Fetch metadata (local fast path, web fallback)
     item_data, missing_keys = _fetch_item_metadata(item_keys)
 
-    user_id = os.environ.get("ZOTERO_USER_ID", "0")
+    user_id = get_config().zotero_user_id or "0"
     result_path = build_document(content, item_data, user_id, output_path)
 
     result = {
@@ -1408,19 +1526,8 @@ def _index_works(works, key_by_doi, store, openalex):
     }
 
 
-@mcp.tool(
-    description=(
-        "Build or update the knowledge graph from your Zotero library. "
-        "Fetches citation data for items with DOIs via OpenAlex, "
-        "resolves references, stores in a local database, and "
-        "computes graph analytics. Auto-detects whether to do a full "
-        "build (first run) or incremental sync (subsequent runs). "
-        "Set full_rebuild=true to force a complete rebuild."
-    ),
-)
-@_handle_tool_errors
-def build_knowledge_graph(full_rebuild: bool = False) -> str:
-    """Build or incrementally update the knowledge graph."""
+def _build_knowledge_graph(full_rebuild: bool = False) -> dict:
+    """Build or incrementally update the knowledge graph. Returns stats dict."""
     from datetime import datetime, timezone
 
     from zotero_mcp.graph_store import GraphStore
@@ -1435,7 +1542,7 @@ def build_knowledge_graph(full_rebuild: bool = False) -> str:
 
     items = web.get_all_items_with_dois()
     if not items:
-        return json.dumps({"error": "No items with DOIs found in library"})
+        return {"error": "No items with DOIs found in library"}
 
     if is_incremental:
         existing_dois = store.get_doi_set()
@@ -1446,7 +1553,7 @@ def build_knowledge_graph(full_rebuild: bool = False) -> str:
             stats["new_papers"] = 0
             stats["new_citations"] = 0
             stats["mode"] = "sync"
-            return json.dumps(stats, ensure_ascii=False)
+            return stats
 
     doi_list = [item["DOI"] for item in items]
     key_by_doi = {item["DOI"]: item["key"] for item in items}
@@ -1468,12 +1575,144 @@ def build_knowledge_graph(full_rebuild: bool = False) -> str:
     else:
         stats.update(counts)
 
-    return json.dumps(stats, ensure_ascii=False)
+    return stats
+
+
+def _build_fulltext_index(full_rebuild: bool = False, limit: int = 0) -> dict:
+    """Build or update the full-text search index. Returns stats dict."""
+    from concurrent.futures import ThreadPoolExecutor, as_completed
+
+    from zotero_mcp.graph_store import GraphStore
+    from zotero_mcp.text_extractor import extract_text_from_pdf, index_paper_text
+
+    web = _get_web()
+    store = GraphStore()
+
+    items = web.get_all_items_with_dois()
+    if not items:
+        return {"error": "No items with DOIs found in library"}
+
+    already_indexed = store.get_indexed_dois()
+    total = len(items)
+
+    if not full_rebuild:
+        items = [it for it in items if it["DOI"] not in already_indexed]
+    skipped = total - len(items)
+
+    if limit > 0:
+        items = items[:limit]
+
+    indexed = 0
+    failed = 0
+
+    def _process_one(item: dict) -> dict:
+        """Extract and index text for a single item."""
+        item_key = item["key"]
+        item_doi = item["DOI"]
+
+        try:
+            children = _read_local_or_web(
+                "get_children", item_key, item_type="attachment"
+            )
+        except Exception:
+            return {"doi": item_doi, "status": "failed", "reason": "no_attachments"}
+
+        pdf_atts = [
+            c for c in children if c.get("contentType") == "application/pdf"
+        ]
+        if not pdf_atts:
+            return {"doi": item_doi, "status": "failed", "reason": "no_pdf"}
+
+        att = pdf_atts[0]
+        att_key = att.get("key", "")
+        pdf_source = None
+
+        try:
+            local = _get_local()
+            local_path = local.get_attachment_path(att_key)
+            if local_path:
+                pdf_source = local_path
+        except Exception:
+            pass
+
+        if pdf_source is None:
+            try:
+                pdf_source = web.download_attachment(att_key)
+            except Exception:
+                return {"doi": item_doi, "status": "failed", "reason": "download_failed"}
+
+        text = extract_text_from_pdf(pdf_source)
+        if not text:
+            return {"doi": item_doi, "status": "failed", "reason": "no_text_extracted"}
+
+        index_paper_text(store, item_doi, text)
+        return {"doi": item_doi, "status": "indexed"}
+
+    with ThreadPoolExecutor(max_workers=4) as pool:
+        futures = {pool.submit(_process_one, it): it for it in items}
+        for future in as_completed(futures):
+            try:
+                result = future.result()
+                if result["status"] == "indexed":
+                    indexed += 1
+                else:
+                    failed += 1
+            except Exception:
+                failed += 1
+
+    return {
+        "indexed": indexed,
+        "skipped": skipped,
+        "failed": failed,
+        "total": total,
+    }
 
 
 @mcp.tool(
     description=(
-        "Query the knowledge graph for insights about your library. "
+        "Build or update indexes for your Zotero library. Use this after adding "
+        "new papers to enable graph queries and full-text search. "
+        "Types: 'graph' (citation network + analytics via OpenAlex — enables "
+        "query_knowledge_graph, query_authors, export_knowledge_graph), "
+        "'fulltext' (PDF text extraction + FTS5 index — enables search_fulltext), "
+        "'both' (runs graph then fulltext). "
+        "Auto-detects full build vs incremental sync. "
+        "Set full_rebuild=true to force a complete rebuild."
+    ),
+)
+@_handle_tool_errors
+def build_index(
+    type: str = "graph",
+    full_rebuild: bool = False,
+    limit: int = 0,
+) -> str:
+    """Build or update knowledge graph and/or fulltext index.
+
+    Args:
+        type: One of 'graph', 'fulltext', 'both'.
+        full_rebuild: If True, force complete rebuild instead of incremental.
+        limit: For fulltext, cap number of papers to process (0 = all).
+    """
+    type = type.strip().lower()
+    if type not in ("graph", "fulltext", "both"):
+        raise ValueError(
+            f"Unknown type: {type!r}. Must be: graph, fulltext, both"
+        )
+
+    result: dict = {}
+    if type in ("graph", "both"):
+        result["graph"] = _build_knowledge_graph(full_rebuild)
+    if type in ("fulltext", "both"):
+        result["fulltext"] = _build_fulltext_index(full_rebuild, limit)
+
+    return json.dumps(result, ensure_ascii=False)
+
+
+@mcp.tool(
+    description=(
+        "Query the knowledge graph for insights about your library's citation network. "
+        "Use this when the user asks about influential papers, research clusters, "
+        "publication trends, or relationships between papers. "
         "Query types: 'influential' (PageRank-ranked papers), "
         "'clusters' (research topic groupings), "
         "'bridges' (papers connecting different clusters), "
@@ -1484,7 +1723,7 @@ def build_knowledge_graph(full_rebuild: bool = False) -> str:
         "'topic_evolution' (per-subfield paper counts by month — optional start_year, end_year), "
         "'citation_velocity' (month-by-month citation count for a DOI — requires doi), "
         "'trending' (papers with accelerating citation rates — optional limit, years window). "
-        "Requires build_knowledge_graph to be run first."
+        "Requires build_index(type='graph') to be run first."
     ),
     annotations={"readOnlyHint": True},
 )
@@ -1550,11 +1789,11 @@ def query_knowledge_graph(
 
 @mcp.tool(
     description=(
-        "Find papers related to items in your Zotero library using "
-        "Semantic Scholar recommendations. Similar to Connected Papers "
-        "or ResearchRabbit. Provide one or more item keys as seeds — "
-        "the more seeds, the better the recommendations. Each result "
-        "is flagged with in_library (true/false)."
+        "Find papers related to items in your library via Semantic Scholar "
+        "recommendations (similar to Connected Papers or ResearchRabbit). "
+        "Use this when the user wants to discover new papers on a topic. "
+        "Provide one or more item keys as seeds — the more seeds, the better "
+        "the recommendations. Each result is flagged with in_library (true/false)."
     ),
     annotations={"readOnlyHint": True},
 )
@@ -1590,7 +1829,7 @@ def find_related_papers(
             }
         )
 
-    s2 = SemanticScholarClient(api_key=os.environ.get("SEMANTIC_SCHOLAR_API_KEY"))
+    s2 = SemanticScholarClient(api_key=get_config().semantic_scholar_api_key)
     recommendations = s2.get_recommendations(dois, limit=limit_int)
 
     # Flag which recommendations are already in library
@@ -1620,123 +1859,11 @@ def find_related_papers(
 
 @mcp.tool(
     description=(
-        "Build or update the full-text search index from PDF attachments "
-        "in your library. Extracts text from PDFs and indexes for search. "
-        "Incremental by default — set full_rebuild=true to re-extract all."
-    ),
-)
-@_handle_tool_errors
-def build_fulltext_index(full_rebuild: bool = False, limit: int = 0) -> str:
-    """Build or update the full-text search index from PDFs.
-
-    Args:
-        full_rebuild: If True, re-extract all PDFs. Otherwise incremental.
-        limit: If > 0, cap the number of papers to process.
-
-    Returns:
-        JSON with indexed, skipped, failed, total counts.
-    """
-    from concurrent.futures import ThreadPoolExecutor, as_completed
-
-    from zotero_mcp.graph_store import GraphStore
-    from zotero_mcp.text_extractor import extract_text_from_pdf, index_paper_text
-
-    web = _get_web()
-    store = GraphStore()
-
-    items = web.get_all_items_with_dois()
-    if not items:
-        return json.dumps({"error": "No items with DOIs found in library"})
-
-    already_indexed = store.get_indexed_dois()
-    total = len(items)
-
-    if not full_rebuild:
-        items = [it for it in items if it["DOI"] not in already_indexed]
-    skipped = total - len(items)
-
-    if limit > 0:
-        items = items[:limit]
-
-    indexed = 0
-    failed = 0
-
-    def _process_one(item: dict) -> dict:
-        """Extract and index text for a single item."""
-        item_key = item["key"]
-        item_doi = item["DOI"]
-
-        # Get PDF attachments
-        try:
-            children = _read_local_or_web(
-                "get_children", item_key, item_type="attachment"
-            )
-        except Exception:
-            return {"doi": item_doi, "status": "failed", "reason": "no_attachments"}
-
-        pdf_atts = [
-            c for c in children if c.get("contentType") == "application/pdf"
-        ]
-        if not pdf_atts:
-            return {"doi": item_doi, "status": "failed", "reason": "no_pdf"}
-
-        att = pdf_atts[0]
-        att_key = att.get("key", "")
-        pdf_source = None
-
-        # Try local path first
-        try:
-            local = _get_local()
-            local_path = local.get_attachment_path(att_key)
-            if local_path:
-                pdf_source = local_path
-        except Exception:
-            pass
-
-        # Fall back to web download
-        if pdf_source is None:
-            try:
-                pdf_source = web.download_attachment(att_key)
-            except Exception:
-                return {"doi": item_doi, "status": "failed", "reason": "download_failed"}
-
-        # Extract text
-        text = extract_text_from_pdf(pdf_source)
-        if not text:
-            return {"doi": item_doi, "status": "failed", "reason": "no_text_extracted"}
-
-        # Index
-        index_paper_text(store, item_doi, text)
-        return {"doi": item_doi, "status": "indexed"}
-
-    with ThreadPoolExecutor(max_workers=4) as pool:
-        futures = {pool.submit(_process_one, it): it for it in items}
-        for future in as_completed(futures):
-            try:
-                result = future.result()
-                if result["status"] == "indexed":
-                    indexed += 1
-                else:
-                    failed += 1
-            except Exception:
-                failed += 1
-
-    return json.dumps(
-        {
-            "indexed": indexed,
-            "skipped": skipped,
-            "failed": failed,
-            "total": total,
-        },
-        ensure_ascii=False,
-    )
-
-
-@mcp.tool(
-    description=(
-        "Search the full text of indexed PDFs in your library. "
+        "Search the full text of indexed PDFs in your library. Use this when "
+        "the user wants to find papers that mention a specific term, method, "
+        "drug, or concept in their body text (not just titles/abstracts). "
         "Returns matching papers with highlighted text snippets. "
-        "Requires build_fulltext_index to be run first."
+        "Requires build_index(type='fulltext') to be run first."
     ),
     annotations={"readOnlyHint": True},
 )
@@ -1767,13 +1894,15 @@ def search_fulltext(query: str, limit: str | int = 20) -> str:
 
 @mcp.tool(
     description=(
-        "Query the author co-citation network in your knowledge graph. "
+        "Query the author co-authorship network in your knowledge graph. "
+        "Use this when the user asks about who publishes most, who collaborates "
+        "with whom, or wants to map out an author's network. "
         "Query types: 'prolific' (authors by paper count), "
         "'influential' (authors by summed PageRank of their papers), "
         "'coauthors_of' (co-authors of a named author, ranked by shared papers), "
         "'network' (ego network for an author within N hops — requires author_name, optional depth), "
         "'clusters' (author community groupings). "
-        "Requires build_knowledge_graph to be run first."
+        "Requires build_index(type='graph') to be run first."
     ),
     annotations={"readOnlyHint": True},
 )
@@ -1814,14 +1943,16 @@ def query_authors(
 
 @mcp.tool(
     description=(
-        "Export the knowledge graph as an interactive HTML visualization. "
-        "Opens in any browser with drag, zoom, click-to-inspect. "
+        "Export the knowledge graph as an interactive HTML visualization that opens "
+        "in any browser. Use this when the user wants to see their citation network "
+        "visually, explore research clusters, or share a graph. "
         "Views: 'citations' (paper nodes + citation edges, colored by cluster), "
         "'authors' (author nodes + co-authorship edges), "
         "'full' (both layers, papers capped at 200 by PageRank). "
-        "Requires build_knowledge_graph to have been run first."
+        "Requires build_index(type='graph') to have been run first."
     )
 )
+@_handle_tool_errors
 def export_knowledge_graph(
     view: str = "citations",
     path: str = "",
@@ -1866,9 +1997,10 @@ def export_knowledge_graph(
 
 @mcp.tool(
     description=(
-        "Get papers that have abstracts but no extracted entities yet. "
-        "Returns abstracts for the calling LLM to extract biomedical "
-        "entities from. Call store_entities with the results."
+        "Get papers that have abstracts but no extracted biomedical entities yet. "
+        "Use this to find papers needing entity extraction, then extract entities "
+        "(conditions, drugs, genes, biomarkers, methods, outcomes) from the returned "
+        "abstracts and save them with store_entities."
     ),
     annotations={"readOnlyHint": True},
 )
@@ -1897,10 +2029,10 @@ def get_unextracted_abstracts(limit: str | int = 50) -> str:
 
 @mcp.tool(
     description=(
-        "Store extracted entities for papers. Call this whenever you "
-        "encounter paper abstracts and can identify biomedical entities. "
-        "Entity types: condition, biomarker, drug, method, gene, organism, "
-        "outcome, dataset. Input: list of {doi, entities: [{name, type}]}"
+        "Store extracted biomedical entities for papers. Call this after extracting "
+        "entities from abstracts (via get_unextracted_abstracts or any paper reading). "
+        "Entity types: condition, biomarker, drug, method, gene, organism, outcome, dataset. "
+        "Input: list of {doi, entities: [{name, type}]}."
     ),
 )
 @_handle_tool_errors
@@ -1941,16 +2073,10 @@ def store_entities(results: str | list) -> str:
             if not ent_name or not ent_type:
                 continue
 
-            # Check if entity already exists before upserting
-            normalized = ent_name.strip().lower()
-            existing = store._conn.execute(
-                "SELECT entity_id FROM entities WHERE name = ? AND entity_type = ?",
-                (normalized, ent_type),
-            ).fetchone()
-
+            already_exists = store.entity_exists(ent_name, ent_type)
             entity_id = store.upsert_entity(ent_name, ent_type)
 
-            if existing:
+            if already_exists:
                 entities_reused += 1
             else:
                 entities_created += 1
@@ -1974,12 +2100,14 @@ def store_entities(results: str | list) -> str:
 
 @mcp.tool(
     description=(
-        "Search the entity graph. Query types: "
-        "'by_name' (papers with entity), "
-        "'by_type' (common entities of a type), "
-        "'co_occurrence' (entities that co-occur with given entity), "
-        "'shared_entities' (entities shared by two papers), "
-        "'paper_entities' (all entities for a paper)."
+        "Search the biomedical entity graph. Use this when the user asks about "
+        "which papers mention a condition/drug/gene, what entities co-occur, "
+        "or what two papers have in common. "
+        "Query types: 'by_name' (papers mentioning an entity), "
+        "'by_type' (common entities of a type, or list all types if no type given), "
+        "'co_occurrence' (entities that co-occur with a given entity), "
+        "'shared_entities' (entities shared by two papers — requires doi_a and doi_b), "
+        "'paper_entities' (all entities extracted from a paper — requires doi)."
     ),
     annotations={"readOnlyHint": True},
 )
@@ -2032,19 +2160,10 @@ def search_entities(
 
     elif query_type == "by_type":
         if entity_type:
-            rows = store._conn.execute(
-                """SELECT entity_id, name, entity_type,
-                          (SELECT COUNT(*) FROM paper_entities pe
-                           WHERE pe.entity_id = e.entity_id) as paper_count
-                   FROM entities e
-                   WHERE entity_type = ?
-                   ORDER BY paper_count DESC
-                   LIMIT ?""",
-                (entity_type, limit_int),
-            ).fetchall()
+            results = store.get_entities_by_type(entity_type, limit=limit_int)
             return json.dumps(
                 {"query": "by_type", "entity_type": entity_type,
-                 "results": [dict(r) for r in rows]},
+                 "results": results},
                 ensure_ascii=False,
             )
         else:
@@ -2095,3 +2214,102 @@ def search_entities(
             f"Unknown query_type: {query_type!r}. "
             "Must be: by_name, by_type, co_occurrence, shared_entities, paper_entities"
         )
+
+
+# -- MCP Prompts (multi-tool workflows) --
+
+
+@mcp.prompt(
+    name="literature_audit",
+    description=(
+        "Run a full literature audit on selected papers: check for retractions, "
+        "verify preprint publication status, and scan for duplicates."
+    ),
+)
+def literature_audit(item_keys: str = "") -> str:
+    """Guide for running a comprehensive literature audit."""
+    return (
+        "Run a literature quality audit on the user's Zotero library:\n\n"
+        "1. First, call check_retractions with the item keys to identify any "
+        "retracted or corrected papers.\n"
+        "2. Then call check_published_versions to find preprints that now have "
+        "published journal versions.\n"
+        "3. Finally, call find_duplicates to identify duplicate entries.\n"
+        "4. Summarize the findings: retracted papers (urgent), preprints with "
+        "published versions (suggest updating), and duplicates (suggest merging).\n\n"
+        f"Item keys to audit: {item_keys or '(search the library first with search_items)'}"
+    )
+
+
+@mcp.prompt(
+    name="build_and_explore",
+    description=(
+        "Build the knowledge graph and fulltext index, then explore the library's "
+        "research landscape with influential papers, clusters, and trends."
+    ),
+)
+def build_and_explore() -> str:
+    """Guide for building indexes and exploring the library."""
+    return (
+        "Build the library's knowledge base and explore its research landscape:\n\n"
+        "1. Call build_index(type='both') to build the citation graph and "
+        "fulltext search index.\n"
+        "2. Call query_knowledge_graph(query_type='stats') for an overview.\n"
+        "3. Call query_knowledge_graph(query_type='influential') to find the "
+        "most influential papers by PageRank.\n"
+        "4. Call query_knowledge_graph(query_type='clusters') to discover "
+        "research topic groupings.\n"
+        "5. Call query_knowledge_graph(query_type='trending') to find papers "
+        "with accelerating citation rates.\n"
+        "6. Present a structured summary of the library's research landscape."
+    )
+
+
+@mcp.prompt(
+    name="add_and_verify",
+    description=(
+        "Add a paper to the library by DOI/PMID/URL, then verify it: "
+        "check for retractions, find related work, and attach a PDF."
+    ),
+)
+def add_and_verify(identifier: str = "") -> str:
+    """Guide for adding a paper and running verification checks."""
+    return (
+        "Add a paper to the library and run verification checks:\n\n"
+        f"1. Call create_item(input='{identifier or '<DOI, PMID, or URL>'}') "
+        "to add the paper.\n"
+        "2. Call check_retractions with the new item key to verify it hasn't "
+        "been retracted.\n"
+        "3. Call attach_pdf with the item key to try auto-downloading the PDF.\n"
+        "4. Call find_related_papers with the item key to discover related work.\n"
+        "5. Report the results: paper added, retraction status, PDF status, "
+        "and top related papers the user might want to add."
+    )
+
+
+@mcp.prompt(
+    name="extract_entities",
+    description=(
+        "Extract biomedical entities from papers that haven't been processed yet, "
+        "then store them for search and co-occurrence analysis."
+    ),
+)
+def extract_entities_prompt() -> str:
+    """Guide for the entity extraction workflow."""
+    return (
+        "Extract biomedical entities from unprocessed papers:\n\n"
+        "1. Call get_unextracted_abstracts(limit=20) to get papers needing "
+        "entity extraction.\n"
+        "2. For each paper's abstract, identify biomedical entities:\n"
+        "   - conditions (diseases, symptoms)\n"
+        "   - drugs (medications, compounds)\n"
+        "   - genes (gene names, variants)\n"
+        "   - biomarkers (lab values, molecular markers)\n"
+        "   - methods (study designs, techniques)\n"
+        "   - outcomes (endpoints, measures)\n"
+        "   - organisms (species, model organisms)\n"
+        "   - datasets (databases, registries)\n"
+        "3. Call store_entities with the extracted entities.\n"
+        "4. Report how many papers were processed and entities found.\n"
+        "5. If there are remaining unprocessed papers, offer to continue."
+    )

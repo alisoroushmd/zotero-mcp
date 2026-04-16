@@ -3,10 +3,11 @@
 from __future__ import annotations
 
 import logging
-import os
 from dataclasses import dataclass
 
 import httpx
+
+from zotero_mcp.config import load_config
 
 logger = logging.getLogger(__name__)
 
@@ -63,16 +64,13 @@ TOOL_MODES: dict[str, list[str]] = {
     "insert_citations": ["cloud_crud"],
     "check_retractions": ["cloud_crud"],
     "get_citation_graph": ["cloud_crud"],
-    "get_tags": ["any_read"],
-    "remove_tag": ["cloud_crud"],
-    "rename_tag": ["cloud_crud"],
+    "manage_tags": ["cloud_crud"],
     "check_published_versions": ["cloud_crud"],
-    "build_knowledge_graph": ["cloud_crud"],
+    "build_index": ["cloud_crud"],
     "query_knowledge_graph": ["any_read"],
     "find_related_papers": ["cloud_crud"],
     "query_authors": ["any_read"],
     "export_knowledge_graph": ["any_read"],
-    "build_fulltext_index": ["cloud_crud"],
     "search_fulltext": ["any_read"],
     "get_unextracted_abstracts": ["any_read"],
     "store_entities": ["cloud_crud"],
@@ -107,25 +105,16 @@ def check_capabilities() -> ServerCapabilities:
     except Exception as e:
         local_error = f"Zotero local API error: {e}"
 
-    web_ok = False
+    cfg = load_config()  # fresh read — capabilities probes current env state
+    web_ok = cfg.has_web_api
     web_error = ""
-    api_key = os.environ.get("ZOTERO_API_KEY", "")
-    user_id = os.environ.get("ZOTERO_USER_ID", "")
-    if api_key and user_id:
-        web_ok = True
-    else:
-        missing = []
-        if not api_key:
-            missing.append("ZOTERO_API_KEY")
-        if not user_id:
-            missing.append("ZOTERO_USER_ID")
+    if not web_ok:
         web_error = (
-            f"Missing environment variable(s): {', '.join(missing)}. "
+            f"Missing environment variable(s): {', '.join(cfg.missing_web_vars)}. "
             f"Get your API key at https://www.zotero.org/settings/keys"
         )
 
-    openalex_key = os.environ.get("OPENALEX_API_KEY", "")
-    if not openalex_key:
+    if not cfg.has_openalex:
         logger.warning(
             "OPENALEX_API_KEY not set — knowledge graph, citation graph, "
             "and retraction checks may fail"
