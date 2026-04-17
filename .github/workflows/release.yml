@@ -1,0 +1,84 @@
+name: Release
+
+# Fires on `v*` tag push (e.g. `v0.8.0`). Builds the MCPB bundle and
+# attaches it to the GitHub Release so users can drag-drop it into
+# Claude Desktop / Claude Cowork for one-click install.
+#
+# `verify-version` fails fast if the tag disagrees with
+# `pyproject.toml` — that drift is the single most common cause of a
+# broken release.
+on:
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.verify.outputs.version }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: astral-sh/setup-uv@v3
+        with:
+          enable-cache: true
+
+      - name: Sync project
+        run: uv sync --python 3.12
+
+      - name: Verify tag matches pyproject version
+        id: verify
+        shell: bash
+        run: |
+          TAG="${GITHUB_REF##refs/tags/}"
+          VERSION="${TAG#v}"
+          PYPROJ_VERSION=$(uv run python -c "import tomllib; print(tomllib.load(open('pyproject.toml','rb'))['project']['version'])")
+          echo "Tag: $TAG"
+          echo "Pyproject version: $PYPROJ_VERSION"
+          if [ "$VERSION" != "$PYPROJ_VERSION" ]; then
+            echo "::error::Tag version $VERSION != pyproject version $PYPROJ_VERSION"
+            exit 1
+          fi
+          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
+
+      - name: Validate manifest
+        run: uv run python mcpb/build.py validate
+
+      - name: Build MCPB
+        run: uv run python mcpb/build.py
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: mcpb
+          path: dist/mcpb/*.mcpb
+          if-no-files-found: error
+
+  release:
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: mcpb
+          path: mcpb-artifact/
+
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ github.ref_name }}
+          name: zotero-mcp ${{ needs.build.outputs.version }}
+          body: |
+            ## Install
+
+            **Claude Desktop / Claude Cowork (one-click):** download
+            `zotero-mcp.mcpb` below and drag it into the app. You will
+            be prompted for your Zotero API key, user ID, and the
+            optional OpenAlex / Semantic Scholar keys.
+
+            **Other MCP clients:** see the README for `uvx` install
+            instructions.
+          files: mcpb-artifact/*.mcpb
+          generate_release_notes: true
