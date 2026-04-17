@@ -29,9 +29,7 @@ def test_extract_text_from_pdf_bytes():
     mock_reader = MagicMock()
     mock_reader.pages = [mock_page1, mock_page2]
 
-    with patch(
-        "zotero_mcp.text_extractor.PdfReader", return_value=mock_reader, create=True
-    ):
+    with patch("zotero_mcp.text_extractor.PdfReader", return_value=mock_reader, create=True):
         # Patch the import inside the function
         import zotero_mcp.text_extractor as te
 

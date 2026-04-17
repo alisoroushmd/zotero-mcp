@@ -80,11 +80,15 @@ def test_openalex_get_references_logs_on_fetch_failure(caplog):
         "id": "https://openalex.org/W123",
         "referenced_works": ["https://openalex.org/W456"],
     }
-    with patch.object(client, "get_work", return_value=fake_work), patch.object(
-        client._client,
-        "get",
-        side_effect=httpx.ConnectError("down"),
-    ), caplog.at_level(logging.WARNING, logger="zotero_mcp.openalex_client"):
+    with (
+        patch.object(client, "get_work", return_value=fake_work),
+        patch.object(
+            client._client,
+            "get",
+            side_effect=httpx.ConnectError("down"),
+        ),
+        caplog.at_level(logging.WARNING, logger="zotero_mcp.openalex_client"),
+    ):
         result = client.get_references("10.1234/test")
     assert result == []
     assert any(

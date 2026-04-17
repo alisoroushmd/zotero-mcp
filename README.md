@@ -25,7 +25,7 @@ Get your API key and user ID at [zotero.org/settings/keys](https://www.zotero.or
 
 ## Operating modes
 
-**All 34 tools work with just API credentials** — Zotero desktop does not need to be running.
+**All 36 tools work with just API credentials** — Zotero desktop does not need to be running.
 
 | Mode | What it provides | Requirements |
 | --- | --- | --- |

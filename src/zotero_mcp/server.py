@@ -166,6 +166,14 @@ def _get_web() -> WebClient:
     if _web is not None:
         return _web
 
+    # Resolve local client BEFORE acquiring _init_lock to avoid deadlock
+    # (_get_local also acquires _init_lock, which is non-reentrant).
+    local = None
+    try:
+        local = _get_local()
+    except RuntimeError:
+        pass  # Zotero desktop not running — web client will use web reads
+
     with _init_lock:
         if _web is not None:
             return _web
@@ -177,12 +185,6 @@ def _get_web() -> WebClient:
             )
         api_key = cfg.zotero_api_key
         user_id = cfg.zotero_user_id
-        # Try to attach local client for faster reads, but don't fail without it
-        local = None
-        try:
-            local = _get_local()
-        except RuntimeError:
-            pass  # Zotero desktop not running — web client will use web reads
         _web = WebClient(api_key=api_key, user_id=user_id, local_client=local)
         return _web
 
@@ -913,6 +915,48 @@ def create_collection(name: str, parent_key: str | None = None) -> str:
     """Create a collection. Returns the new collection key."""
     result = _get_web().create_collection(name, parent_key)
     return json.dumps(result, ensure_ascii=False)
+
+
+@mcp.tool(
+    description=(
+        "Diagnose Python SSL/TLS certificate configuration. Use when any tool "
+        "reports CERTIFICATE_VERIFY_FAILED, SSL errors, or HTTPS failures "
+        "(OpenAlex, CrossRef, PubMed, etc). Returns Python/OpenSSL versions, "
+        "resolved cert bundle paths, CA count, env-var overrides (flagging any "
+        "pointing at missing paths), certifi version, live probes against "
+        "canonical endpoints, a verdict (HEALTHY/DEGRADED/BROKEN), and "
+        "concrete remediation steps. Safe, read-only. Set probe=False for "
+        "offline config-only diagnostics."
+    ),
+)
+@_handle_tool_errors
+def check_ssl_health(probe: bool = True) -> str:
+    """Run a full SSL/TLS configuration audit and return a JSON report."""
+    from zotero_mcp.ssl_health import check_ssl_health as _check, report_to_dict
+
+    return json.dumps(report_to_dict(_check(probe=probe)), ensure_ascii=False)
+
+
+@mcp.tool(
+    description=(
+        "Audit the local Zotero SQLite database for collection/item keys that "
+        "contain forbidden characters (0, 1, I, O). Such keys are rejected by "
+        "the Zotero sync server with 'not a valid collection/item key' and halt "
+        "sync with 'Made no progress during upload -- stopping'. Use this as a "
+        "diagnostic when the user reports sync errors, or proactively after any "
+        "bulk library operation. Reads ~/Zotero/zotero.sqlite read-only "
+        "(override with the ZOTERO_DATA_DIR env var). Returns a summary with "
+        "the offending keys, their names, and sync state so they can be "
+        "rekeyed manually before the next sync."
+    ),
+)
+@_handle_tool_errors
+def audit_local_keys(include_items: bool = True) -> str:
+    """Scan local SQLite for invalid collection/item keys."""
+    from zotero_mcp.local_audit import audit_local_keys as _audit, audit_summary
+
+    findings = _audit(include_items=include_items)
+    return json.dumps(audit_summary(findings), ensure_ascii=False)
 
 
 @mcp.tool(

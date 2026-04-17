@@ -6,10 +6,17 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/).
 
 ## [Unreleased]
 
+## [0.8.0] - 2026-04-16
+
 ### Added
 
 - Centralized configuration module (`config.py`) — all environment variables read once, exposed as typed attributes with validation properties
 - 4 MCP prompts for guided multi-tool workflows: `literature_audit`, `build_and_explore`, `add_and_verify`, `extract_entities`
+- `check_ssl_health` tool — diagnoses Python SSL/TLS configuration (cert bundle paths, CA count, env-var overrides, live HTTPS probes) and returns a HEALTHY/DEGRADED/BROKEN verdict with concrete remediation steps. Use when any tool reports `CERTIFICATE_VERIFY_FAILED`.
+- `audit_local_keys` tool — scans the local Zotero SQLite for collection/item keys containing forbidden characters (`0`, `1`, `O`) that the Zotero sync server rejects with "not a valid collection key", halting sync.
+- `ZOTERO_DATA_DIR` env var — overrides the Zotero desktop data directory (defaults to `~/Zotero`); used by the local-key audit.
+- `truststore` dependency — server now uses the OS trust store (macOS Keychain, Windows CertStore, Linux CA bundle) instead of Python's bundled CA file, working around broken/stale interpreter cert bundles (e.g. Homebrew Python 3.14 shipping a `cert.pem` whose root CA fails Basic Constraints verification). Falls back gracefully if `truststore` is not installed.
+- `get_pdf_content` arXiv fallback — for arXiv DOIs (`10.48550/arxiv.*`), fetches the PDF directly from arXiv when no published version exists. CrossRef's `is-preprint-of` relation is checked first so users still get the canonical published PDF when one is available.
 
 ### Changed
 
@@ -19,11 +26,15 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/).
 - All 34 tool descriptions rewritten to be LLM-actionable ("Use this when...") per MCP best practices
 - Environment variable reads centralized: `capabilities.py`, `openalex_client.py`, `web_client.py`, `graph_store.py`, and `server.py` now use `config.py` instead of scattered `os.environ.get()` calls
 - `store_entities` and `search_entities` now use `GraphStore` public methods (`entity_exists`, `get_entities_by_type`) instead of reaching into `store._conn` directly
+- `get_pdf_content` PDF downloads (Unpaywall, PMC, arXiv, bioRxiv/medRxiv) now retry up to 3 times with exponential backoff on transient network errors and 5xx responses instead of failing on the first glitch.
 
 ### Fixed
 
 - `export_knowledge_graph` missing `@_handle_tool_errors` — errors now return structured JSON instead of propagating to MCP transport
 - `build_index` validated `type` parameter after execution; now fails fast before any work
+- Deadlock on first web-client initialization when Zotero desktop was running — `_get_web()` now resolves the optional local client before acquiring the non-reentrant `_init_lock`.
+- `find_duplicates` was silently including notes in its DOI scan — the Zotero Web API only honors single-value `itemType` negation, so notes are now filtered client-side after a `-attachment` request.
+- `get_pdf_content` Unpaywall fallback silently returned `not_found` for every item when `ZOTERO_MCP_EMAIL` was unset or a placeholder (`@example.com`, etc.) — Unpaywall rejects these with HTTP 422. The call is now skipped with a clear warning telling the user to set a real email, and placeholder-domain emails are treated as unset.
 
 ### Removed
 

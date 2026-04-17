@@ -76,6 +76,26 @@ def _get_polite_email() -> str:
     return get_config().polite_email
 
 
+def _is_usable_polite_email(email: str) -> bool:
+    """Return True if the polite email is usable with external APIs.
+
+    Unpaywall (and several other polite-pool services) reject placeholder
+    domains like example.com with HTTP 422. We treat these as effectively
+    unset so callers can skip the API instead of silently failing.
+    """
+    if not email:
+        return False
+    low = email.lower().strip()
+    placeholder_domains = (
+        "@example.com",
+        "@example.org",
+        "@example.net",
+        "@test.com",
+        "@localhost",
+    )
+    return not any(low.endswith(d) for d in placeholder_domains)
+
+
 SEARCH_TIMEOUT = httpx.Timeout(45.0, connect=5.0)  # searches can be slow on large libraries
 
 
@@ -86,6 +106,39 @@ _PREPRINT_DOI_PREFIXES = ("10.1101/", "10.64898/")
 def _is_preprint_doi(doi: str) -> bool:
     """Check if a DOI belongs to bioRxiv or medRxiv."""
     return doi.startswith(_PREPRINT_DOI_PREFIXES)
+
+
+_ARXIV_DOI_RE = re.compile(r"^10\.48550/arxiv\.([\w.\-/]+)$", re.IGNORECASE)
+
+
+def _extract_arxiv_id(doi: str) -> str:
+    """Return the arXiv identifier if doi is an arXiv DOI, else ''."""
+    m = _ARXIV_DOI_RE.match(doi.strip())
+    return m.group(1) if m else ""
+
+
+def _fetch_pdf_with_retry(
+    url: str,
+    *,
+    attempts: int = 3,
+    backoff: float = 1.5,
+    timeout: float = 30.0,
+) -> httpx.Response | None:
+    """GET a PDF URL, retrying on transient network errors and 5xx."""
+    last_exc: Exception | None = None
+    for i in range(attempts):
+        try:
+            resp = httpx.get(url, timeout=timeout, follow_redirects=True)
+            if 500 <= resp.status_code < 600:
+                last_exc = RuntimeError(f"HTTP {resp.status_code}")
+            else:
+                return resp
+        except httpx.TransportError as exc:
+            last_exc = exc
+        if i < attempts - 1:
+            time.sleep(backoff * (2 ** i))
+    logger.warning("PDF fetch gave up after %d attempts for %s: %s", attempts, url, last_exc)
+    return None
 
 
 def _is_valid_pdf(content: bytes) -> bool:
@@ -1536,10 +1589,13 @@ class WebClient:
         total = None
 
         while True:
+            # Web API only supports single-value itemType negation.
+            # Use -attachment to exclude attachments; notes are filtered
+            # client-side (they rarely have DOIs anyway).
             params = {
                 "limit": page_size,
                 "start": start,
-                "itemType": "-attachment || -note",
+                "itemType": "-attachment",
                 "format": "json",
             }
             resp = self._web_client.get(
@@ -1553,6 +1609,8 @@ class WebClient:
                 total = int(resp.headers.get("Total-Results", "0"))
 
             for item in resp.json():
+                if item.get("data", {}).get("itemType") == "note":
+                    continue
                 summary = _format_summary(item)
                 if summary.get("DOI"):
                     results.append(summary)
@@ -1863,24 +1921,42 @@ class WebClient:
 
         safe_doi = doi.replace("/", "_").replace(".", "_")
 
-        # 1. Try Unpaywall (finds free legal PDFs for any DOI)
-        try:
-            resp = httpx.get(
-                f"https://api.unpaywall.org/v2/{doi}",
-                params={"email": _get_polite_email()},
-                timeout=TIMEOUT,
+        # 1. Try Unpaywall (finds free legal PDFs for any DOI).
+        # Unpaywall rejects placeholder emails (@example.com) with HTTP 422.
+        # Skip the call entirely in that case so the user sees PMC/bioRxiv
+        # results instead of silently getting `not_found` on every item.
+        polite_email = _get_polite_email()
+        if not _is_usable_polite_email(polite_email):
+            logger.warning(
+                "Skipping Unpaywall: ZOTERO_MCP_EMAIL is unset or placeholder "
+                "(%r). Set it to your real email to enable free-PDF discovery.",
+                polite_email,
             )
-            if resp.status_code == 200:
-                data = resp.json()
-                best_oa = data.get("best_oa_location", {})
-                pdf_url = best_oa.get("url_for_pdf") if best_oa else None
-                if pdf_url:
-                    _validate_url(pdf_url)
-                    pdf_resp = httpx.get(pdf_url, timeout=30.0, follow_redirects=True)
-                    if pdf_resp.status_code == 200 and _is_valid_pdf(pdf_resp.content):
-                        return pdf_resp.content, f"{safe_doi}.pdf", "unpaywall"
-        except Exception as exc:
-            logger.warning("Unpaywall PDF download failed for %s: %s", doi, exc)
+        else:
+            try:
+                resp = httpx.get(
+                    f"https://api.unpaywall.org/v2/{doi}",
+                    params={"email": polite_email},
+                    timeout=TIMEOUT,
+                )
+                if resp.status_code == 422:
+                    logger.warning(
+                        "Unpaywall rejected email %r (422). Set ZOTERO_MCP_EMAIL "
+                        "to a real address. Response: %s",
+                        polite_email,
+                        resp.text[:200],
+                    )
+                elif resp.status_code == 200:
+                    data = resp.json()
+                    best_oa = data.get("best_oa_location", {})
+                    pdf_url = best_oa.get("url_for_pdf") if best_oa else None
+                    if pdf_url:
+                        _validate_url(pdf_url)
+                        pdf_resp = _fetch_pdf_with_retry(pdf_url)
+                        if pdf_resp is not None and pdf_resp.status_code == 200 and _is_valid_pdf(pdf_resp.content):
+                            return pdf_resp.content, f"{safe_doi}.pdf", "unpaywall"
+            except Exception as exc:
+                logger.warning("Unpaywall PDF download failed for %s: %s", doi, exc)
 
         # 2. Try PubMed Central
         if not _is_preprint_doi(doi):  # Skip bioRxiv/medRxiv DOIs for PMC
@@ -1894,13 +1970,43 @@ class WebClient:
                     if ids:
                         pmc_id = ids[0]
                         pdf_url = f"https://www.ncbi.nlm.nih.gov/pmc/articles/PMC{pmc_id}/pdf/"
-                        pdf_resp = httpx.get(pdf_url, timeout=30.0, follow_redirects=True)
-                        if pdf_resp.status_code == 200 and _is_valid_pdf(pdf_resp.content):
+                        pdf_resp = _fetch_pdf_with_retry(pdf_url)
+                        if pdf_resp is not None and pdf_resp.status_code == 200 and _is_valid_pdf(pdf_resp.content):
                             return pdf_resp.content, f"PMC{pmc_id}.pdf", "pmc"
             except Exception as exc:
                 logger.warning("PMC PDF download failed for %s: %s", doi, exc)
 
-        # 3. Try bioRxiv/medRxiv
+        # 3. Try arXiv — only when the arXiv version is terminal (no published
+        # version exists). CrossRef's `relation.is-preprint-of` points to the
+        # published DOI when one exists; skip arXiv in that case so the user
+        # retrieves the canonical published PDF via institutional access.
+        arxiv_id = _extract_arxiv_id(doi)
+        if arxiv_id:
+            try:
+                cr_resp = httpx.get(
+                    f"https://api.crossref.org/works/{doi}",
+                    headers={"User-Agent": f"zotero-mcp/1.0 (mailto:{_get_polite_email()})"},
+                    timeout=15.0,
+                )
+                has_published_version = False
+                if cr_resp.status_code == 200:
+                    relation = cr_resp.json().get("message", {}).get("relation", {})
+                    if relation.get("is-preprint-of"):
+                        has_published_version = True
+                if has_published_version:
+                    logger.info(
+                        "Skipping arXiv for %s: published version exists (CrossRef is-preprint-of)",
+                        doi,
+                    )
+                else:
+                    pdf_url = f"https://arxiv.org/pdf/{arxiv_id}.pdf"
+                    pdf_resp = _fetch_pdf_with_retry(pdf_url)
+                    if pdf_resp is not None and pdf_resp.status_code == 200 and _is_valid_pdf(pdf_resp.content):
+                        return pdf_resp.content, f"arXiv_{arxiv_id}.pdf", "arxiv"
+            except Exception as exc:
+                logger.warning("arXiv PDF download failed for %s: %s", doi, exc)
+
+        # 4. Try bioRxiv/medRxiv
         if _is_preprint_doi(doi):
             for server, host in (
                 ("biorxiv", "www.biorxiv.org"),
@@ -1921,8 +2027,8 @@ class WebClient:
                             except (ValueError, TypeError):
                                 version = 1
                     pdf_url = f"https://{host}/content/{doi}v{version}.full.pdf"
-                    pdf_resp = httpx.get(pdf_url, timeout=30.0, follow_redirects=True)
-                    if pdf_resp.status_code == 200 and _is_valid_pdf(pdf_resp.content):
+                    pdf_resp = _fetch_pdf_with_retry(pdf_url)
+                    if pdf_resp is not None and pdf_resp.status_code == 200 and _is_valid_pdf(pdf_resp.content):
                         return pdf_resp.content, f"{safe_doi}.pdf", server
                 except Exception as exc:
                     logger.warning("%s PDF download failed for %s: %s", server, doi, exc)

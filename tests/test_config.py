@@ -1,6 +1,5 @@
 """Tests for centralized Config module."""
 
-
 import pytest
 
 from zotero_mcp.config import Config, _reset_config, get_config, load_config

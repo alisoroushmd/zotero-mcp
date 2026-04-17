@@ -30,6 +30,9 @@ class Config:
     # Optional: override graph database path
     graph_db_path: str = ""
 
+    # Optional: Zotero desktop data directory (default: ~/Zotero)
+    zotero_data_dir: str = ""
+
     # Derived: XDG data directory for graph store default
     xdg_data_home: str = ""
 
@@ -64,6 +67,11 @@ class Config:
         """Resolved graph database path (explicit override or default)."""
         return self.graph_db_path or self.default_graph_db_path
 
+    @property
+    def effective_zotero_data_dir(self) -> str:
+        """Resolved Zotero desktop data directory (explicit override or default)."""
+        return self.zotero_data_dir or os.path.expanduser("~/Zotero")
+
 
 def load_config() -> Config:
     """Load configuration from environment variables."""
@@ -74,6 +82,7 @@ def load_config() -> Config:
         semantic_scholar_api_key=os.environ.get("SEMANTIC_SCHOLAR_API_KEY", ""),
         polite_email=os.environ.get("ZOTERO_MCP_EMAIL", "zotero-mcp@example.com"),
         graph_db_path=os.environ.get("ZOTERO_MCP_GRAPH_DB", ""),
+        zotero_data_dir=os.environ.get("ZOTERO_DATA_DIR", ""),
         xdg_data_home=os.environ.get("XDG_DATA_HOME", ""),
     )
 

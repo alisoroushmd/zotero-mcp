@@ -8,7 +8,7 @@ import pytest
 
 
 def test_server_has_all_tools():
-    """Server exposes all 34 tools."""
+    """Server exposes all 36 tools."""
     from zotero_mcp.server import mcp
 
     tools = asyncio.run(mcp.list_tools())
@@ -25,6 +25,8 @@ def test_server_has_all_tools():
         "batch_organize",
         "find_duplicates",
         "create_collection",
+        "audit_local_keys",
+        "check_ssl_health",
         "add_to_collection",
         "update_item",
         "trash_items",
@@ -53,7 +55,7 @@ def test_server_has_all_tools():
     extra = actual - expected
     assert not missing, f"Missing tools: {missing}"
     assert not extra, f"Extra tools: {extra}"
-    assert len(tools) == 34
+    assert len(tools) == 36
 
 
 def test_server_has_prompts():

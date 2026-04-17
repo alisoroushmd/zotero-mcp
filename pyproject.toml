@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "zotero-mcp"
-version = "0.7.0"
+version = "0.8.0"
 description = "MCP server for Zotero — search, organize, cite, and analyze your library"
 license = "MIT"
 requires-python = ">=3.11"
@@ -13,6 +13,11 @@ dependencies = [
     "fastmcp>=2.3.0",
     "httpx>=0.27.0",
     "python-docx>=1.1.0",
+    # Use OS trust store for HTTPS — avoids broken/stale bundled CA bundles
+    # (e.g. Homebrew Python 3.14 ships a cert.pem with a non-critical Basic
+    # Constraints CA that fails verification). Tiny (~18 KB) and requires
+    # Python >= 3.10; server.py falls back gracefully if missing.
+    "truststore>=0.9",
 ]
 
 [project.scripts]
