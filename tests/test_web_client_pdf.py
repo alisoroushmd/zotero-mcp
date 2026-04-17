@@ -140,8 +140,15 @@ def test_download_free_pdf_rejects_html_response():
 
 
 @respx.mock
-def test_download_free_pdf_accepts_small_valid_pdf():
+def test_download_free_pdf_accepts_small_valid_pdf(monkeypatch):
     """A valid PDF starting with %PDF- should be accepted regardless of size."""
+    # Unpaywall rejects placeholder @example.com emails, so the fallback
+    # only attempts the call when a real address is configured.
+    monkeypatch.setenv("ZOTERO_MCP_EMAIL", "tester@institution.edu")
+    from zotero_mcp.config import _reset_config
+
+    _reset_config()
+
     doi = "10.1234/test"
     valid_pdf = b"%PDF-1.4 minimal"  # Small but valid magic bytes
 

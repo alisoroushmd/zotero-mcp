@@ -2,11 +2,13 @@
 
 from __future__ import annotations
 
-import os
 import sqlite3
-from pathlib import Path
+from typing import TYPE_CHECKING
 
 import pytest
+
+if TYPE_CHECKING:
+    from pathlib import Path
 
 from zotero_mcp.local_audit import (
     INVALID_KEY_CHARS,
@@ -18,7 +20,7 @@ from zotero_mcp.local_audit import (
 
 def test_invalid_chars_are_zero_one_o_only():
     """Zotero's key alphabet excludes 0, 1, and O. 'I' and 'L' are valid."""
-    assert INVALID_KEY_CHARS == frozenset("01O")
+    assert frozenset("01O") == INVALID_KEY_CHARS
     assert "I" not in INVALID_KEY_CHARS
     assert "L" not in INVALID_KEY_CHARS
 
@@ -26,13 +28,13 @@ def test_invalid_chars_are_zero_one_o_only():
 @pytest.mark.parametrize(
     "key,expected",
     [
-        ("ABCDEFGH", ""),          # clean
-        ("ABCD0EFG", "0"),         # contains zero
-        ("ABCD1EFG", "1"),         # contains one
-        ("ABCDOEFG", "O"),         # contains capital O
-        ("0O1ABCDE", "0,1,O"),     # all three
-        ("ABCIDEFG", ""),          # 'I' is valid
-        ("ABCLDEFG", ""),          # 'L' is valid
+        ("ABCDEFGH", ""),  # clean
+        ("ABCD0EFG", "0"),  # contains zero
+        ("ABCD1EFG", "1"),  # contains one
+        ("ABCDOEFG", "O"),  # contains capital O
+        ("0O1ABCDE", "0,1,O"),  # all three
+        ("ABCIDEFG", ""),  # 'I' is valid
+        ("ABCLDEFG", ""),  # 'L' is valid
     ],
 )
 def test_bad_chars_detects_forbidden_only(key, expected):

@@ -98,9 +98,7 @@ def audit_local_keys(
     try:
         findings: list[InvalidKeyRecord] = []
 
-        for row in conn.execute(
-            "SELECT key, collectionName, synced, version FROM collections"
-        ):
+        for row in conn.execute("SELECT key, collectionName, synced, version FROM collections"):
             key, name, synced, version = row
             bc = _bad_chars(key)
             if bc:

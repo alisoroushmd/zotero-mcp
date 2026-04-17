@@ -2,10 +2,6 @@
 
 from __future__ import annotations
 
-from unittest.mock import patch
-
-import pytest
-
 from zotero_mcp.ssl_health import (
     OVERRIDE_ENV_VARS,
     ProbeResult,
@@ -41,8 +37,11 @@ def test_healthy_when_everything_ok():
 def _ssl_probe(url: str, err: str = "verify failed") -> ProbeResult:
     """Probe that failed specifically due to an SSL error."""
     return ProbeResult(
-        url=url, ok=False, status=None,
-        error_type="SSLCertVerificationError", error_message=err,
+        url=url,
+        ok=False,
+        status=None,
+        error_type="SSLCertVerificationError",
+        error_message=err,
     )
 
 

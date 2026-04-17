@@ -932,7 +932,8 @@ def create_collection(name: str, parent_key: str | None = None) -> str:
 @_handle_tool_errors
 def check_ssl_health(probe: bool = True) -> str:
     """Run a full SSL/TLS configuration audit and return a JSON report."""
-    from zotero_mcp.ssl_health import check_ssl_health as _check, report_to_dict
+    from zotero_mcp.ssl_health import check_ssl_health as _check
+    from zotero_mcp.ssl_health import report_to_dict
 
     return json.dumps(report_to_dict(_check(probe=probe)), ensure_ascii=False)
 
@@ -953,7 +954,8 @@ def check_ssl_health(probe: bool = True) -> str:
 @_handle_tool_errors
 def audit_local_keys(include_items: bool = True) -> str:
     """Scan local SQLite for invalid collection/item keys."""
-    from zotero_mcp.local_audit import audit_local_keys as _audit, audit_summary
+    from zotero_mcp.local_audit import audit_local_keys as _audit
+    from zotero_mcp.local_audit import audit_summary
 
     findings = _audit(include_items=include_items)
     return json.dumps(audit_summary(findings), ensure_ascii=False)
@@ -1617,8 +1619,8 @@ def _build_fulltext_index(full_rebuild: bool = False, limit: int = 0) -> dict:
     indexed = 0
     failed = 0
 
-    def _process_one(item: dict) -> dict:
-        """Extract and index text for a single item."""
+    def _extract_one(item: dict) -> dict:
+        """Extract text for a single item. No sqlite writes (not thread-safe)."""
         item_key = item["key"]
         item_doi = item["DOI"]
 
@@ -1653,19 +1655,25 @@ def _build_fulltext_index(full_rebuild: bool = False, limit: int = 0) -> dict:
         if not text:
             return {"doi": item_doi, "status": "failed", "reason": "no_text_extracted"}
 
-        index_paper_text(store, item_doi, text)
-        return {"doi": item_doi, "status": "indexed"}
+        return {"doi": item_doi, "status": "extracted", "text": text}
 
+    # Extract in parallel, write serially on the main thread (sqlite3 conn
+    # is not thread-safe).
     with ThreadPoolExecutor(max_workers=4) as pool:
-        futures = {pool.submit(_process_one, it): it for it in items}
+        futures = {pool.submit(_extract_one, it): it for it in items}
         for future in as_completed(futures):
             try:
                 result = future.result()
-                if result["status"] == "indexed":
-                    indexed += 1
-                else:
-                    failed += 1
             except Exception:
+                failed += 1
+                continue
+            if result["status"] == "extracted":
+                try:
+                    index_paper_text(store, result["doi"], result["text"])
+                    indexed += 1
+                except Exception:
+                    failed += 1
+            else:
                 failed += 1
 
     return {

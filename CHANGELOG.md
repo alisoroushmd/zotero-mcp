@@ -6,6 +6,14 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/).
 
 ## [Unreleased]
 
+### Changed
+
+- CI now installs the `graph` and `fulltext` optional extras alongside `dev`, so the knowledge-graph, graph-renderer, and full-text tests actually run. Every main-branch CI run since 0.7.0 failed because these tests were being imported without `networkx` / `pypdf` available.
+
+### Fixed
+
+- Full-text index build (`build_index(type="fulltext")`) was writing to SQLite from worker threads, which sqlite3 connections don't support — extraction now runs in parallel and writes are serialized on the main thread. Prevents silent data corruption and thread-safety warnings on large builds.
+
 ## [0.8.0] - 2026-04-16
 
 ### Added

@@ -136,7 +136,7 @@ def _fetch_pdf_with_retry(
         except httpx.TransportError as exc:
             last_exc = exc
         if i < attempts - 1:
-            time.sleep(backoff * (2 ** i))
+            time.sleep(backoff * (2**i))
     logger.warning("PDF fetch gave up after %d attempts for %s: %s", attempts, url, last_exc)
     return None
 
@@ -1953,7 +1953,11 @@ class WebClient:
                     if pdf_url:
                         _validate_url(pdf_url)
                         pdf_resp = _fetch_pdf_with_retry(pdf_url)
-                        if pdf_resp is not None and pdf_resp.status_code == 200 and _is_valid_pdf(pdf_resp.content):
+                        if (
+                            pdf_resp is not None
+                            and pdf_resp.status_code == 200
+                            and _is_valid_pdf(pdf_resp.content)
+                        ):
                             return pdf_resp.content, f"{safe_doi}.pdf", "unpaywall"
             except Exception as exc:
                 logger.warning("Unpaywall PDF download failed for %s: %s", doi, exc)
@@ -1971,7 +1975,11 @@ class WebClient:
                         pmc_id = ids[0]
                         pdf_url = f"https://www.ncbi.nlm.nih.gov/pmc/articles/PMC{pmc_id}/pdf/"
                         pdf_resp = _fetch_pdf_with_retry(pdf_url)
-                        if pdf_resp is not None and pdf_resp.status_code == 200 and _is_valid_pdf(pdf_resp.content):
+                        if (
+                            pdf_resp is not None
+                            and pdf_resp.status_code == 200
+                            and _is_valid_pdf(pdf_resp.content)
+                        ):
                             return pdf_resp.content, f"PMC{pmc_id}.pdf", "pmc"
             except Exception as exc:
                 logger.warning("PMC PDF download failed for %s: %s", doi, exc)
@@ -2001,7 +2009,11 @@ class WebClient:
                 else:
                     pdf_url = f"https://arxiv.org/pdf/{arxiv_id}.pdf"
                     pdf_resp = _fetch_pdf_with_retry(pdf_url)
-                    if pdf_resp is not None and pdf_resp.status_code == 200 and _is_valid_pdf(pdf_resp.content):
+                    if (
+                        pdf_resp is not None
+                        and pdf_resp.status_code == 200
+                        and _is_valid_pdf(pdf_resp.content)
+                    ):
                         return pdf_resp.content, f"arXiv_{arxiv_id}.pdf", "arxiv"
             except Exception as exc:
                 logger.warning("arXiv PDF download failed for %s: %s", doi, exc)
@@ -2028,7 +2040,11 @@ class WebClient:
                                 version = 1
                     pdf_url = f"https://{host}/content/{doi}v{version}.full.pdf"
                     pdf_resp = _fetch_pdf_with_retry(pdf_url)
-                    if pdf_resp is not None and pdf_resp.status_code == 200 and _is_valid_pdf(pdf_resp.content):
+                    if (
+                        pdf_resp is not None
+                        and pdf_resp.status_code == 200
+                        and _is_valid_pdf(pdf_resp.content)
+                    ):
                         return pdf_resp.content, f"{safe_doi}.pdf", server
                 except Exception as exc:
                     logger.warning("%s PDF download failed for %s: %s", server, doi, exc)
