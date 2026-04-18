@@ -23,6 +23,52 @@ Add to your MCP client config (Claude Code, Claude Desktop, etc.):
 
 Get your API key and user ID at [zotero.org/settings/keys](https://www.zotero.org/settings/keys).
 
+<details>
+<summary><b>Alternative: install as a Claude bundle (one-click)</b></summary>
+
+Prefer drag-and-drop over editing MCP config? Download `zotero-mcp.mcpb`
+from the [latest Release](https://github.com/alisoroushmd/zotero-mcp/releases/latest)
+and install it in your Claude app.
+
+### Claude Desktop
+
+1. Open **Claude Desktop** → **Settings** → **Extensions**.
+2. Drag `zotero-mcp.mcpb` onto the pane (or click **Install extension**
+   and pick the file).
+3. When the dialog appears, fill the `user_config` fields:
+   - **Zotero API Key** and **Zotero User ID** (required)
+   - **OpenAlex API Key** — *optional*, required for knowledge-graph
+     and citation-graph tools
+   - **Semantic Scholar API Key** — *optional*, improves
+     `find_related_papers` rate limits
+4. Click **Save / Install**. Start a new chat and the Zotero tools
+   appear in the tool picker.
+
+**Change keys later:** Settings → Extensions → click **Zotero** →
+**Configure** (gear icon) → edit → **Save**. The extension restarts
+automatically.
+
+### Claude Cowork
+
+Cowork accepts the same `.mcpb` file.
+
+1. Open the Cowork side panel → **Settings** → **Extensions**
+   (or **Connectors**).
+2. Drop `zotero-mcp.mcpb` in and fill the same fields as above.
+
+**Change keys later:** open the same panel, click the Zotero entry,
+update the fields, and save.
+
+### Where to get each credential
+
+| Field | Where | Required? |
+| --- | --- | --- |
+| Zotero API Key + User ID | [zotero.org/settings/keys](https://www.zotero.org/settings/keys) — create a key with library write access | required |
+| OpenAlex API Key | [openalex.org/users/me](https://openalex.org/users/me) | optional |
+| Semantic Scholar API Key | [semanticscholar.org/product/api](https://www.semanticscholar.org/product/api) | optional |
+
+</details>
+
 ## Operating modes
 
 **All 36 tools work with just API credentials** — Zotero desktop does not need to be running.
