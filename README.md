@@ -30,34 +30,48 @@ Prefer drag-and-drop over editing MCP config? Download `zotero-mcp.mcpb`
 from the [latest Release](https://github.com/alisoroushmd/zotero-mcp/releases/latest)
 and install it in your Claude app.
 
-### Claude Desktop
+![Installing zotero-mcp as a Claude Desktop connector](./mcpb/mcpb-guide-zotero-mcp.gif)
 
-1. Open **Claude Desktop** → **Settings** → **Extensions**.
+### Install in Claude Desktop
+
+Two equivalent paths — pick whichever your Claude Desktop build shows:
+
+**Option 1 — Settings → Extensions**
+
+1. **Claude Desktop** → **Settings** → **Extensions**.
 2. Drag `zotero-mcp.mcpb` onto the pane (or click **Install extension**
    and pick the file).
-3. When the dialog appears, fill the `user_config` fields:
-   - **Zotero API Key** and **Zotero User ID** (required)
-   - **OpenAlex API Key** — *optional*, required for knowledge-graph
-     and citation-graph tools
-   - **Semantic Scholar API Key** — *optional*, improves
-     `find_related_papers` rate limits
-4. Click **Save / Install**. Start a new chat and the Zotero tools
-   appear in the tool picker.
+3. Fill the fields when prompted; click **Save / Install**.
 
-**Change keys later:** Settings → Extensions → click **Zotero** →
-**Configure** (gear icon) → edit → **Save**. The extension restarts
-automatically.
+**Option 2 — Customize → Connectors**
+
+1. **Claude Desktop** → **Customize** → **Connector** tab.
+2. Under the **Desktop** heading, click the **gear icon**.
+3. Drag-and-drop `zotero-mcp.mcpb` into the dialog.
+4. Enter your Zotero API key, user ID, and the optional keys.
+
+### Fields to fill
+
+- **Zotero API Key** and **Zotero User ID** — required
+- **OpenAlex API Key** — *optional*, required for knowledge-graph and
+  citation-graph tools
+- **Semantic Scholar API Key** — *optional*, improves
+  `find_related_papers` rate limits
+
+Start a new chat — the Zotero tools appear in the tool picker.
+
+### Change the API key (or other variables) later
+
+**Claude Desktop** → **Customize** → **Connector** tab. Under the
+**Desktop** heading you'll see the Zotero connector — open its **Config**
+section to edit the API keys and other variables, then save. The
+extension restarts automatically.
 
 ### Claude Cowork
 
-Cowork accepts the same `.mcpb` file.
-
-1. Open the Cowork side panel → **Settings** → **Extensions**
-   (or **Connectors**).
-2. Drop `zotero-mcp.mcpb` in and fill the same fields as above.
-
-**Change keys later:** open the same panel, click the Zotero entry,
-update the fields, and save.
+Cowork accepts the same `.mcpb` file. Open the Cowork panel →
+**Extensions** / **Connectors** → drop the file in → fill the same
+fields. Keys can be edited from the same panel later.
 
 ### Where to get each credential
 
