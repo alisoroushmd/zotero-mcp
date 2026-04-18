@@ -1,4 +1,4 @@
-.PHONY: install test lint format check
+.PHONY: install test lint format check mcpb mcpb-validate
 
 install:
 	pip install -e ".[dev,graph,fulltext]"
@@ -15,3 +15,9 @@ format:
 	ruff check --fix src/ tests/
 
 check: lint test
+
+mcpb:
+	uv run python mcpb/build.py
+
+mcpb-validate:
+	uv run python mcpb/build.py validate
