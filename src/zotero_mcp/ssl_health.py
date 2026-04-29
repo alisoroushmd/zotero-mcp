@@ -179,7 +179,7 @@ def _build_verdict_and_remediation(
             "/opt/homebrew/etc/ca-certificates/cert.pem."
         )
 
-    if ca_count == 0:
+    if ca_count == 0 and not (probes and all(p.ok for p in probes)):
         remediation.append(
             "Zero CAs are loaded by the default SSL context. If the cafile exists "
             "but is empty, the bundle is corrupted — reinstall ca-certificates. "
@@ -210,7 +210,15 @@ def _build_verdict_and_remediation(
     #   DEGRADED— config looks fine but not all probes succeeded for non-SSL
     #             reasons. Verification works where it was reachable.
     #   HEALTHY — all probes succeeded (or probes skipped) with clean config.
-    config_broken = not cafile_exists or ca_count == 0 or bool(broken_env)
+    #
+    # ca_count==0 alone is not a fault: on macOS the default capath holds the
+    # CAs and ssl.get_ca_certs() only enumerates cafile-loaded ones. If probes
+    # were run and all succeeded, TLS verification empirically works — trust
+    # that over the static count.
+    probes_ran = bool(probes)
+    config_broken = not cafile_exists or bool(broken_env)
+    if not probes_ran and ca_count == 0:
+        config_broken = True
     if config_broken or ssl_failures:
         verdict = "BROKEN"
     elif all_ok:

@@ -11,6 +11,12 @@ logging.basicConfig(
 
 
 def main() -> None:
+    # Self-reap when launcher chain (Claude.app disclaimer / uvx / uv) exits
+    # without propagating stdin-close. See zotero_mcp._orphan_watchdog.
+    from zotero_mcp._orphan_watchdog import install as _install_watchdog
+
+    _install_watchdog()
+
     from zotero_mcp.server import mcp
 
     mcp.run(transport="stdio")

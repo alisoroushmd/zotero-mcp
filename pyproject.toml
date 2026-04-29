@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "zotero-mcp"
-version = "0.8.0"
+version = "0.8.1"
 description = "MCP server for Zotero — search, organize, cite, and analyze your library"
 license = "MIT"
 requires-python = ">=3.11"

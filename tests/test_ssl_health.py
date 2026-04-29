@@ -129,6 +129,35 @@ def test_zero_ca_count_flagged():
     assert "Zero CAs" in joined or "0 CA" in joined or "zero" in joined.lower()
 
 
+def test_zero_ca_count_with_all_probes_ok_is_healthy():
+    """macOS + Homebrew Python often reports 0 CAs because the CAs are loaded
+    from the default capath, not the cafile. If every probe still succeeds,
+    TLS verification empirically works — trust the probes over the count."""
+    verdict, rem = _build_verdict_and_remediation(
+        cafile_exists=True,
+        capath_exists=True,
+        ca_count=0,
+        broken_env={},
+        probes=[_probe("u1", True, 200), _probe("u2", True, 200)],
+    )
+    assert verdict == "HEALTHY"
+    joined = " ".join(rem)
+    assert "Zero CAs" not in joined
+
+
+def test_zero_ca_count_offline_is_broken():
+    """Without probes we can't verify empirically, so ca_count==0 must
+    still be treated as a configuration fault."""
+    verdict, _rem = _build_verdict_and_remediation(
+        cafile_exists=True,
+        capath_exists=True,
+        ca_count=0,
+        broken_env={},
+        probes=[],
+    )
+    assert verdict == "BROKEN"
+
+
 def test_check_ssl_health_offline_returns_report():
     """With probe=False, no network I/O happens but a report is produced."""
     report = check_ssl_health(probe=False)

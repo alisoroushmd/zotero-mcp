@@ -6,12 +6,19 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/).
 
 ## [Unreleased]
 
+## [0.8.1] - 2026-04-29
+
+### Added
+
+- `_orphan_watchdog` module — daemon thread that calls `os._exit(0)` when the launching parent (Claude.app disclaimer, `uv run`, `uvx`, etc.) exits without propagating stdin-close, eliminating orphan-process accumulation across session restarts. Installed automatically from `__main__.py`; disable with `PARENT_WATCHDOG_DISABLE=1`.
+
 ### Changed
 
 - CI now installs the `graph` and `fulltext` optional extras alongside `dev`, so the knowledge-graph, graph-renderer, and full-text tests actually run. Every main-branch CI run since 0.7.0 failed because these tests were being imported without `networkx` / `pypdf` available.
 
 ### Fixed
 
+- `check_ssl_health` reported `BROKEN` on macOS + Homebrew Python whenever `ssl.get_ca_certs()` returned 0 entries, even when both HTTPS probes succeeded. The default `capath` (e.g. `/private/etc/ssl/certs`) holds the CAs but `get_ca_certs()` only enumerates `cafile`-loaded ones, so `ca_count == 0` is a normal state. The verdict now trusts probe success over the static count, and the "Zero CAs" remediation hint is suppressed when probes empirically work. Offline (`probe=False`) calls still treat `ca_count == 0` as a fault.
 - Full-text index build (`build_index(type="fulltext")`) was writing to SQLite from worker threads, which sqlite3 connections don't support — extraction now runs in parallel and writes are serialized on the main thread. Prevents silent data corruption and thread-safety warnings on large builds.
 
 ## [0.8.0] - 2026-04-16

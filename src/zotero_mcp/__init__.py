@@ -1,6 +1,6 @@
 """Zotero MCP Server — Web API primary, local API optional fast path."""
 
-__version__ = "0.8.0"
+__version__ = "0.8.1"
 
 # Opportunistically use the OS trust store for SSL verification. Fixes
 # CERTIFICATE_VERIFY_FAILED for third-party hosts (Nature, PMC, bioRxiv,
