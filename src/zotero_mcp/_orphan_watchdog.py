@@ -26,7 +26,10 @@ import os
 import sys
 import threading
 import time
-from typing import Callable, Optional
+from typing import TYPE_CHECKING
+
+if TYPE_CHECKING:
+    from collections.abc import Callable
 
 logger = logging.getLogger(__name__)
 
@@ -35,7 +38,7 @@ _INSTALLED = False
 
 def install(
     poll_interval: float = 2.0,
-    on_shutdown: Optional[Callable[[], None]] = None,
+    on_shutdown: Callable[[], None] | None = None,
 ) -> None:
     """Spawn a daemon thread that exits the process when the parent dies.
 
@@ -83,10 +86,7 @@ def install(
             except Exception:
                 continue
             if current_ppid != initial_ppid or current_ppid == 1:
-                _exit(
-                    f"parent {initial_ppid} exited "
-                    f"(reparented to {current_ppid})"
-                )
+                _exit(f"parent {initial_ppid} exited (reparented to {current_ppid})")
 
     threading.Thread(
         target=_watch,
