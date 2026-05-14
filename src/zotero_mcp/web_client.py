@@ -9,7 +9,7 @@ import re
 import time
 from pathlib import Path
 from typing import TYPE_CHECKING
-from urllib.parse import urlencode, urlparse
+from urllib.parse import quote, urlencode, urlparse
 
 import defusedxml.ElementTree as ElementTree
 import httpx
@@ -96,6 +96,18 @@ def _is_usable_polite_email(email: str) -> bool:
     return not any(low.endswith(d) for d in placeholder_domains)
 
 
+def _polite_user_agent() -> str:
+    """Return a User-Agent string for polite-pool APIs.
+
+    Includes mailto: only when the configured email is a real address.
+    Falls back to a generic string so CrossRef/OpenAlex still accept the request.
+    """
+    email = _get_polite_email()
+    if _is_usable_polite_email(email):
+        return f"zotero-mcp/1.0 (mailto:{email})"
+    return "zotero-mcp/1.0"
+
+
 SEARCH_TIMEOUT = httpx.Timeout(45.0, connect=5.0)  # searches can be slow on large libraries
 
 
@@ -180,14 +192,14 @@ def _retry_request(
         resp = fn()
     if resp.status_code == 429:
         try:
-            resp.raise_for_status()
-        except RuntimeError as err:
-            # Response has no request attached (e.g. in tests); raise directly
-            raise httpx.HTTPStatusError(
-                f"429 Too Many Requests after {max_attempts} attempts",
-                request=httpx.Request("GET", ""),
-                response=resp,
-            ) from err
+            req = resp.request
+        except RuntimeError:
+            req = httpx.Request("GET", "")
+        raise httpx.HTTPStatusError(
+            f"429 Too Many Requests after {max_attempts} attempts",
+            request=req,
+            response=resp,
+        )
     return resp
 
 
@@ -377,7 +389,7 @@ class WebClient:
         try:
             resp = httpx.get(
                 f"https://api.crossref.org/works/{doi}",
-                headers={"User-Agent": f"zotero-mcp/1.0 (mailto:{_get_polite_email()})"},
+                headers={"User-Agent": _polite_user_agent()},
                 timeout=TIMEOUT,
             )
             if resp.status_code != 200:
@@ -425,7 +437,7 @@ class WebClient:
         try:
             resp = httpx.get(
                 f"https://api.crossref.org/works/{doi}",
-                headers={"User-Agent": f"zotero-mcp/1.0 (mailto:{_get_polite_email()})"},
+                headers={"User-Agent": _polite_user_agent()},
                 timeout=TIMEOUT,
             )
             if resp.status_code != 200:
@@ -945,7 +957,7 @@ class WebClient:
         try:
             resp = httpx.get(
                 f"https://api.crossref.org/works/{doi}",
-                headers={"User-Agent": f"zotero-mcp/1.0 (mailto:{_get_polite_email()})"},
+                headers={"User-Agent": _polite_user_agent()},
                 timeout=TIMEOUT,
             )
             if resp.status_code != 200:
@@ -1404,7 +1416,9 @@ class WebClient:
                             json=new_patch,
                         )
                         resp.raise_for_status()
-                    results["updated"].append(key)
+                        results["updated"].append(key)
+                    else:
+                        results["skipped"].append(key)
                 elif resp.status_code == 429:
                     retry_after = int(resp.headers.get("Retry-After", "5"))
                     time.sleep(min(retry_after, 10))
@@ -1662,7 +1676,7 @@ class WebClient:
         version = resp.headers.get("Last-Modified-Version", "0")
 
         resp = self._web_client.delete(
-            f"/tags/{tag}",
+            f"/tags/{quote(tag, safe='')}",
             headers={"If-Unmodified-Since-Version": str(version)},
         )
         resp.raise_for_status()
@@ -1993,7 +2007,7 @@ class WebClient:
             try:
                 cr_resp = httpx.get(
                     f"https://api.crossref.org/works/{doi}",
-                    headers={"User-Agent": f"zotero-mcp/1.0 (mailto:{_get_polite_email()})"},
+                    headers={"User-Agent": _polite_user_agent()},
                     timeout=15.0,
                 )
                 has_published_version = False

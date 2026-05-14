@@ -385,20 +385,26 @@ class GraphStore:
         Returns:
             List of dicts with doi, title, zotero_key, snippet, rank.
         """
-        rows = self._conn.execute(
-            """SELECT
-                   pf.doi,
-                   p.title,
-                   p.zotero_key,
-                   snippet(paper_fulltext, 1, '<b>', '</b>', '...', 30) AS snippet,
-                   rank
-               FROM paper_fulltext pf
-               LEFT JOIN papers p ON p.doi = pf.doi
-               WHERE paper_fulltext MATCH ?
-               ORDER BY rank ASC
-               LIMIT ?""",
-            (query, limit),
-        ).fetchall()
+        try:
+            rows = self._conn.execute(
+                """SELECT
+                       pf.doi,
+                       p.title,
+                       p.zotero_key,
+                       snippet(paper_fulltext, 1, '<b>', '</b>', '...', 30) AS snippet,
+                       rank
+                   FROM paper_fulltext pf
+                   LEFT JOIN papers p ON p.doi = pf.doi
+                   WHERE paper_fulltext MATCH ?
+                   ORDER BY rank ASC
+                   LIMIT ?""",
+                (query, limit),
+            ).fetchall()
+        except sqlite3.OperationalError as exc:
+            raise ValueError(
+                f"Invalid full-text search query: {exc}. "
+                "Check for unbalanced quotes or unsupported FTS5 syntax."
+            ) from exc
         return [dict(r) for r in rows]
 
     def delete_fulltext(self, doi: str) -> None:
@@ -619,3 +625,9 @@ class GraphStore:
 
     def close(self) -> None:
         self._conn.close()
+
+    def __enter__(self) -> GraphStore:
+        return self
+
+    def __exit__(self, *_) -> None:
+        self.close()

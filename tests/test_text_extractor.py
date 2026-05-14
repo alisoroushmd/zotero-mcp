@@ -21,28 +21,6 @@ def tmp_db():
 
 def test_extract_text_from_pdf_bytes():
     """extract_text_from_pdf extracts text from PDF bytes via pypdf."""
-    mock_page1 = MagicMock()
-    mock_page1.extract_text.return_value = "Page one content about gastric cancer."
-    mock_page2 = MagicMock()
-    mock_page2.extract_text.return_value = "Page two discusses treatment options."
-
-    mock_reader = MagicMock()
-    mock_reader.pages = [mock_page1, mock_page2]
-
-    with patch("zotero_mcp.text_extractor.PdfReader", return_value=mock_reader, create=True):
-        # Patch the import inside the function
-        import zotero_mcp.text_extractor as te
-
-        original_func = te.extract_text_from_pdf
-
-        def patched_extract(source):
-
-            with patch.dict("sys.modules", {"pypdf": MagicMock()}):
-                # Directly test the logic by mocking PdfReader at the point of use
-                pass
-            return original_func(source)
-
-    # Simpler approach: mock at module level
     mock_pypdf = MagicMock()
     mock_reader_inst = MagicMock()
     page1 = MagicMock()
@@ -53,7 +31,6 @@ def test_extract_text_from_pdf_bytes():
     mock_pypdf.PdfReader.return_value = mock_reader_inst
 
     with patch.dict("sys.modules", {"pypdf": mock_pypdf}):
-        # Re-import to pick up the mock
         import importlib
 
         import zotero_mcp.text_extractor as te
@@ -226,3 +203,12 @@ def test_build_fulltext_index_incremental(tmp_db):
     to_process = [it for it in items if it["DOI"] not in indexed]
     assert len(to_process) == 1
     assert to_process[0]["DOI"] == "10.1/new"
+
+
+def test_search_fulltext_raises_value_error_on_bad_fts5(tmp_db):
+    """Malformed FTS5 query raises ValueError instead of sqlite3.OperationalError."""
+    store = GraphStore(tmp_db)
+    store.upsert_fulltext("10.1/any", "Some content for testing", 1, 24)
+
+    with pytest.raises(ValueError, match="Invalid full-text search query"):
+        store.search_fulltext('"unbalanced quote', limit=10)

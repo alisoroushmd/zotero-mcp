@@ -135,7 +135,7 @@ def test_get_citation_graph_tool_with_in_library_flag():
 
     with (
         patch.object(srv, "_get_web", return_value=mock_web),
-        patch("zotero_mcp.openalex_client.OpenAlexClient", return_value=mock_openalex),
+        patch.object(srv, "_openalex", mock_openalex),
     ):
         result = json.loads(srv.get_citation_graph("ABC123"))
 

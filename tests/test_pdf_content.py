@@ -252,3 +252,52 @@ def test_get_pdf_content_returns_not_found():
 
     assert result["content_source"] == "not_found"
     assert result["doi"] == "10.1234/test"
+
+
+def test_get_pdf_content_with_extract_text(tmp_path):
+    """extract_text=True adds text/page_count/char_count to result."""
+    from unittest.mock import patch
+
+    item_data = {
+        "key": "PDF001",
+        "DOI": "10.1234/test",
+        "title": "Test PDF Paper",
+        "itemType": "journalArticle",
+        "extra": "",
+    }
+    children = [
+        {
+            "key": "ATT001",
+            "contentType": "application/pdf",
+            "linkMode": "stored_file",
+            "filename": "test.pdf",
+        }
+    ]
+
+    mock_web = _mock_web_client(item_data, children)
+    pdf_bytes = b"%PDF-1.4 test content for extraction" + b" " * 100
+    mock_web.download_attachment.return_value = pdf_bytes
+
+    mock_local = _mock_local_client()
+    mock_local.get_children.return_value = children
+    # No local path → fall through to web download
+    mock_local.get_attachment_path.return_value = None
+
+    import zotero_mcp.server as srv
+
+    extracted_text = "hello world paper text about gastric cancer findings"
+
+    with (
+        patch.object(srv, "_get_web", return_value=mock_web),
+        patch.object(srv, "_get_local", return_value=mock_local),
+        patch(
+            "zotero_mcp.text_extractor.extract_text_from_pdf",
+            return_value=extracted_text,
+        ),
+    ):
+        result = json.loads(srv.get_pdf_content("PDF001", extract_text=True))
+
+    assert "text" in result
+    assert result["page_count"] >= 1
+    assert result["char_count"] > 0
+    assert result["char_count"] == len(extracted_text)

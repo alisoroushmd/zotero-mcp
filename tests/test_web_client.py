@@ -877,3 +877,87 @@ def test_get_all_items_with_dois_skips_no_doi():
     client = WebClient(api_key="test", user_id="123")
     result = client.get_all_items_with_dois()
     assert len(result) == 1
+
+
+# -- batch_organize tests --
+
+
+@respx.mock
+def test_batch_organize_moves_items_to_collection():
+    """batch_organize PATCHes each item to add it to the target collection."""
+    # _read_item falls back to web GET when no local client
+    item_response = {
+        "key": "ITEM1",
+        "version": 5,
+        "data": {
+            "key": "ITEM1",
+            "version": 5,
+            "tags": [],
+            "collections": [],
+        },
+    }
+    respx.get(f"{WEB_BASE}/users/12345/items/ITEM1").mock(
+        return_value=httpx.Response(200, json=item_response)
+    )
+    patch_route = respx.patch(f"{WEB_BASE}/users/12345/items/ITEM1").mock(
+        return_value=httpx.Response(204)
+    )
+
+    client = WebClient(api_key="test-key", user_id="12345")
+    result = client.batch_organize(["ITEM1"], collection_key="COL999")
+
+    assert "ITEM1" in result["updated_keys"]
+    assert result["updated_count"] == 1
+    assert result["failed_count"] == 0
+    # Verify the PATCH was sent with the collection
+    import json as _json
+
+    patch_body = _json.loads(patch_route.calls[0].request.content)
+    assert "COL999" in patch_body.get("collections", [])
+
+
+@respx.mock
+def test_batch_organize_handles_412_retry():
+    """batch_organize retries on 412 version conflict and still records the item as updated."""
+    item_v5 = {
+        "key": "ITEM2",
+        "version": 5,
+        "data": {
+            "key": "ITEM2",
+            "version": 5,
+            "tags": [],
+            "collections": [],
+        },
+    }
+    item_v6 = {
+        "key": "ITEM2",
+        "version": 6,
+        "data": {
+            "key": "ITEM2",
+            "version": 6,
+            "tags": [],
+            "collections": [],
+        },
+    }
+
+    # First GET: initial read; second GET: re-read after 412
+    respx.get(f"{WEB_BASE}/users/12345/items/ITEM2").mock(
+        side_effect=[
+            httpx.Response(200, json=item_v5),
+            httpx.Response(200, json=item_v6),
+        ]
+    )
+    # First PATCH returns 412 (version conflict); second PATCH succeeds
+    respx.patch(f"{WEB_BASE}/users/12345/items/ITEM2").mock(
+        side_effect=[
+            httpx.Response(412),
+            httpx.Response(204),
+        ]
+    )
+
+    client = WebClient(api_key="test-key", user_id="12345")
+    result = client.batch_organize(["ITEM2"], collection_key="COLX")
+
+    assert "ITEM2" in result["updated_keys"]
+    assert result["updated_count"] == 1
+    assert result["failed_count"] == 0

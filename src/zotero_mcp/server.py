@@ -43,6 +43,8 @@ _local: LocalClient | None = None
 _local_failed_at: float | None = None  # time.monotonic() when probe last failed
 _LOCAL_RETRY_INTERVAL = 300.0  # retry local API probe every 5 minutes
 _web: WebClient | None = None
+_openalex = None  # OpenAlexClient singleton — typed as Any to avoid eager import
+_openalex_lock = threading.Lock()
 _init_lock = threading.Lock()
 
 # Temp file tracking for cleanup at exit.
@@ -189,6 +191,19 @@ def _get_web() -> WebClient:
         return _web
 
 
+def _get_openalex():
+    """Lazy-initialize the OpenAlexClient singleton (thread-safe)."""
+    global _openalex
+    if _openalex is not None:
+        return _openalex
+    with _openalex_lock:
+        if _openalex is None:
+            from zotero_mcp.openalex_client import OpenAlexClient
+
+            _openalex = OpenAlexClient()
+    return _openalex
+
+
 def _parse_list_param(value: str | list | None) -> list | None:
     """Parse a parameter that may be a JSON string, list, or None."""
     if value is None:
@@ -236,6 +251,13 @@ def _handle_tool_errors(fn):
                     "api_error",
                     f"Zotero API returned {exc.response.status_code}",
                     status_code=exc.response.status_code,
+                )
+            )
+        except httpx.TimeoutException:
+            return json.dumps(
+                _error_response(
+                    "timeout",
+                    "Zotero API timed out. Try again or reduce the operation size.",
                 )
             )
         except RuntimeError as exc:
@@ -601,8 +623,6 @@ def check_retractions(item_keys: str | list[str]) -> str:
     """
     from concurrent.futures import ThreadPoolExecutor, as_completed
 
-    from zotero_mcp.openalex_client import OpenAlexClient
-
     keys = _parse_list_param(item_keys) or []
     if not keys:
         raise ValueError("item_keys must not be empty")
@@ -610,7 +630,7 @@ def check_retractions(item_keys: str | list[str]) -> str:
         _validate_key(k, "item_key")
 
     web = _get_web()
-    openalex = OpenAlexClient()
+    openalex = _get_openalex()
 
     results = []
     retracted_count = 0
@@ -657,7 +677,10 @@ def check_retractions(item_keys: str | list[str]) -> str:
     with ThreadPoolExecutor(max_workers=3) as pool:
         futures = {pool.submit(_check_one, k): k for k in keys}
         for future in as_completed(futures):
-            entry = future.result()
+            try:
+                entry = future.result()
+            except Exception as exc:
+                entry = {"key": futures[future], "error": str(exc)}
             results.append(entry)
             if entry.get("retracted"):
                 retracted_count += 1
@@ -696,8 +719,6 @@ def get_citation_graph(item_key: str, direction: str = "both", limit: str | int 
     Returns:
         JSON with cited_by and/or references lists, each with in_library flag.
     """
-    from zotero_mcp.openalex_client import OpenAlexClient
-
     _validate_key(item_key, "item_key")
     limit_int = _clamp_limit(limit, lo=1, hi=50)
 
@@ -715,7 +736,7 @@ def get_citation_graph(item_key: str, direction: str = "both", limit: str | int 
             }
         )
 
-    openalex = OpenAlexClient()
+    openalex = _get_openalex()
 
     def _add_library_flags(works: list[dict]) -> list[dict]:
         """Batch-check library membership using ThreadPoolExecutor."""
@@ -898,7 +919,6 @@ def batch_organize(
         "similarity (>85%). Use this when the user wants to clean up their library "
         "or after bulk imports. Optionally scoped to a single collection."
     ),
-    annotations={"readOnlyHint": True},
 )
 @_handle_tool_errors
 def find_duplicates(collection_key: str | None = None, limit: str | int = 100) -> str:
@@ -1137,8 +1157,6 @@ def check_published_versions(item_keys: str | list[str]) -> str:
     """
     from concurrent.futures import ThreadPoolExecutor, as_completed
 
-    from zotero_mcp.openalex_client import OpenAlexClient
-
     keys = _parse_list_param(item_keys) or []
     if not keys:
         raise ValueError("item_keys must not be empty")
@@ -1146,7 +1164,7 @@ def check_published_versions(item_keys: str | list[str]) -> str:
         _validate_key(k, "item_key")
 
     web = _get_web()
-    openalex = OpenAlexClient()
+    openalex = _get_openalex()
 
     published_count = 0
     results: list[dict] = []
@@ -1195,7 +1213,10 @@ def check_published_versions(item_keys: str | list[str]) -> str:
     with ThreadPoolExecutor(max_workers=3) as pool:
         futures = {pool.submit(_check_one, k): k for k in keys}
         for future in as_completed(futures):
-            entry = future.result()
+            try:
+                entry = future.result()
+            except Exception as exc:
+                entry = {"key": futures[future], "error": str(exc)}
             results.append(entry)
             if entry.get("has_published_version"):
                 published_count += 1
@@ -1424,11 +1445,13 @@ def _get_or_build_kg() -> KnowledgeGraph:
         from zotero_mcp.graph_store import GraphStore
         from zotero_mcp.knowledge_graph import KnowledgeGraph
 
-        store = GraphStore()
-        if store.get_last_sync() is None:
-            raise RuntimeError("Knowledge graph not yet built. Run build_knowledge_graph first.")
-        kg = KnowledgeGraph()
-        kg.build_from_store(store)
+        with GraphStore() as store:
+            if store.get_last_sync() is None:
+                raise RuntimeError(
+                    "Knowledge graph not yet built. Run build_knowledge_graph first."
+                )
+            kg = KnowledgeGraph()
+            kg.build_from_store(store)
         _kg_cache = kg
         return kg
 
@@ -1552,37 +1575,39 @@ def _build_knowledge_graph(full_rebuild: bool = False) -> dict:
     from datetime import datetime
 
     from zotero_mcp.graph_store import GraphStore
-    from zotero_mcp.openalex_client import OpenAlexClient
 
     web = _get_web()
-    openalex = OpenAlexClient()
+    openalex = _get_openalex()
     store = GraphStore()
+    try:
+        last_sync = store.get_last_sync()
+        is_incremental = last_sync is not None and not full_rebuild
 
-    last_sync = store.get_last_sync()
-    is_incremental = last_sync is not None and not full_rebuild
-
-    items = web.get_all_items_with_dois()
-    if not items:
-        return {"error": "No items with DOIs found in library"}
-
-    if is_incremental:
-        existing_dois = store.get_doi_set()
-        items = [item for item in items if item["DOI"] not in existing_dois]
+        items = web.get_all_items_with_dois()
         if not items:
-            kg = _get_or_build_kg()
-            stats = kg.get_stats()
-            stats["new_papers"] = 0
-            stats["new_citations"] = 0
-            stats["mode"] = "sync"
-            return stats
+            return {"error": "No items with DOIs found in library"}
 
-    doi_list = [item["DOI"] for item in items]
-    key_by_doi = {item["DOI"]: item["key"] for item in items}
+        if is_incremental:
+            existing_dois = store.get_doi_set()
+            items = [item for item in items if item["DOI"] not in existing_dois]
+            if not items:
+                kg = _get_or_build_kg()
+                stats = kg.get_stats()
+                stats["new_papers"] = 0
+                stats["new_citations"] = 0
+                stats["mode"] = "sync"
+                return stats
 
-    works = openalex.bulk_get_works(doi_list)
-    counts = _index_works(works, key_by_doi, store, openalex)
+        doi_list = [item["DOI"] for item in items]
+        key_by_doi = {item["DOI"]: item["key"] for item in items}
 
-    store.set_last_sync(datetime.now(UTC).isoformat())
+        works = openalex.bulk_get_works(doi_list)
+        counts = _index_works(works, key_by_doi, store, openalex)
+
+        store.set_last_sync(datetime.now(UTC).isoformat())
+    finally:
+        store.close()
+
     _invalidate_kg_cache()
     kg = _get_or_build_kg()
     stats = kg.get_stats()
@@ -1608,80 +1633,82 @@ def _build_fulltext_index(full_rebuild: bool = False, limit: int = 0) -> dict:
 
     web = _get_web()
     store = GraphStore()
+    try:
+        items = web.get_all_items_with_dois()
+        if not items:
+            return {"error": "No items with DOIs found in library"}
 
-    items = web.get_all_items_with_dois()
-    if not items:
-        return {"error": "No items with DOIs found in library"}
+        already_indexed = store.get_indexed_dois()
+        total = len(items)
 
-    already_indexed = store.get_indexed_dois()
-    total = len(items)
+        if not full_rebuild:
+            items = [it for it in items if it["DOI"] not in already_indexed]
+        skipped = total - len(items)
 
-    if not full_rebuild:
-        items = [it for it in items if it["DOI"] not in already_indexed]
-    skipped = total - len(items)
+        if limit > 0:
+            items = items[:limit]
 
-    if limit > 0:
-        items = items[:limit]
+        indexed = 0
+        failed = 0
 
-    indexed = 0
-    failed = 0
+        def _extract_one(item: dict) -> dict:
+            """Extract text for a single item. No sqlite writes (not thread-safe)."""
+            item_key = item["key"]
+            item_doi = item["DOI"]
 
-    def _extract_one(item: dict) -> dict:
-        """Extract text for a single item. No sqlite writes (not thread-safe)."""
-        item_key = item["key"]
-        item_doi = item["DOI"]
-
-        try:
-            children = _read_local_or_web("get_children", item_key, item_type="attachment")
-        except Exception:
-            return {"doi": item_doi, "status": "failed", "reason": "no_attachments"}
-
-        pdf_atts = [c for c in children if c.get("contentType") == "application/pdf"]
-        if not pdf_atts:
-            return {"doi": item_doi, "status": "failed", "reason": "no_pdf"}
-
-        att = pdf_atts[0]
-        att_key = att.get("key", "")
-        pdf_source = None
-
-        try:
-            local = _get_local()
-            local_path = local.get_attachment_path(att_key)
-            if local_path:
-                pdf_source = local_path
-        except Exception:
-            pass
-
-        if pdf_source is None:
             try:
-                pdf_source = web.download_attachment(att_key)
+                children = _read_local_or_web("get_children", item_key, item_type="attachment")
             except Exception:
-                return {"doi": item_doi, "status": "failed", "reason": "download_failed"}
+                return {"doi": item_doi, "status": "failed", "reason": "no_attachments"}
 
-        text = extract_text_from_pdf(pdf_source)
-        if not text:
-            return {"doi": item_doi, "status": "failed", "reason": "no_text_extracted"}
+            pdf_atts = [c for c in children if c.get("contentType") == "application/pdf"]
+            if not pdf_atts:
+                return {"doi": item_doi, "status": "failed", "reason": "no_pdf"}
 
-        return {"doi": item_doi, "status": "extracted", "text": text}
+            att = pdf_atts[0]
+            att_key = att.get("key", "")
+            pdf_source = None
 
-    # Extract in parallel, write serially on the main thread (sqlite3 conn
-    # is not thread-safe).
-    with ThreadPoolExecutor(max_workers=4) as pool:
-        futures = {pool.submit(_extract_one, it): it for it in items}
-        for future in as_completed(futures):
             try:
-                result = future.result()
+                local = _get_local()
+                local_path = local.get_attachment_path(att_key)
+                if local_path:
+                    pdf_source = local_path
             except Exception:
-                failed += 1
-                continue
-            if result["status"] == "extracted":
+                pass
+
+            if pdf_source is None:
                 try:
-                    index_paper_text(store, result["doi"], result["text"])
-                    indexed += 1
+                    pdf_source = web.download_attachment(att_key)
+                except Exception:
+                    return {"doi": item_doi, "status": "failed", "reason": "download_failed"}
+
+            text = extract_text_from_pdf(pdf_source)
+            if not text:
+                return {"doi": item_doi, "status": "failed", "reason": "no_text_extracted"}
+
+            return {"doi": item_doi, "status": "extracted", "text": text}
+
+        # Extract in parallel, write serially on the main thread (sqlite3 conn
+        # is not thread-safe).
+        with ThreadPoolExecutor(max_workers=4) as pool:
+            futures = {pool.submit(_extract_one, it): it for it in items}
+            for future in as_completed(futures):
+                try:
+                    result = future.result()
                 except Exception:
                     failed += 1
-            else:
-                failed += 1
+                    continue
+                if result["status"] == "extracted":
+                    try:
+                        index_paper_text(store, result["doi"], result["text"])
+                        indexed += 1
+                    except Exception:
+                        failed += 1
+                else:
+                    failed += 1
+    finally:
+        store.close()
 
     return {
         "indexed": indexed,
@@ -1905,8 +1932,8 @@ def search_fulltext(query: str, limit: str | int = 20) -> str:
         raise ValueError("query must not be empty")
 
     limit_int = _clamp_limit(limit, lo=1, hi=100)
-    store = GraphStore()
-    results = store.search_fulltext(query.strip(), limit_int)
+    with GraphStore() as store:
+        results = store.search_fulltext(query.strip(), limit_int)
     return json.dumps(
         {"query": query.strip(), "results": results, "count": len(results)},
         ensure_ascii=False,
@@ -2006,6 +2033,8 @@ def export_knowledge_graph(
         fd, path = tempfile.mkstemp(suffix=".html", prefix="zotero_mcp_graph_")
         os.close(fd)
         _register_temp_file(path)
+    else:
+        path = _validate_path(path, "path")
 
     with open(path, "w", encoding="utf-8") as f:
         f.write(html)
@@ -2038,8 +2067,8 @@ def get_unextracted_abstracts(limit: str | int = 50) -> str:
     from zotero_mcp.graph_store import GraphStore
 
     limit_int = _clamp_limit(limit, lo=1, hi=200)
-    store = GraphStore()
-    all_unextracted = store.get_unextracted_dois()
+    with GraphStore() as store:
+        all_unextracted = store.get_unextracted_dois()
     batch = all_unextracted[:limit_int]
     remaining = len(all_unextracted) - len(batch)
     return json.dumps(
@@ -2074,39 +2103,48 @@ def store_entities(results: str | list) -> str:
     if not isinstance(results, list):
         raise ValueError("results must be a list of {doi, entities: [{name, type}]}")
 
-    store = GraphStore()
+    _VALID_ENTITY_TYPES = frozenset(
+        {"condition", "biomarker", "drug", "method", "gene", "organism", "outcome", "dataset"}
+    )
+
     papers_stored = 0
     entities_created = 0
     entities_reused = 0
 
-    for item in results:
-        doi = item.get("doi", "").strip()
-        if not doi:
-            continue
-        entities = item.get("entities", [])
-        if not entities:
-            continue
-
-        entities_stored_for_paper = 0
-        for ent in entities:
-            ent_name = ent.get("name", "").strip()
-            ent_type = ent.get("type", "").strip()
-            if not ent_name or not ent_type:
+    with GraphStore() as store:
+        for item in results:
+            doi = item.get("doi", "").strip()
+            if not doi:
+                continue
+            entities = item.get("entities", [])
+            if not entities:
                 continue
 
-            already_exists = store.entity_exists(ent_name, ent_type)
-            entity_id = store.upsert_entity(ent_name, ent_type)
+            entities_stored_for_paper = 0
+            for ent in entities:
+                ent_name = ent.get("name", "").strip()
+                ent_type = ent.get("type", "").strip().lower()
+                if not ent_name or not ent_type:
+                    continue
+                if ent_type not in _VALID_ENTITY_TYPES:
+                    raise ValueError(
+                        f"Invalid entity type: {ent_type!r}. "
+                        f"Must be one of: {', '.join(sorted(_VALID_ENTITY_TYPES))}"
+                    )
 
-            if already_exists:
-                entities_reused += 1
-            else:
-                entities_created += 1
+                already_exists = store.entity_exists(ent_name, ent_type)
+                entity_id = store.upsert_entity(ent_name, ent_type)
 
-            store.upsert_paper_entity(doi, entity_id)
-            entities_stored_for_paper += 1
+                if already_exists:
+                    entities_reused += 1
+                else:
+                    entities_created += 1
 
-        if entities_stored_for_paper > 0:
-            papers_stored += 1
+                store.upsert_paper_entity(doi, entity_id)
+                entities_stored_for_paper += 1
+
+            if entities_stored_for_paper > 0:
+                papers_stored += 1
 
     _invalidate_kg_cache()
     return json.dumps(
@@ -2160,80 +2198,80 @@ def search_entities(
     from zotero_mcp.graph_store import GraphStore
 
     limit_int = _clamp_limit(limit, lo=1, hi=100)
-    store = GraphStore()
 
-    if query_type == "by_name":
-        if not entity_name:
-            raise ValueError("by_name query requires entity_name")
-        entities = store.search_entities_by_name(entity_name, limit=limit_int)
-        results = []
-        for ent in entities:
-            papers = store.get_papers_for_entity(ent["entity_id"])
-            results.append(
-                {
-                    **ent,
-                    "paper_count": len(papers),
-                    "papers": [
-                        {"doi": p["doi"], "title": p["title"], "year": p["year"]}
-                        for p in papers[:limit_int]
-                    ],
-                }
-            )
-        return json.dumps({"query": "by_name", "results": results}, ensure_ascii=False)
+    with GraphStore() as store:
+        if query_type == "by_name":
+            if not entity_name:
+                raise ValueError("by_name query requires entity_name")
+            entities = store.search_entities_by_name(entity_name, limit=limit_int)
+            results = []
+            for ent in entities:
+                papers = store.get_papers_for_entity(ent["entity_id"])
+                results.append(
+                    {
+                        **ent,
+                        "paper_count": len(papers),
+                        "papers": [
+                            {"doi": p["doi"], "title": p["title"], "year": p["year"]}
+                            for p in papers[:limit_int]
+                        ],
+                    }
+                )
+            return json.dumps({"query": "by_name", "results": results}, ensure_ascii=False)
 
-    elif query_type == "by_type":
-        if entity_type:
-            results = store.get_entities_by_type(entity_type, limit=limit_int)
+        elif query_type == "by_type":
+            if entity_type:
+                results = store.get_entities_by_type(entity_type, limit=limit_int)
+                return json.dumps(
+                    {"query": "by_type", "entity_type": entity_type, "results": results},
+                    ensure_ascii=False,
+                )
+            else:
+                types = store.get_all_entity_types()
+                return json.dumps(
+                    {"query": "by_type", "entity_types": types},
+                    ensure_ascii=False,
+                )
+
+        elif query_type == "co_occurrence":
+            if not entity_name:
+                raise ValueError("co_occurrence query requires entity_name")
+            matches = store.search_entities_by_name(entity_name, limit=1)
+            if not matches:
+                return json.dumps(
+                    {"query": "co_occurrence", "error": f"Entity not found: {entity_name}"},
+                    ensure_ascii=False,
+                )
+            entity_id = matches[0]["entity_id"]
+            co_occurring = store.get_entity_co_occurrence(entity_id, limit=limit_int)
             return json.dumps(
-                {"query": "by_type", "entity_type": entity_type, "results": results},
+                {"query": "co_occurrence", "entity": matches[0], "co_occurring": co_occurring},
                 ensure_ascii=False,
             )
+
+        elif query_type == "shared_entities":
+            if not doi_a or not doi_b:
+                raise ValueError("shared_entities query requires doi_a and doi_b")
+            shared = store.get_shared_entities(doi_a, doi_b)
+            return json.dumps(
+                {"query": "shared_entities", "doi_a": doi_a, "doi_b": doi_b, "shared": shared},
+                ensure_ascii=False,
+            )
+
+        elif query_type == "paper_entities":
+            if not doi:
+                raise ValueError("paper_entities query requires doi")
+            entities = store.get_entities_for_doi(doi)
+            return json.dumps(
+                {"query": "paper_entities", "doi": doi, "entities": entities},
+                ensure_ascii=False,
+            )
+
         else:
-            types = store.get_all_entity_types()
-            return json.dumps(
-                {"query": "by_type", "entity_types": types},
-                ensure_ascii=False,
+            raise ValueError(
+                f"Unknown query_type: {query_type!r}. "
+                "Must be: by_name, by_type, co_occurrence, shared_entities, paper_entities"
             )
-
-    elif query_type == "co_occurrence":
-        if not entity_name:
-            raise ValueError("co_occurrence query requires entity_name")
-        matches = store.search_entities_by_name(entity_name, limit=1)
-        if not matches:
-            return json.dumps(
-                {"query": "co_occurrence", "error": f"Entity not found: {entity_name}"},
-                ensure_ascii=False,
-            )
-        entity_id = matches[0]["entity_id"]
-        co_occurring = store.get_entity_co_occurrence(entity_id, limit=limit_int)
-        return json.dumps(
-            {"query": "co_occurrence", "entity": matches[0], "co_occurring": co_occurring},
-            ensure_ascii=False,
-        )
-
-    elif query_type == "shared_entities":
-        if not doi_a or not doi_b:
-            raise ValueError("shared_entities query requires doi_a and doi_b")
-        shared = store.get_shared_entities(doi_a, doi_b)
-        return json.dumps(
-            {"query": "shared_entities", "doi_a": doi_a, "doi_b": doi_b, "shared": shared},
-            ensure_ascii=False,
-        )
-
-    elif query_type == "paper_entities":
-        if not doi:
-            raise ValueError("paper_entities query requires doi")
-        entities = store.get_entities_for_doi(doi)
-        return json.dumps(
-            {"query": "paper_entities", "doi": doi, "entities": entities},
-            ensure_ascii=False,
-        )
-
-    else:
-        raise ValueError(
-            f"Unknown query_type: {query_type!r}. "
-            "Must be: by_name, by_type, co_occurrence, shared_entities, paper_entities"
-        )
 
 
 # -- MCP Prompts (multi-tool workflows) --

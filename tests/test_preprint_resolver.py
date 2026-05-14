@@ -231,7 +231,7 @@ def test_check_published_versions_tool_finds_published_preprint():
 
     with (
         patch.object(srv, "_web", mock_web),
-        patch("zotero_mcp.openalex_client.OpenAlexClient", return_value=mock_oa),
+        patch.object(srv, "_openalex", mock_oa),
     ):
         result = json.loads(srv.check_published_versions("PREP0001"))
 
@@ -270,7 +270,7 @@ def test_check_published_versions_tool_flags_in_library():
 
     with (
         patch.object(srv, "_web", mock_web),
-        patch("zotero_mcp.openalex_client.OpenAlexClient", return_value=mock_oa),
+        patch.object(srv, "_openalex", mock_oa),
     ):
         result = json.loads(srv.check_published_versions("PREP0002"))
 
@@ -296,7 +296,7 @@ def test_check_published_versions_tool_handles_no_doi():
 
     with (
         patch.object(srv, "_web", mock_web),
-        patch("zotero_mcp.openalex_client.OpenAlexClient", return_value=mock_oa),
+        patch.object(srv, "_openalex", mock_oa),
     ):
         result = json.loads(srv.check_published_versions("NODOI001"))
 
@@ -329,7 +329,7 @@ def test_check_published_versions_crossref_fallback_when_openalex_empty():
 
     with (
         patch.object(srv, "_web", mock_web),
-        patch("zotero_mcp.openalex_client.OpenAlexClient", return_value=mock_oa),
+        patch.object(srv, "_openalex", mock_oa),
     ):
         result = json.loads(srv.check_published_versions("PREP0003"))
 

@@ -23,9 +23,27 @@ Add to your MCP client config (Claude Code, Claude Desktop, etc.):
 
 Get your API key and user ID at [zotero.org/settings/keys](https://www.zotero.org/settings/keys).
 
+**`OPENALEX_API_KEY` is also required for the analysis tools** (`check_retractions`, `get_citation_graph`, `check_published_versions`). To enable those plus the knowledge graph and full-text search tools, add the extras and an OpenAlex key:
+
+```json
+{
+  "zotero": {
+    "command": "uvx",
+    "args": ["zotero-mcp-plus[graph,fulltext]"],
+    "env": {
+      "ZOTERO_API_KEY": "your-api-key",
+      "ZOTERO_USER_ID": "your-user-id",
+      "OPENALEX_API_KEY": "your-openalex-key"
+    }
+  }
+}
+```
+
+Free OpenAlex key at [openalex.org/users/me](https://openalex.org/users/me).
+
 ## Operating modes
 
-**All 36 tools work with just API credentials** — Zotero desktop does not need to be running.
+**All 36 tools work with just API credentials** — Zotero desktop does not need to be running. Two diagnostic tools (`check_ssl_health`, `audit_local_keys`) require no credentials at all.
 
 | Mode | What it provides | Requirements |
 | --- | --- | --- |
@@ -85,7 +103,7 @@ Call `server_status` to check which modes are available.
 
 ### Knowledge graph tools
 
-Requires `pip install zotero-mcp[graph]` (adds networkx) and `OPENALEX_API_KEY` env var.
+Requires the `graph` extra (`uvx "zotero-mcp-plus[graph]"` or `pip install "zotero-mcp-plus[graph]"`) and `OPENALEX_API_KEY` env var.
 
 | Tool                       | Description                                                                       |
 | -------------------------- | --------------------------------------------------------------------------------- |
@@ -97,7 +115,7 @@ Requires `pip install zotero-mcp[graph]` (adds networkx) and `OPENALEX_API_KEY` 
 
 ### Full-text search tools
 
-Requires `pip install zotero-mcp[fulltext]` (adds pypdf).
+Requires the `fulltext` extra (`uvx "zotero-mcp-plus[fulltext]"` or `pip install "zotero-mcp-plus[fulltext]"`).
 
 | Tool                       | Description                                                                       |
 | -------------------------- | --------------------------------------------------------------------------------- |
@@ -113,7 +131,16 @@ Two-tool pattern: the MCP server provides abstracts, the calling LLM extracts en
 | -------------------------- | --------------------------------------------------------------------------------- |
 | `get_unextracted_abstracts`| Get papers with abstracts not yet entity-extracted                                |
 | `store_entities`           | Persist typed entities (biomarker, drug, gene, etc.) extracted by the LLM         |
-| `search_entities`          | Query entity index: by name, type, DOI, co-occurrence, shared entities, network   |
+| `search_entities`          | Query entity index: by_name, by_type, paper_entities (by DOI), co_occurrence, shared_entities |
+
+### Diagnostic tools
+
+These two tools require no API credentials and can be used to debug setup problems.
+
+| Tool                | Description                                                                          |
+| ------------------- | ------------------------------------------------------------------------------------ |
+| `check_ssl_health`  | Diagnose Python SSL/TLS config — cert paths, CA count, env-var overrides, live HTTPS probes. Returns HEALTHY/DEGRADED/BROKEN verdict with remediation steps. Use when any tool reports `CERTIFICATE_VERIFY_FAILED`. |
+| `audit_local_keys`  | Scan local Zotero SQLite for item/collection keys containing characters (`0`, `1`, `O`) that the Zotero sync server rejects, halting sync. |
 
 ### MCP Prompts
 
@@ -181,52 +208,86 @@ In Zotero Desktop: **Settings > Advanced > General** > enable **Allow other appl
 
 **Option A — uvx (recommended, no clone needed):**
 
-Your MCP client runs `uvx` directly from the quickstart config above.
+Install `uv` first if you don't have it: [astral.sh/uv](https://astral.sh/uv) (one-line install on macOS/Linux). Then use `zotero-mcp-plus` for the base install or `zotero-mcp-plus[graph,fulltext]` for the full feature set (see Quickstart above). Your MCP client runs `uvx` directly — no separate install step.
 
 **Option B — local install:**
 
 ```bash
 git clone https://github.com/alisoroushmd/zotero-mcp.git
 cd zotero-mcp
-pip install -e .
+pip install -e ".[graph,fulltext]"
 ```
 
 Then configure your MCP client to run `python -m zotero_mcp`.
 
-### 4. Set up OpenAlex API key (required for analysis tools)
+### 4. Set up OpenAlex API key (required for analysis and knowledge graph tools)
 
-OpenAlex requires a free API key as of Feb 2026:
+`OPENALEX_API_KEY` is required for: `check_retractions`, `get_citation_graph`, `check_published_versions`, `build_index(type='graph')`, `query_knowledge_graph`, `query_authors`, and `export_knowledge_graph`. OpenAlex requires a free API key as of Feb 2026:
 
 1. Register at [openalex.org/users/me](https://openalex.org/users/me)
 2. Set `OPENALEX_API_KEY` in your MCP client config
 
 ### 5. Install knowledge graph support (optional)
 
-```bash
-pip install zotero-mcp[graph]
+With uvx (add to your MCP client config `args`):
+
+```text
+zotero-mcp-plus[graph]
 ```
 
-This adds networkx (plus numpy and scipy for PageRank) for `build_index(type='graph')`, `query_knowledge_graph`, `query_authors`, and `export_knowledge_graph`. The `find_related_papers` tool works without it (uses Semantic Scholar API directly).
+With pip (local install):
+
+```bash
+pip install "zotero-mcp-plus[graph]"
+```
+
+Adds networkx, numpy, and scipy for `build_index(type='graph')`, `query_knowledge_graph`, `query_authors`, and `export_knowledge_graph`. `find_related_papers` works without it (uses Semantic Scholar API directly).
 
 Optionally set `SEMANTIC_SCHOLAR_API_KEY` for improved rate limits.
 
 ### 6. Install full-text search support (optional)
 
-```bash
-pip install zotero-mcp[fulltext]
+With uvx (add to your MCP client config `args`):
+
+```text
+zotero-mcp-plus[fulltext]
 ```
 
-This adds pypdf for extracting text from PDFs. Used by `build_index(type='fulltext')` to create a searchable FTS5 index across your library. Without it, `search_fulltext` and `build_index(type='fulltext')` will return an install prompt.
+With pip (local install):
+
+```bash
+pip install "zotero-mcp-plus[fulltext]"
+```
+
+Adds pypdf for extracting text from PDFs. Used by `build_index(type='fulltext')` to build a searchable FTS5 index. Without it, `search_fulltext` and `build_index(type='fulltext')` return an install prompt.
+
+## Environment variables
+
+| Variable                   | Required | Description |
+| -------------------------- | -------- | ----------- |
+| `ZOTERO_API_KEY`           | Yes      | Zotero Web API key — get at [zotero.org/settings/keys](https://www.zotero.org/settings/keys) |
+| `ZOTERO_USER_ID`           | Yes      | Zotero user/group ID — same page as the API key |
+| `OPENALEX_API_KEY`         | For analysis/graph tools | Required for `check_retractions`, `get_citation_graph`, `check_published_versions`, and all knowledge-graph tools — free at [openalex.org/users/me](https://openalex.org/users/me) |
+| `ZOTERO_MCP_EMAIL`         | No       | Your email address. Sent in User-Agent headers to CrossRef/OpenAlex polite pools and required for Unpaywall PDF lookup in `attach_pdf`. Without it, Unpaywall PDF fetches are skipped. |
+| `SEMANTIC_SCHOLAR_API_KEY` | No       | Improves rate limits for `find_related_papers` — free at [semanticscholar.org](https://www.semanticscholar.org/product/api) |
+| `ZOTERO_DATA_DIR`          | No       | Override path to Zotero desktop data directory (default: `~/Zotero`). Used by `audit_local_keys` and the local PDF path resolver in `get_pdf_content`. |
+| `ZOTERO_MCP_GRAPH_DB`      | No       | Override path for the knowledge-graph SQLite database (default: `~/.local/share/zotero-mcp/graph.sqlite` or `$XDG_DATA_HOME/zotero-mcp/graph.sqlite`). |
+| `XDG_DATA_HOME`            | No       | Standard XDG override for the default graph DB location. |
+| `PARENT_WATCHDOG_DISABLE`  | No       | Set to `1` to disable the orphan-process watchdog that kills the server when the parent process (Claude.app, uvx, etc.) exits. |
 
 ## Troubleshooting
 
-| Problem                                     | Cause                                                | Fix                                                                           |
-| ------------------------------------------- | ---------------------------------------------------- | ----------------------------------------------------------------------------- |
-| `Cloud CRUD mode requires ZOTERO_API_KEY` | Missing env vars                                     | Set `ZOTERO_API_KEY` and `ZOTERO_USER_ID` in your MCP client config       |
-| Reads are slow                              | Zotero desktop not running; reads go through Web API | Start Zotero and enable local API for faster reads (optional)                 |
-| Item not found after creation               | Zotero sync lag                                      | Items created via Web API appear locally after Zotero syncs (usually seconds) |
-| `Version conflict for item`               | Item was modified between read and write             | Retry the operation; the server uses optimistic locking                       |
-| Translation server 503                      | translate.zotero.org is intermittent                 | The server falls back to PubMed and CrossRef automatically                    |
+| Problem | Cause | Fix |
+| ------- | ----- | --- |
+| `Cloud CRUD mode requires ZOTERO_API_KEY` | Missing env vars | Set `ZOTERO_API_KEY` and `ZOTERO_USER_ID` in your MCP client config |
+| `CERTIFICATE_VERIFY_FAILED` on any tool | Python SSL misconfiguration | Run `check_ssl_health` — it diagnoses the cert bundle and returns remediation steps |
+| `attach_pdf` never finds a free PDF | `ZOTERO_MCP_EMAIL` not set | Unpaywall requires a real email address. Set `ZOTERO_MCP_EMAIL` in your config. |
+| Analysis tools fail without obvious error | `OPENALEX_API_KEY` missing | `check_retractions`, `get_citation_graph`, and `check_published_versions` all require it |
+| Reads are slow | Zotero desktop not running; reads go through Web API | Start Zotero and enable local API for faster reads (optional) |
+| Item not found after creation | Zotero sync lag | Items created via Web API appear locally after Zotero syncs (usually seconds) |
+| `Version conflict for item` | Item was modified between read and write | Retry the operation; the server uses optimistic locking |
+| Translation server 503 | translate.zotero.org is intermittent | The server falls back to PubMed and CrossRef automatically |
+| Orphan server processes accumulate | Parent exits without closing stdin | Normal behavior is auto-handled by the watchdog. Disable with `PARENT_WATCHDOG_DISABLE=1` if it conflicts with your setup. |
 
 ## Development
 

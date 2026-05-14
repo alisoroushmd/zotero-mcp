@@ -42,6 +42,8 @@ class ServerCapabilities:
 # "local_read" = optional speedup, NOT required
 TOOL_MODES: dict[str, list[str]] = {
     "server_status": [],
+    "check_ssl_health": [],
+    "audit_local_keys": [],
     "search_items": ["any_read"],
     "get_item": ["any_read"],
     "get_collections": ["any_read"],

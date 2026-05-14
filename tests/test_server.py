@@ -292,3 +292,263 @@ def test_build_index_both_delegates_to_both():
         result = _json.loads(srv.build_index(type="both"))
         assert result["graph"]["papers"] == 5
         assert result["fulltext"]["indexed"] == 3
+
+
+# -- _parse_list_param tests --
+
+
+def test_parse_list_param_with_native_list():
+    """_parse_list_param passes through a native Python list unchanged."""
+    from zotero_mcp.server import _parse_list_param
+
+    assert _parse_list_param(["a", "b"]) == ["a", "b"]
+
+
+def test_parse_list_param_with_json_string():
+    """_parse_list_param deserialises a JSON-encoded list string."""
+    from zotero_mcp.server import _parse_list_param
+
+    assert _parse_list_param('["a","b"]') == ["a", "b"]
+
+
+def test_parse_list_param_with_bare_string():
+    """_parse_list_param wraps a bare (non-JSON) string in a single-item list."""
+    from zotero_mcp.server import _parse_list_param
+
+    assert _parse_list_param("ABC123") == ["ABC123"]
+
+
+def test_parse_list_param_with_none():
+    """_parse_list_param returns None when given None."""
+    from zotero_mcp.server import _parse_list_param
+
+    assert _parse_list_param(None) is None
+
+
+# -- write_cited_document path-traversal and missing-key tests --
+
+
+def test_write_cited_document_rejects_path_traversal():
+    """write_cited_document raises ValueError for path traversal attempts."""
+    import json as _json
+
+    import zotero_mcp.server as srv
+
+    with patch.object(srv, "_get_web"):
+        result = _json.loads(
+            srv.write_cited_document(
+                content="Test [@ABC123].",
+                output_path="/etc/passwd.docx",
+            )
+        )
+    assert result.get("error") == "invalid_input"
+
+
+def test_write_cited_document_missing_keys_reported():
+    """write_cited_document reports missing keys that couldn't be fetched."""
+    import json as _json
+    import pathlib
+    import tempfile
+
+    import zotero_mcp.server as srv
+
+    tmp_path = str(pathlib.Path(tempfile.gettempdir()) / "test_missing.docx")
+
+    mock_web = MagicMock()
+    # Return a string to simulate fetch failure (server.py checks `isinstance(item, str)`)
+    mock_web.get_item.return_value = "error: not found"
+
+    with (
+        patch.object(srv, "_web", mock_web),
+        patch.object(srv, "_get_local", side_effect=RuntimeError("no local")),
+        patch.object(srv, "_get_web", return_value=mock_web),
+    ):
+        result = _json.loads(
+            srv.write_cited_document(
+                content="Test [@ABC123].",
+                output_path=tmp_path,
+            )
+        )
+    # Missing keys should be reported (either in result or the call should still succeed)
+    assert "missing_keys" in result or result.get("error") is not None
+
+
+# -- _handle_tool_errors timeout --
+
+
+def test_handle_tool_errors_catches_timeout():
+    """_handle_tool_errors converts httpx.TimeoutException to structured JSON error."""
+    import json as _json
+
+    import httpx
+
+    import zotero_mcp.server as srv
+
+    @srv._handle_tool_errors
+    def slow_tool():
+        raise httpx.ReadTimeout("connection timed out")
+
+    result = _json.loads(slow_tool())
+    assert result["error"] == "timeout"
+    assert "timed out" in result["message"].lower()
+
+
+# -- store_entities entity_type validation --
+
+
+def test_store_entities_rejects_invalid_type():
+    """store_entities raises ValueError for unknown entity types."""
+    import json as _json
+
+    import zotero_mcp.server as srv
+
+    bad_input = [{"doi": "10.1/test", "entities": [{"name": "cancer", "type": "disease"}]}]
+
+    with patch.object(srv, "_invalidate_kg_cache"):
+        with patch("zotero_mcp.graph_store.GraphStore") as mock_gs_cls:
+            mock_store = MagicMock()
+            mock_gs_cls.return_value.__enter__ = MagicMock(return_value=mock_store)
+            mock_gs_cls.return_value.__exit__ = MagicMock(return_value=False)
+
+            result = _json.loads(srv.store_entities(bad_input))
+
+    assert result["error"] == "invalid_input"
+    assert "disease" in result["message"]
+
+
+def test_store_entities_accepts_valid_type():
+    """store_entities accepts all documented entity types without error."""
+    import json as _json
+
+    import zotero_mcp.server as srv
+
+    valid_input = [{"doi": "10.1/test", "entities": [{"name": "imatinib", "type": "drug"}]}]
+
+    with patch.object(srv, "_invalidate_kg_cache"):
+        with patch("zotero_mcp.graph_store.GraphStore") as mock_gs_cls:
+            mock_store = MagicMock()
+            mock_store.entity_exists.return_value = False
+            mock_store.upsert_entity.return_value = 1
+            mock_gs_cls.return_value.__enter__ = MagicMock(return_value=mock_store)
+            mock_gs_cls.return_value.__exit__ = MagicMock(return_value=False)
+
+            result = _json.loads(srv.store_entities(valid_input))
+
+    assert result.get("error") is None
+    assert result["stored"] == 1
+    assert result["entities_created"] == 1
+
+
+# -- FTS5 malformed query handling --
+
+
+def test_search_fulltext_bad_fts5_query_returns_error():
+    """search_fulltext returns structured error for invalid FTS5 syntax."""
+    import json as _json
+
+    import zotero_mcp.server as srv
+
+    with patch("zotero_mcp.graph_store.GraphStore") as mock_gs_cls:
+        mock_store = MagicMock()
+        mock_store.search_fulltext.side_effect = ValueError("Invalid full-text search query")
+        mock_gs_cls.return_value.__enter__ = MagicMock(return_value=mock_store)
+        mock_gs_cls.return_value.__exit__ = MagicMock(return_value=False)
+
+        result = _json.loads(srv.search_fulltext('"unbalanced'))
+
+    assert result["error"] == "invalid_input"
+
+
+# -- query_knowledge_graph dispatch --
+
+
+def test_query_knowledge_graph_unknown_type_returns_error():
+    """query_knowledge_graph returns structured error for unknown query_type."""
+    import json as _json
+
+    import zotero_mcp.server as srv
+
+    mock_kg = MagicMock()
+    with patch.object(srv, "_get_or_build_kg", return_value=mock_kg):
+        result = _json.loads(srv.query_knowledge_graph(query_type="bogus"))
+
+    assert result["error"] == "invalid_input"
+    assert "bogus" in result["message"]
+
+
+def test_query_knowledge_graph_path_requires_both_dois():
+    """query_knowledge_graph path query raises if doi_a or doi_b missing."""
+    import json as _json
+
+    import zotero_mcp.server as srv
+
+    mock_kg = MagicMock()
+    with patch.object(srv, "_get_or_build_kg", return_value=mock_kg):
+        result = _json.loads(srv.query_knowledge_graph(query_type="path", doi_a="10.1/a"))
+
+    assert result["error"] == "invalid_input"
+    assert "doi_b" in result["message"]
+
+
+def test_query_knowledge_graph_influential_delegates():
+    """query_knowledge_graph influential delegates to KnowledgeGraph.get_influential_papers."""
+    import json as _json
+
+    import zotero_mcp.server as srv
+
+    mock_kg = MagicMock()
+    mock_kg.get_influential_papers.return_value = [{"doi": "10.1/a", "pagerank": 0.9}]
+    with patch.object(srv, "_get_or_build_kg", return_value=mock_kg):
+        result = _json.loads(srv.query_knowledge_graph(query_type="influential", limit=5))
+
+    mock_kg.get_influential_papers.assert_called_once_with(top_n=5)
+    assert result[0]["doi"] == "10.1/a"
+
+
+# -- find_related_papers server layer --
+
+
+def test_find_related_papers_no_dois_returns_error():
+    """find_related_papers returns error when none of the items have DOIs."""
+    import json as _json
+
+    import zotero_mcp.server as srv
+
+    mock_web = MagicMock()
+    mock_web.get_item.return_value = {"key": "ABC123", "title": "No DOI item"}
+
+    with patch.object(srv, "_get_web", return_value=mock_web):
+        result = _json.loads(srv.find_related_papers("ABC123"))
+
+    assert "error" in result
+    assert "DOI" in result["error"]
+
+
+def test_find_related_papers_flags_in_library():
+    """find_related_papers marks recommendations already in library."""
+    import json as _json
+
+    import zotero_mcp.server as srv
+
+    mock_web = MagicMock()
+    mock_web.get_item.return_value = {"key": "ABC123", "DOI": "10.1/seed", "title": "Seed"}
+    mock_web._check_duplicate_doi.side_effect = lambda doi: (
+        {"key": "REC001"} if doi == "10.1/in_lib" else None
+    )
+
+    mock_s2 = MagicMock()
+    mock_s2.get_recommendations.return_value = [
+        {"doi": "10.1/in_lib", "title": "Already have this"},
+        {"doi": "10.1/new", "title": "New paper"},
+    ]
+
+    with (
+        patch.object(srv, "_get_web", return_value=mock_web),
+        patch("zotero_mcp.semantic_scholar_client.SemanticScholarClient", return_value=mock_s2),
+    ):
+        result = _json.loads(srv.find_related_papers("ABC123"))
+
+    recs = result["recommendations"]
+    assert recs[0]["in_library"] is True
+    assert recs[0]["zotero_key"] == "REC001"
+    assert recs[1]["in_library"] is False

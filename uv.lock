@@ -1723,8 +1723,8 @@ wheels = [
 ]
 
 [[package]]
-name = "zotero-mcp"
-version = "0.8.0"
+name = "zotero-mcp-plus"
+version = "0.8.1"
 source = { editable = "." }
 dependencies = [
     { name = "defusedxml" },

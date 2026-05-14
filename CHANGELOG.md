@@ -6,6 +6,8 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/).
 
 ## [Unreleased]
 
+## [0.8.2] - 2026-05-14
+
 ### Fixed
 
 - **`get_attachment_path` now resolves `imported_url` PDFs from local storage.**
@@ -22,6 +24,40 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/).
   (e.g. `["local_storage_path", "web_api_download", "free_pdf_unpaywall"]`) so
   callers can diagnose why a paywalled paper returned `not_found` instead of
   silently failing. (`server.py:get_pdf_content`)
+
+- **Unhandled exceptions in `check_retractions` and `check_published_versions` ThreadPoolExecutor futures** now return per-item `{"key": ..., "error": ...}` entries instead of crashing the entire tool call. (`server.py`)
+
+- **`httpx.TimeoutException` added to `_handle_tool_errors`** — write-path tools (`create_item`, `update_item`, `trash_items`, `attach_pdf`, etc.) now return a structured `{"error": "timeout"}` response instead of an unhandled exception when the Zotero API times out. (`server.py`)
+
+- **Tag name URL-encoding in `remove_tag`** — tags containing `/`, `?`, `#`, or spaces are now percent-encoded before being interpolated into the DELETE path, preventing silent mismatches. (`web_client.py`)
+
+- **FTS5 query parse errors in `search_fulltext`** — malformed queries (unbalanced quotes, bare `AND`) now raise a `ValueError` with a clear message instead of crashing with an uncaught `sqlite3.OperationalError`. (`graph_store.py`)
+
+- **`export_knowledge_graph` now validates the `path` parameter** via `_validate_path` before writing, consistent with every other file-writing tool. (`server.py`)
+
+- **`polite_user_agent` helper** — CrossRef and OpenAlex User-Agent headers now use `_polite_user_agent()` which omits the `mailto:` clause when the email is a placeholder (`@example.com` etc.), preventing fake identities being sent to polite-pool APIs. (`web_client.py`)
+
+### Added
+
+- **`TOOL_MODES` now includes `check_ssl_health` and `audit_local_keys`** — both tools were missing from the capability map, making them invisible to `server_status`. Both require no credentials (`[]`). (`capabilities.py`)
+
+- **`store_entities` validates `entity_type`** against the documented set (`condition`, `biomarker`, `drug`, `method`, `gene`, `organism`, `outcome`, `dataset`). Invalid types raise `ValueError` instead of silently fragmenting the vocabulary. (`server.py`)
+
+- **`GraphStore` context manager** (`__enter__` / `__exit__`) — all tool functions now close their `GraphStore` connections deterministically via `with GraphStore() as store:` or `try/finally store.close()`, replacing reliance on CPython GC. (`graph_store.py`, `server.py`)
+
+- **`OpenAlexClient` module-level singleton** (`_openalex`, `_get_openalex()`) — eliminates per-tool-call TCP connection churn; pooled connection is reused across `check_retractions`, `get_citation_graph`, `check_published_versions`, and `build_index`. (`server.py`)
+
+- **13 new tests** covering `_parse_list_param` (all four input shapes), `_validate_path` path traversal rejection, `get_pdf_content` with `extract_text=True`, `batch_organize` normal case and 412 retry, and `write_cited_document` path-traversal guard. Dead code removed from `test_text_extractor.py`. (`tests/`)
+
+- **README: Environment variables section** documenting all 9 env vars (`ZOTERO_API_KEY`, `ZOTERO_USER_ID`, `OPENALEX_API_KEY`, `ZOTERO_MCP_EMAIL`, `SEMANTIC_SCHOLAR_API_KEY`, `ZOTERO_DATA_DIR`, `ZOTERO_MCP_GRAPH_DB`, `XDG_DATA_HOME`, `PARENT_WATCHDOG_DISABLE`).
+
+- **README: Diagnostic tools section** for `check_ssl_health` and `audit_local_keys`, with SSL troubleshooting and Unpaywall `ZOTERO_MCP_EMAIL` entries in the troubleshooting table.
+
+### Changed
+
+- CI matrix drops Python 3.14 (not yet stable; `allow-prereleases` was not set). (`ci.yml`)
+- GitHub Release workflow: fixed wrong step-output expression `steps.changelog.notes.outputs.notes` → `steps.changelog.outputs.notes` that produced empty release bodies. (`release.yml`)
+- `find_duplicates` `readOnlyHint: True` annotation removed — the tool requires Web API credentials and was inconsistently annotated as read-only.
 
 ## [0.8.1] - 2026-04-29
 
