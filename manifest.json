@@ -1,6 +1,6 @@
 {
   "manifest_version": "0.3",
-  "name": "zotero-mcp",
+  "name": "zotero-mcp-plus",
   "display_name": "Zotero",
   "version": "0.8.1",
   "description": "Search, organize, cite, and analyze your Zotero library",

@@ -12,7 +12,7 @@ Add to your MCP client config (Claude Code, Claude Desktop, etc.):
 {
   "zotero": {
     "command": "uvx",
-    "args": ["--from", "git+https://github.com/alisoroushmd/zotero-mcp", "zotero-mcp"],
+    "args": ["zotero-mcp-plus"],
     "env": {
       "ZOTERO_API_KEY": "your-api-key",
       "ZOTERO_USER_ID": "your-user-id"
