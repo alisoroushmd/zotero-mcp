@@ -6,6 +6,23 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/).
 
 ## [Unreleased]
 
+### Fixed
+
+- **`get_attachment_path` now resolves `imported_url` PDFs from local storage.**
+  For attachments with `linkMode: imported_url` (the most common type — PDFs
+  downloaded via Zotero's browser connector), the Zotero API's `path` field is
+  empty. The method now falls back to constructing the real filesystem path from
+  `{ZOTERO_DATA_DIR}/storage/{attachment_key}/{filename}` and verifies the file
+  exists before returning it. Also skips `storage:` URI prefixes returned by
+  some Zotero API versions, which are not valid filesystem paths.
+  (`local_client.py:get_attachment_path`)
+
+- **`get_pdf_content` `not_found` response now includes `routes_tried`.**
+  When no PDF source is found, the response includes which routes were attempted
+  (e.g. `["local_storage_path", "web_api_download", "free_pdf_unpaywall"]`) so
+  callers can diagnose why a paywalled paper returned `not_found` instead of
+  silently failing. (`server.py:get_pdf_content`)
+
 ## [0.8.1] - 2026-04-29
 
 ### Added

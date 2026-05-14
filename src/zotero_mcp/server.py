@@ -466,6 +466,8 @@ def get_pdf_content(item_key: str, extract_text: bool = False) -> str:
             except Exception as exc:
                 logger.warning("PMCID lookup failed for item %s PMID %s: %s", item_key, pmid, exc)
 
+    routes_tried: list[str] = []
+
     # Step 2: Check for PDF attachments
     try:
         children = _read_local_or_web("get_children", item_key, item_type="attachment")
@@ -492,8 +494,10 @@ def get_pdf_content(item_key: str, extract_text: bool = False) -> str:
                     "message": "Read this PDF path",
                 }
                 return json.dumps(_maybe_extract(local_path, result))
+            routes_tried.append("local_storage_path")
         except Exception as exc:
             logger.warning("Local attachment path lookup failed for %s: %s", att_key, exc)
+            routes_tried.append("local_storage_path")
 
         # Step 4: Download from web API
         try:
@@ -526,6 +530,7 @@ def get_pdf_content(item_key: str, extract_text: bool = False) -> str:
             )
         except Exception as exc:
             logger.warning("Web PDF download failed for attachment %s: %s", att_key, exc)
+            routes_tried.append("web_api_download")
 
     # Step 5: No stored PDF — try free PDF via DOI (Unpaywall / PMC / bioRxiv)
     if doi:
@@ -559,11 +564,13 @@ def get_pdf_content(item_key: str, extract_text: bool = False) -> str:
                 )
         except Exception as exc:
             logger.warning("Free PDF download failed for DOI %s: %s", doi, exc)
+            routes_tried.append("free_pdf_unpaywall")
 
     # Step 6: No PDF found anywhere, return DOI/URL fallback
     result: dict = {
         "item_key": item_key,
         "content_source": "not_found",
+        "routes_tried": routes_tried,
         "message": "No PDF attached or available open-access. Try DOI or ask user for the file.",
     }
     if doi:

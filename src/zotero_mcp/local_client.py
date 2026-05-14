@@ -1,8 +1,11 @@
 """Reads from Zotero local API at localhost:23119."""
 
 import logging
+import os
 
 import httpx
+
+from zotero_mcp.config import get_config
 
 logger = logging.getLogger(__name__)
 
@@ -164,8 +167,23 @@ class LocalClient:
         resp = self._get(f"/users/0/items/{attachment_key}")
         data = resp.json().get("data", resp.json())
         link_mode = data.get("linkMode", "")
-        if link_mode in ("imported_file", "imported_url", "linked_file"):
-            return data.get("path", None)
+        if link_mode not in ("imported_file", "imported_url", "linked_file"):
+            return None
+
+        path = data.get("path") or ""
+        # linked_file always has an explicit path; imported items may not.
+        if path and not path.startswith("storage:"):
+            return path
+
+        # For storage-backed items (imported_url / imported_file), the API
+        # path field is empty or a "storage:KEY/file" URI. Construct the real
+        # filesystem path from ZOTERO_DATA_DIR/storage/<key>/<filename>.
+        filename = data.get("filename", "")
+        if filename:
+            data_dir = get_config().effective_zotero_data_dir
+            candidate = os.path.join(data_dir, "storage", attachment_key, filename)
+            if os.path.exists(candidate):
+                return candidate
         return None
 
 

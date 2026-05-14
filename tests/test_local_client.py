@@ -1,5 +1,7 @@
 """Tests for LocalClient — read operations via Zotero local API."""
 
+from unittest.mock import patch
+
 import httpx
 import pytest
 import respx
@@ -189,6 +191,69 @@ def test_get_attachment_path_returns_none_for_linked_url():
     )
     client = LocalClient(probe=False)
     path = client.get_attachment_path("ATT002")
+    assert path is None
+
+
+@respx.mock
+def test_get_attachment_path_constructs_storage_path_for_imported_url():
+    """For imported_url with no explicit path, construct path from ZOTERO_DATA_DIR/storage/KEY/filename."""
+    respx.get(f"{LOCAL_BASE}/users/0/items/UE89AVJC").mock(
+        return_value=httpx.Response(
+            200,
+            json={
+                "key": "UE89AVJC",
+                "data": {
+                    "key": "UE89AVJC",
+                    "itemType": "attachment",
+                    "linkMode": "imported_url",
+                    "path": "",
+                    "filename": "Canals2023.pdf",
+                    "contentType": "application/pdf",
+                },
+            },
+        )
+    )
+    client = LocalClient(probe=False)
+
+    expected = "/Users/test/Zotero/storage/UE89AVJC/Canals2023.pdf"
+    with (
+        patch("zotero_mcp.local_client.get_config") as mock_cfg,
+        patch("zotero_mcp.local_client.os.path.exists", return_value=True),
+    ):
+        mock_cfg.return_value.effective_zotero_data_dir = "/Users/test/Zotero"
+        path = client.get_attachment_path("UE89AVJC")
+
+    assert path == expected
+
+
+@respx.mock
+def test_get_attachment_path_returns_none_when_storage_file_missing():
+    """Returns None when storage path is constructed but file not on disk."""
+    respx.get(f"{LOCAL_BASE}/users/0/items/UE89AVJC").mock(
+        return_value=httpx.Response(
+            200,
+            json={
+                "key": "UE89AVJC",
+                "data": {
+                    "key": "UE89AVJC",
+                    "itemType": "attachment",
+                    "linkMode": "imported_url",
+                    "path": "",
+                    "filename": "Canals2023.pdf",
+                    "contentType": "application/pdf",
+                },
+            },
+        )
+    )
+    client = LocalClient(probe=False)
+
+    with (
+        patch("zotero_mcp.local_client.get_config") as mock_cfg,
+        patch("zotero_mcp.local_client.os.path.exists", return_value=False),
+    ):
+        mock_cfg.return_value.effective_zotero_data_dir = "/Users/test/Zotero"
+        path = client.get_attachment_path("UE89AVJC")
+
     assert path is None
 
 

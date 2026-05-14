@@ -148,6 +148,87 @@ def test_get_pdf_content_downloads_from_web():
     assert result["pdf_path"].endswith(".pdf")
 
 
+def test_get_pdf_content_finds_imported_url_pdf_in_storage_dir():
+    """imported_url attachment with no explicit path is found via ZOTERO_DATA_DIR/storage/KEY/filename."""
+    item_data = {
+        "key": "LXDHDBYE",
+        "title": "Canals 2023",
+        "DOI": "10.1016/j.compmedimag.2022.102170",
+        "extra": "",
+    }
+    children = [
+        {
+            "key": "UE89AVJC",
+            "itemType": "attachment",
+            "contentType": "application/pdf",
+            "linkMode": "imported_url",
+            "path": "",
+            "filename": "Canals2023.pdf",
+        }
+    ]
+
+    mock_web = _mock_web_client(item_data, children)
+    mock_local = MagicMock()
+    mock_local.get_item.return_value = item_data
+    mock_local.get_children.return_value = children
+    # Local API returns None for path (imported_url with no explicit path field)
+    mock_local.get_attachment_path.return_value = (
+        "/Users/LEGION/Zotero/storage/UE89AVJC/Canals2023.pdf"
+    )
+
+    import zotero_mcp.server as srv
+
+    with (
+        patch.object(srv, "_get_web", return_value=mock_web),
+        patch.object(srv, "_get_local", return_value=mock_local),
+    ):
+        result = json.loads(srv.get_pdf_content("LXDHDBYE"))
+
+    assert result["content_source"] == "local_pdf"
+    assert "UE89AVJC" in result["pdf_path"]
+    assert result["attachment_key"] == "UE89AVJC"
+
+
+def test_get_pdf_content_not_found_includes_attempted_routes():
+    """not_found response includes which routes were tried, to aid debugging."""
+    item_data = {
+        "key": "LXDHDBYE",
+        "title": "Canals 2023",
+        "DOI": "10.1016/j.compmedimag.2022.102170",
+        "url": "https://www.sciencedirect.com/article/pii/S0895611122001537",
+        "extra": "",
+    }
+    children = [
+        {
+            "key": "UE89AVJC",
+            "itemType": "attachment",
+            "contentType": "application/pdf",
+            "linkMode": "imported_url",
+            "path": "",
+            "filename": "Canals2023.pdf",
+        }
+    ]
+
+    mock_web = _mock_web_client(item_data, children)
+    mock_web.download_attachment.side_effect = Exception("403 Forbidden")
+    mock_web._download_free_pdf.side_effect = Exception("Unpaywall: no OA version")
+    mock_local = MagicMock()
+    mock_local.get_item.return_value = item_data
+    mock_local.get_children.return_value = children
+    mock_local.get_attachment_path.return_value = None
+
+    import zotero_mcp.server as srv
+
+    with (
+        patch.object(srv, "_get_web", return_value=mock_web),
+        patch.object(srv, "_get_local", return_value=mock_local),
+    ):
+        result = json.loads(srv.get_pdf_content("LXDHDBYE"))
+
+    assert result["content_source"] == "not_found"
+    assert "routes_tried" in result
+
+
 def test_get_pdf_content_returns_not_found():
     """If no PDF attached and no PMCID, return DOI/URL for manual lookup."""
     item_data = {
