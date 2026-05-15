@@ -6,6 +6,15 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/).
 
 ## [Unreleased]
 
+## [0.8.3] - 2026-05-14
+
+### Fixed
+
+- **DXT manifest schema:** renamed top-level `manifest_version` to `dxt_version`
+  to match the current `@anthropic-ai/dxt` CLI schema. The v0.8.2 release
+  workflow's `build-dxt` job failed because the CLI rejected the old field name.
+  (`manifest.json`)
+
 ## [0.8.2] - 2026-05-14
 
 ### Fixed
