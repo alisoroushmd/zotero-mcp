@@ -3,7 +3,8 @@
 # Single-source the version from installed package metadata (ZOT-10) so the
 # in-package __version__, the wheel, and manifest.json cannot drift. Falls back
 # to a literal only when running from an uninstalled source tree.
-from importlib.metadata import PackageNotFoundError, version as _pkg_version
+from importlib.metadata import PackageNotFoundError
+from importlib.metadata import version as _pkg_version
 
 try:
     __version__ = _pkg_version("zotero-mcp-plus")

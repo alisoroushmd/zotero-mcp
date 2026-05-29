@@ -2,7 +2,7 @@
   "dxt_version": "0.3",
   "name": "zotero-mcp-plus",
   "display_name": "Zotero",
-  "version": "0.8.4",
+  "version": "0.8.5",
   "description": "Search, organize, cite, and analyze your Zotero library",
   "author": {
     "name": "Ali Soroush",

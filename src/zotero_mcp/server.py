@@ -12,10 +12,11 @@ import tempfile
 import threading
 import time
 from datetime import UTC
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Annotated, Literal
 
 import httpx
 from fastmcp import FastMCP
+from pydantic import Field
 
 from zotero_mcp.capabilities import check_capabilities, format_status
 from zotero_mcp.config import get_config
@@ -149,6 +150,80 @@ def _validate_key(value: str, name: str = "key") -> None:
 def _clamp_limit(value: str | int, lo: int = 1, hi: int = 100) -> int:
     """Clamp a limit parameter to a safe range."""
     return max(lo, min(hi, int(value)))
+
+
+def _md_scalar(v) -> str:
+    if v is None:
+        return ""
+    return str(v).replace("|", "\\|").replace("\n", " ")
+
+
+def _to_markdown(obj, _depth: int = 0) -> str:
+    """Render a JSON-like result as compact markdown (audit ZOT-07).
+
+    Lists of flat dicts become tables; dicts become ``**key**: value`` lines,
+    recursing into nested structures. Generic so it works for every tool shape.
+    """
+    indent = "  " * _depth
+
+    def _flat_dicts(value) -> bool:
+        return bool(value) and all(
+            isinstance(x, dict) and all(not isinstance(v, (dict, list)) for v in x.values())
+            for x in value
+        )
+
+    if isinstance(obj, dict):
+        lines: list[str] = []
+        for key, value in obj.items():
+            if isinstance(value, list) and _flat_dicts(value):
+                cols = list({k for row in value for k in row})
+                lines.append(f"{indent}**{key}** ({len(value)}):")
+                lines.append(f"{indent}| " + " | ".join(cols) + " |")
+                lines.append(f"{indent}| " + " | ".join("---" for _ in cols) + " |")
+                for row in value:
+                    lines.append(f"{indent}| " + " | ".join(_md_scalar(row.get(c)) for c in cols) + " |")
+            elif isinstance(value, (dict, list)) and value:
+                lines.append(f"{indent}**{key}**:")
+                lines.append(_to_markdown(value, _depth + 1))
+            else:
+                lines.append(f"{indent}**{key}**: {_md_scalar(value)}")
+        return "\n".join(lines)
+    if isinstance(obj, list):
+        if _flat_dicts(obj):
+            cols = list({k for row in obj for k in row})
+            out = [f"{indent}| " + " | ".join(cols) + " |",
+                   f"{indent}| " + " | ".join("---" for _ in cols) + " |"]
+            for row in obj:
+                out.append(f"{indent}| " + " | ".join(_md_scalar(row.get(c)) for c in cols) + " |")
+            return "\n".join(out)
+        return "\n".join(f"{indent}- {_md_scalar(x)}" for x in obj)
+    return f"{indent}{_md_scalar(obj)}"
+
+
+def _render(obj, response_format: str = "json") -> str:
+    """Serialize a tool result as JSON (default) or markdown (audit ZOT-07)."""
+    if response_format == "markdown":
+        return _to_markdown(obj)
+    return json.dumps(obj, ensure_ascii=False)
+
+
+def _paginate(items: list, offset: int, limit: int) -> dict:
+    """Wrap a page of results in a pagination envelope (audit ZOT-05).
+
+    ``has_more`` is inferred from a full page (Zotero does not return a total
+    count without a separate request); ``next_offset`` is the offset to pass to
+    fetch the following page, or None when the page was not full.
+    """
+    count = len(items)
+    has_more = count == limit
+    return {
+        "items": items,
+        "count": count,
+        "offset": offset,
+        "limit": limit,
+        "has_more": has_more,
+        "next_offset": offset + limit if has_more else None,
+    }
 
 
 def _get_local() -> LocalClient:
@@ -337,16 +412,25 @@ def search_items(
     limit: str | int = 25,
     item_type: str = "",
     tag: str = "",
+    offset: Annotated[int, Field(ge=0)] = 0,
+    response_format: Literal["json", "markdown"] = "json",
 ) -> str:
-    """Search for items by keyword. Excludes attachments and notes."""
-    results = _read_local_or_web(
+    """Search for items by keyword. Excludes attachments and notes.
+
+    Returns a pagination envelope: items, count, offset, limit, has_more, and
+    next_offset (pass it back as ``offset`` to page through large libraries).
+    """
+    lim = _clamp_limit(limit)
+    off = max(0, int(offset))
+    items = _read_local_or_web(
         "search_items",
         query,
-        _clamp_limit(limit),
+        lim,
         item_type=item_type or None,
         tag=tag or None,
+        start=off,
     )
-    return json.dumps(results, ensure_ascii=False)
+    return _render(_paginate(items, offset=off, limit=lim), response_format)
 
 
 @mcp.tool(
@@ -358,13 +442,17 @@ def search_items(
     annotations=_RR,
 )
 @_handle_tool_errors
-def get_item(item_key: str, format: str = "json") -> str:
+def get_item(
+    item_key: str,
+    format: Literal["json", "bibtex"] = "json",
+    response_format: Literal["json", "markdown"] = "json",
+) -> str:
     """Get full metadata or BibTeX for one item by its key."""
     _validate_key(item_key, "item_key")
     result = _read_local_or_web("get_item", item_key.strip(), fmt=format)
     if isinstance(result, str):
         return result
-    return json.dumps(result, ensure_ascii=False)
+    return _render(result, response_format)
 
 
 @mcp.tool(
@@ -376,10 +464,10 @@ def get_item(item_key: str, format: str = "json") -> str:
     annotations=_RR,
 )
 @_handle_tool_errors
-def get_collections() -> str:
+def get_collections(response_format: Literal["json", "markdown"] = "json") -> str:
     """Returns flat list of collections with key, name, parent, and item count."""
     results = _read_local_or_web("get_collections")
-    return json.dumps(results, ensure_ascii=False)
+    return _render(results, response_format)
 
 
 @mcp.tool(
@@ -741,7 +829,11 @@ def check_retractions(item_keys: str | list[str]) -> str:
     annotations=_RR,
 )
 @_handle_tool_errors
-def get_citation_graph(item_key: str, direction: str = "both", limit: str | int = 20) -> str:
+def get_citation_graph(
+    item_key: str,
+    direction: Literal["cited_by", "references", "both"] = "both",
+    limit: str | int = 20,
+) -> str:
     """Get citing and/or referenced works for a Zotero item.
 
     Args:
@@ -817,13 +909,24 @@ def get_citation_graph(item_key: str, direction: str = "both", limit: str | int 
     annotations=_RR,
 )
 @_handle_tool_errors
-def get_collection_items(collection_key: str, limit: str | int = 100) -> str:
-    """Get items within a collection by its key."""
+def get_collection_items(
+    collection_key: str,
+    limit: str | int = 100,
+    offset: Annotated[int, Field(ge=0)] = 0,
+    response_format: Literal["json", "markdown"] = "json",
+) -> str:
+    """Get items within a collection by its key.
+
+    Returns a pagination envelope: items, count, offset, limit, has_more, and
+    next_offset (pass it back as ``offset`` to page through large collections).
+    """
     _validate_key(collection_key, "collection_key")
-    results = _read_local_or_web(
-        "get_collection_items", collection_key.strip(), _clamp_limit(limit)
+    lim = _clamp_limit(limit)
+    off = max(0, int(offset))
+    items = _read_local_or_web(
+        "get_collection_items", collection_key.strip(), lim, start=off
     )
-    return json.dumps(results, ensure_ascii=False)
+    return _render(_paginate(items, offset=off, limit=lim), response_format)
 
 
 # -- Write tools (web API) --
@@ -1150,7 +1253,7 @@ def empty_trash() -> str:
 )
 @_handle_tool_errors
 def manage_tags(
-    action: str = "list",
+    action: Literal["list", "remove", "rename"] = "list",
     tag: str = "",
     new_tag: str = "",
     prefix: str = "",
@@ -1781,7 +1884,7 @@ def _build_fulltext_index(full_rebuild: bool = False, limit: int = 0) -> dict:
 )
 @_handle_tool_errors
 def build_index(
-    type: str = "graph",
+    type: Literal["graph", "fulltext", "both"] = "graph",
     full_rebuild: bool = False,
     limit: int = 0,
 ) -> str:
@@ -1826,7 +1929,10 @@ def build_index(
 )
 @_handle_tool_errors
 def query_knowledge_graph(
-    query_type: str,
+    query_type: Literal[
+        "influential", "clusters", "bridges", "path", "neighborhood", "stats",
+        "timeline", "topic_evolution", "citation_velocity", "trending",
+    ],
     doi: str = "",
     doi_a: str = "",
     doi_b: str = "",
@@ -1836,6 +1942,7 @@ def query_knowledge_graph(
     start_year: int = 0,
     end_year: int = 0,
     years: int = 3,
+    response_format: Literal["json", "markdown"] = "json",
 ) -> str:
     """Query the knowledge graph (uses cached graph)."""
     kg = _get_or_build_kg()
@@ -1881,7 +1988,7 @@ def query_knowledge_graph(
             "stats, timeline, topic_evolution, citation_velocity, trending"
         )
 
-    return json.dumps(result, ensure_ascii=False)
+    return _render(result, response_format)
 
 
 @mcp.tool(

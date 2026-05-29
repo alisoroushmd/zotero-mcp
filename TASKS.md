@@ -8,27 +8,7 @@ Durable backlog for this repo. Severity: `[high]` / `[med]` / `[low]`.
 
 ## Backlog
 
-Deferred from the 2026-05-28 MCP best-practices audit (full evidence in
-`~/claude-memory/system/audit-reports/2026-05-28-mcp-server-audit.md`). These
-are larger refactors/feature additions, not defects; the verified defects were
-fixed on branch `audit-fixes-2026-05-28`.
-
-- `[med]` **ZOT-05 — pagination metadata.** `search_items` and
-  `get_collection_items` have no offset/total/has_more, so an agent cannot page
-  past the first `limit` results of a large library/collection. Adding it
-  cleanly means threading an `offset`/`start` param and a result envelope
-  (`{total, count, offset, items, has_more, next_offset}`) through
-  `_read_local_or_web` and BOTH the web client (read `Total-Results` header) and
-  the local client. Deferred from the audit-fix batch to avoid shipping a
-  half-correct `total` across the two read paths — do as a focused change with
-  tests for each path.
-- `[low]` **ZOT-07 — `response_format` option.** Add a `ResponseFormat` enum
-  (markdown default / json) on high-traffic read tools (`search_items`,
-  `get_item`, `get_collections`, `query_knowledge_graph`) for token efficiency.
-- `[low]` **ZOT-08 — Pydantic input models.** Replace manual validation +
-  free-string enums with Pydantic `BaseModel` inputs: `Field()` constraints and
-  `Enum`s for `direction` / `query_type` / tag `action` / `limit`, so the
-  inputSchema advertises valid choices up front. Large; do incrementally.
+(none — all 2026-05-28 audit findings resolved)
 
 ## Done
 
@@ -50,3 +30,15 @@ fixed on branch `audit-fixes-2026-05-28`.
   any writes, so a bad item can't leave a partially-committed batch. completed 2026-05-28.
 - `[low]` ZOT-01 / ZOT-02 — naming/server-name tradeoff recorded in server.py.
   completed 2026-05-28.
+- `[med]` ZOT-05 — pagination: `offset` param + `{items, count, offset, limit,
+  has_more, next_offset}` envelope on `search_items` and `get_collection_items`;
+  `start` threaded through both the web and local clients. `total` is omitted
+  (Zotero needs a separate count request); `has_more` is inferred from a full
+  page. NOTE: this changes those tools' output shape from a bare list to the
+  envelope. completed 2026-05-28.
+- `[low]` ZOT-07 — `response_format="markdown"` on search_items, get_item,
+  get_collections, get_collection_items, query_knowledge_graph via shared
+  `_render`/`_to_markdown`. completed 2026-05-28.
+- `[med→low]` ZOT-08 — typed public params with `Literal` enums (direction,
+  manage_tags action, build_index type, query_knowledge_graph query_type,
+  get_item format); runtime checks kept as defense-in-depth. completed 2026-05-28.
