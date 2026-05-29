@@ -51,12 +51,42 @@ mcp = FastMCP(
 # clients gate confirmation prompts; openWorldHint flags tools that reach
 # external/unbounded services (Zotero API, OpenAlex, CrossRef) vs. the local
 # knowledge graph / index.
-_RL = {"readOnlyHint": True, "destructiveHint": False, "idempotentHint": True, "openWorldHint": False}
-_RR = {"readOnlyHint": True, "destructiveHint": False, "idempotentHint": True, "openWorldHint": True}
-_WR = {"readOnlyHint": False, "destructiveHint": False, "idempotentHint": False, "openWorldHint": True}
-_WL = {"readOnlyHint": False, "destructiveHint": False, "idempotentHint": False, "openWorldHint": False}
-_WIR = {"readOnlyHint": False, "destructiveHint": False, "idempotentHint": True, "openWorldHint": True}
-_DR = {"readOnlyHint": False, "destructiveHint": True, "idempotentHint": False, "openWorldHint": True}
+_RL = {
+    "readOnlyHint": True,
+    "destructiveHint": False,
+    "idempotentHint": True,
+    "openWorldHint": False,
+}
+_RR = {
+    "readOnlyHint": True,
+    "destructiveHint": False,
+    "idempotentHint": True,
+    "openWorldHint": True,
+}
+_WR = {
+    "readOnlyHint": False,
+    "destructiveHint": False,
+    "idempotentHint": False,
+    "openWorldHint": True,
+}
+_WL = {
+    "readOnlyHint": False,
+    "destructiveHint": False,
+    "idempotentHint": False,
+    "openWorldHint": False,
+}
+_WIR = {
+    "readOnlyHint": False,
+    "destructiveHint": False,
+    "idempotentHint": True,
+    "openWorldHint": True,
+}
+_DR = {
+    "readOnlyHint": False,
+    "destructiveHint": True,
+    "idempotentHint": False,
+    "openWorldHint": True,
+}
 
 _local: LocalClient | None = None
 _local_failed_at: float | None = None  # time.monotonic() when probe last failed
@@ -181,7 +211,9 @@ def _to_markdown(obj, _depth: int = 0) -> str:
                 lines.append(f"{indent}| " + " | ".join(cols) + " |")
                 lines.append(f"{indent}| " + " | ".join("---" for _ in cols) + " |")
                 for row in value:
-                    lines.append(f"{indent}| " + " | ".join(_md_scalar(row.get(c)) for c in cols) + " |")
+                    lines.append(
+                        f"{indent}| " + " | ".join(_md_scalar(row.get(c)) for c in cols) + " |"
+                    )
             elif isinstance(value, (dict, list)) and value:
                 lines.append(f"{indent}**{key}**:")
                 lines.append(_to_markdown(value, _depth + 1))
@@ -191,8 +223,10 @@ def _to_markdown(obj, _depth: int = 0) -> str:
     if isinstance(obj, list):
         if _flat_dicts(obj):
             cols = list({k for row in obj for k in row})
-            out = [f"{indent}| " + " | ".join(cols) + " |",
-                   f"{indent}| " + " | ".join("---" for _ in cols) + " |"]
+            out = [
+                f"{indent}| " + " | ".join(cols) + " |",
+                f"{indent}| " + " | ".join("---" for _ in cols) + " |",
+            ]
             for row in obj:
                 out.append(f"{indent}| " + " | ".join(_md_scalar(row.get(c)) for c in cols) + " |")
             return "\n".join(out)
@@ -923,9 +957,7 @@ def get_collection_items(
     _validate_key(collection_key, "collection_key")
     lim = _clamp_limit(limit)
     off = max(0, int(offset))
-    items = _read_local_or_web(
-        "get_collection_items", collection_key.strip(), lim, start=off
-    )
+    items = _read_local_or_web("get_collection_items", collection_key.strip(), lim, start=off)
     return _render(_paginate(items, offset=off, limit=lim), response_format)
 
 
@@ -939,7 +971,7 @@ def get_collection_items(
         "bioRxiv, arXiv, publisher pages). Resolves metadata automatically and "
         "checks for duplicates. Use this when the user wants to save a paper to "
         "their library. Optional title is only used for bare URLs that can't be scraped."
-    )
+    ),
 )
 @_handle_tool_errors
 def create_item(
@@ -1077,7 +1109,7 @@ def find_duplicates(collection_key: str | None = None, limit: str | int = 100) -
     description=(
         "Create a new collection (folder) in Zotero, optionally nested under a parent. "
         "Use this when the user wants to organize papers into a new group."
-    )
+    ),
 )
 @_handle_tool_errors
 def create_collection(name: str, parent_key: str | None = None) -> str:
@@ -1533,7 +1565,7 @@ def insert_citations(document_path: str, output_path: str | None = None) -> str:
         "Use [@ITEM_KEY] markers in the content for citations. Use this when writing "
         "a new document from scratch (e.g. literature review, manuscript draft). "
         "For adding citations to an existing document, use insert_citations instead."
-    )
+    ),
 )
 @_handle_tool_errors
 def write_cited_document(content: str, output_path: str) -> str:
@@ -1930,8 +1962,16 @@ def build_index(
 @_handle_tool_errors
 def query_knowledge_graph(
     query_type: Literal[
-        "influential", "clusters", "bridges", "path", "neighborhood", "stats",
-        "timeline", "topic_evolution", "citation_velocity", "trending",
+        "influential",
+        "clusters",
+        "bridges",
+        "path",
+        "neighborhood",
+        "stats",
+        "timeline",
+        "topic_evolution",
+        "citation_velocity",
+        "trending",
     ],
     doi: str = "",
     doi_a: str = "",
@@ -2155,7 +2195,7 @@ def query_authors(
         "'authors' (author nodes + co-authorship edges), "
         "'full' (both layers, papers capped at 200 by PageRank). "
         "Requires build_index(type='graph') to have been run first."
-    )
+    ),
 )
 @_handle_tool_errors
 def export_knowledge_graph(
