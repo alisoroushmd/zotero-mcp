@@ -52,6 +52,7 @@ class LocalClient:
         limit: int = 25,
         item_type: str | None = None,
         tag: str | None = None,
+        start: int = 0,
     ) -> list[dict]:
         """Keyword search across the library. Excludes attachments and notes.
 
@@ -60,6 +61,7 @@ class LocalClient:
             limit: Max results (1–100).
             item_type: Filter by Zotero item type, e.g. "journalArticle".
             tag: Filter by tag name (exact match).
+            start: Zero-based result offset for pagination (default 0).
 
         Returns:
             List of item summary dicts.
@@ -71,6 +73,8 @@ class LocalClient:
         }
         if tag:
             params["tag"] = tag
+        if start:
+            params["start"] = start
         resp = self._get("/users/0/items", params=params)
         return [_format_summary(item) for item in resp.json()]
 
@@ -107,14 +111,19 @@ class LocalClient:
             for c in resp.json()
         ]
 
-    def get_collection_items(self, collection_key: str, limit: int = 100) -> list[dict]:
+    def get_collection_items(
+        self, collection_key: str, limit: int = 100, start: int = 0
+    ) -> list[dict]:
         """Get items in a specific collection."""
+        params: dict = {
+            "limit": limit,
+            "itemType": "-attachment || -note",
+        }
+        if start:
+            params["start"] = start
         resp = self._get(
             f"/users/0/collections/{collection_key}/items",
-            params={
-                "limit": limit,
-                "itemType": "-attachment || -note",
-            },
+            params=params,
         )
         return [_format_summary(item) for item in resp.json()]
 

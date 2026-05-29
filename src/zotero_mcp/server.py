@@ -12,10 +12,11 @@ import tempfile
 import threading
 import time
 from datetime import UTC
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Annotated, Literal
 
 import httpx
 from fastmcp import FastMCP
+from pydantic import Field
 
 from zotero_mcp.capabilities import check_capabilities, format_status
 from zotero_mcp.config import get_config
@@ -27,6 +28,12 @@ if TYPE_CHECKING:
 
 logger = logging.getLogger(__name__)
 
+# Naming note (audit 2026-05-28, findings ZOT-01 / ZOT-02): tools use bare
+# names (search_items, create_item, ...) and the server is named "zotero"
+# rather than "zotero_mcp". Both are deliberate, recorded tradeoffs: the MCP
+# host namespaces every tool by server name (clients see mcp__zotero__<tool>),
+# so collision risk is mitigated at the routing layer, and renaming would break
+# existing references in user settings and skills.
 mcp = FastMCP(
     "zotero",
     instructions=(
@@ -39,9 +46,52 @@ mcp = FastMCP(
     ),
 )
 
+# Tool annotation presets (audit ZOT-03 / ZOT-04). readOnlyHint gates whether a
+# client treats the call as side-effect-free; destructiveHint/idempotentHint let
+# clients gate confirmation prompts; openWorldHint flags tools that reach
+# external/unbounded services (Zotero API, OpenAlex, CrossRef) vs. the local
+# knowledge graph / index.
+_RL = {
+    "readOnlyHint": True,
+    "destructiveHint": False,
+    "idempotentHint": True,
+    "openWorldHint": False,
+}
+_RR = {
+    "readOnlyHint": True,
+    "destructiveHint": False,
+    "idempotentHint": True,
+    "openWorldHint": True,
+}
+_WR = {
+    "readOnlyHint": False,
+    "destructiveHint": False,
+    "idempotentHint": False,
+    "openWorldHint": True,
+}
+_WL = {
+    "readOnlyHint": False,
+    "destructiveHint": False,
+    "idempotentHint": False,
+    "openWorldHint": False,
+}
+_WIR = {
+    "readOnlyHint": False,
+    "destructiveHint": False,
+    "idempotentHint": True,
+    "openWorldHint": True,
+}
+_DR = {
+    "readOnlyHint": False,
+    "destructiveHint": True,
+    "idempotentHint": False,
+    "openWorldHint": True,
+}
+
 _local: LocalClient | None = None
 _local_failed_at: float | None = None  # time.monotonic() when probe last failed
 _LOCAL_RETRY_INTERVAL = 300.0  # retry local API probe every 5 minutes
+_MAX_PDF_TEXT_CHARS = 50_000  # cap inline extracted PDF text in responses (ZOT-06)
 _web: WebClient | None = None
 _openalex = None  # OpenAlexClient singleton — typed as Any to avoid eager import
 _openalex_lock = threading.Lock()
@@ -130,6 +180,84 @@ def _validate_key(value: str, name: str = "key") -> None:
 def _clamp_limit(value: str | int, lo: int = 1, hi: int = 100) -> int:
     """Clamp a limit parameter to a safe range."""
     return max(lo, min(hi, int(value)))
+
+
+def _md_scalar(v) -> str:
+    if v is None:
+        return ""
+    return str(v).replace("|", "\\|").replace("\n", " ")
+
+
+def _to_markdown(obj, _depth: int = 0) -> str:
+    """Render a JSON-like result as compact markdown (audit ZOT-07).
+
+    Lists of flat dicts become tables; dicts become ``**key**: value`` lines,
+    recursing into nested structures. Generic so it works for every tool shape.
+    """
+    indent = "  " * _depth
+
+    def _flat_dicts(value) -> bool:
+        return bool(value) and all(
+            isinstance(x, dict) and all(not isinstance(v, (dict, list)) for v in x.values())
+            for x in value
+        )
+
+    if isinstance(obj, dict):
+        lines: list[str] = []
+        for key, value in obj.items():
+            if isinstance(value, list) and _flat_dicts(value):
+                cols = list({k for row in value for k in row})
+                lines.append(f"{indent}**{key}** ({len(value)}):")
+                lines.append(f"{indent}| " + " | ".join(cols) + " |")
+                lines.append(f"{indent}| " + " | ".join("---" for _ in cols) + " |")
+                for row in value:
+                    lines.append(
+                        f"{indent}| " + " | ".join(_md_scalar(row.get(c)) for c in cols) + " |"
+                    )
+            elif isinstance(value, (dict, list)) and value:
+                lines.append(f"{indent}**{key}**:")
+                lines.append(_to_markdown(value, _depth + 1))
+            else:
+                lines.append(f"{indent}**{key}**: {_md_scalar(value)}")
+        return "\n".join(lines)
+    if isinstance(obj, list):
+        if _flat_dicts(obj):
+            cols = list({k for row in obj for k in row})
+            out = [
+                f"{indent}| " + " | ".join(cols) + " |",
+                f"{indent}| " + " | ".join("---" for _ in cols) + " |",
+            ]
+            for row in obj:
+                out.append(f"{indent}| " + " | ".join(_md_scalar(row.get(c)) for c in cols) + " |")
+            return "\n".join(out)
+        return "\n".join(f"{indent}- {_md_scalar(x)}" for x in obj)
+    return f"{indent}{_md_scalar(obj)}"
+
+
+def _render(obj, response_format: str = "json") -> str:
+    """Serialize a tool result as JSON (default) or markdown (audit ZOT-07)."""
+    if response_format == "markdown":
+        return _to_markdown(obj)
+    return json.dumps(obj, ensure_ascii=False)
+
+
+def _paginate(items: list, offset: int, limit: int) -> dict:
+    """Wrap a page of results in a pagination envelope (audit ZOT-05).
+
+    ``has_more`` is inferred from a full page (Zotero does not return a total
+    count without a separate request); ``next_offset`` is the offset to pass to
+    fetch the following page, or None when the page was not full.
+    """
+    count = len(items)
+    has_more = count == limit
+    return {
+        "items": items,
+        "count": count,
+        "offset": offset,
+        "limit": limit,
+        "has_more": has_more,
+        "next_offset": offset + limit if has_more else None,
+    }
 
 
 def _get_local() -> LocalClient:
@@ -275,7 +403,7 @@ def _handle_tool_errors(fn):
         "for any that are misconfigured. Use this first when tools return 'unavailable' errors "
         "or when starting a new session to verify connectivity."
     ),
-    annotations={"readOnlyHint": True},
+    annotations=_RR,
 )
 @_handle_tool_errors
 def server_status() -> str:
@@ -310,7 +438,7 @@ def _read_local_or_web(local_method: str, *args, **kwargs):
         "author, and tag matching. Filter by item_type (e.g. 'journalArticle', "
         "'book') or tag (exact tag name)."
     ),
-    annotations={"readOnlyHint": True},
+    annotations=_RR,
 )
 @_handle_tool_errors
 def search_items(
@@ -318,16 +446,25 @@ def search_items(
     limit: str | int = 25,
     item_type: str = "",
     tag: str = "",
+    offset: Annotated[int, Field(ge=0)] = 0,
+    response_format: Literal["json", "markdown"] = "json",
 ) -> str:
-    """Search for items by keyword. Excludes attachments and notes."""
-    results = _read_local_or_web(
+    """Search for items by keyword. Excludes attachments and notes.
+
+    Returns a pagination envelope: items, count, offset, limit, has_more, and
+    next_offset (pass it back as ``offset`` to page through large libraries).
+    """
+    lim = _clamp_limit(limit)
+    off = max(0, int(offset))
+    items = _read_local_or_web(
         "search_items",
         query,
-        _clamp_limit(limit),
+        lim,
         item_type=item_type or None,
         tag=tag or None,
+        start=off,
     )
-    return json.dumps(results, ensure_ascii=False)
+    return _render(_paginate(items, offset=off, limit=lim), response_format)
 
 
 @mcp.tool(
@@ -336,16 +473,20 @@ def search_items(
         "you need full bibliographic details (title, authors, DOI, abstract, dates) "
         "for a specific item. Set format='bibtex' for BibTeX export."
     ),
-    annotations={"readOnlyHint": True},
+    annotations=_RR,
 )
 @_handle_tool_errors
-def get_item(item_key: str, format: str = "json") -> str:
+def get_item(
+    item_key: str,
+    format: Literal["json", "bibtex"] = "json",
+    response_format: Literal["json", "markdown"] = "json",
+) -> str:
     """Get full metadata or BibTeX for one item by its key."""
     _validate_key(item_key, "item_key")
     result = _read_local_or_web("get_item", item_key.strip(), fmt=format)
     if isinstance(result, str):
         return result
-    return json.dumps(result, ensure_ascii=False)
+    return _render(result, response_format)
 
 
 @mcp.tool(
@@ -354,13 +495,13 @@ def get_item(item_key: str, format: str = "json") -> str:
         "parent relationships, and item counts. Use this when the user asks about their "
         "library organization or wants to browse/find a collection."
     ),
-    annotations={"readOnlyHint": True},
+    annotations=_RR,
 )
 @_handle_tool_errors
-def get_collections() -> str:
+def get_collections(response_format: Literal["json", "markdown"] = "json") -> str:
     """Returns flat list of collections with key, name, parent, and item count."""
     results = _read_local_or_web("get_collections")
-    return json.dumps(results, ensure_ascii=False)
+    return _render(results, response_format)
 
 
 @mcp.tool(
@@ -368,7 +509,7 @@ def get_collections() -> str:
         "Get all notes attached to a Zotero item. Use this when the user wants to "
         "read their annotations, reading notes, or comments on a paper."
     ),
-    annotations={"readOnlyHint": True},
+    annotations=_RR,
 )
 @_handle_tool_errors
 def get_notes(parent_key: str) -> str:
@@ -385,7 +526,7 @@ def get_notes(parent_key: str) -> str:
         "Returns availability: stored_remote_available, stored_local_available, "
         "linked_local_available, or metadata_only."
     ),
-    annotations={"readOnlyHint": True},
+    annotations=_RR,
 )
 @_handle_tool_errors
 def get_item_attachments(parent_key: str) -> str:
@@ -422,7 +563,7 @@ def get_item_attachments(parent_key: str) -> str:
         "Set extract_text=true to extract and return the text inline; "
         "otherwise returns a file path or PMCID for the caller to read."
     ),
-    annotations={"readOnlyHint": True},
+    annotations=_RR,
 )
 @_handle_tool_errors
 def get_pdf_content(item_key: str, extract_text: bool = False) -> str:
@@ -461,10 +602,24 @@ def get_pdf_content(item_key: str, extract_text: bool = False) -> str:
 
         text = extract_text_from_pdf(source)
         if text:
+            total_chars = len(text)
             result_dict["content_source"] = "extracted_text"
-            result_dict["text"] = text
             result_dict["page_count"] = text.count("\n\n") + 1
-            result_dict["char_count"] = len(text)
+            result_dict["total_chars"] = total_chars
+            # Cap inline text so a large PDF can't blow up the response (ZOT-06).
+            if total_chars > _MAX_PDF_TEXT_CHARS:
+                result_dict["text"] = text[:_MAX_PDF_TEXT_CHARS]
+                result_dict["truncated"] = True
+                result_dict["char_count"] = _MAX_PDF_TEXT_CHARS
+                result_dict["truncation_note"] = (
+                    f"Text truncated to {_MAX_PDF_TEXT_CHARS} of {total_chars} chars. "
+                    "Re-fetch without extract_text to get a file path you can read "
+                    "natively, or request a narrower section."
+                )
+            else:
+                result_dict["text"] = text
+                result_dict["truncated"] = False
+                result_dict["char_count"] = total_chars
             result_dict.pop("message", None)
         return result_dict
 
@@ -609,7 +764,7 @@ def get_pdf_content(item_key: str, extract_text: bool = False) -> str:
         "validity, before citing papers, or as part of a literature audit. "
         "Accepts one or more item keys."
     ),
-    annotations={"readOnlyHint": True},
+    annotations=_RR,
 )
 @_handle_tool_errors
 def check_retractions(item_keys: str | list[str]) -> str:
@@ -705,10 +860,14 @@ def check_retractions(item_keys: str | list[str]) -> str:
         "find related work, or trace the influence of a paper. Each result is "
         "flagged with in_library (true/false). Direction: 'cited_by', 'references', or 'both'."
     ),
-    annotations={"readOnlyHint": True},
+    annotations=_RR,
 )
 @_handle_tool_errors
-def get_citation_graph(item_key: str, direction: str = "both", limit: str | int = 20) -> str:
+def get_citation_graph(
+    item_key: str,
+    direction: Literal["cited_by", "references", "both"] = "both",
+    limit: str | int = 20,
+) -> str:
     """Get citing and/or referenced works for a Zotero item.
 
     Args:
@@ -781,28 +940,38 @@ def get_citation_graph(item_key: str, direction: str = "both", limit: str | int 
         "List all items in a specific Zotero collection by its key. Use this when "
         "the user wants to see what's in a particular folder/collection."
     ),
-    annotations={"readOnlyHint": True},
+    annotations=_RR,
 )
 @_handle_tool_errors
-def get_collection_items(collection_key: str, limit: str | int = 100) -> str:
-    """Get items within a collection by its key."""
+def get_collection_items(
+    collection_key: str,
+    limit: str | int = 100,
+    offset: Annotated[int, Field(ge=0)] = 0,
+    response_format: Literal["json", "markdown"] = "json",
+) -> str:
+    """Get items within a collection by its key.
+
+    Returns a pagination envelope: items, count, offset, limit, has_more, and
+    next_offset (pass it back as ``offset`` to page through large collections).
+    """
     _validate_key(collection_key, "collection_key")
-    results = _read_local_or_web(
-        "get_collection_items", collection_key.strip(), _clamp_limit(limit)
-    )
-    return json.dumps(results, ensure_ascii=False)
+    lim = _clamp_limit(limit)
+    off = max(0, int(offset))
+    items = _read_local_or_web("get_collection_items", collection_key.strip(), lim, start=off)
+    return _render(_paginate(items, offset=off, limit=lim), response_format)
 
 
 # -- Write tools (web API) --
 
 
 @mcp.tool(
+    annotations=_WR,
     description=(
         "Add a paper to Zotero from any identifier: DOI, PMID, or URL (PubMed, "
         "bioRxiv, arXiv, publisher pages). Resolves metadata automatically and "
         "checks for duplicates. Use this when the user wants to save a paper to "
         "their library. Optional title is only used for bare URLs that can't be scraped."
-    )
+    ),
 )
 @_handle_tool_errors
 def create_item(
@@ -826,6 +995,7 @@ def create_item(
 
 
 @mcp.tool(
+    annotations=_WR,
     description=(
         "Create a Zotero item with manually provided metadata fields. Use this "
         "instead of create_item when you have structured metadata already (e.g. from "
@@ -875,6 +1045,7 @@ def create_item_manual(
 
 
 @mcp.tool(
+    annotations=_WR,
     description=(
         "Create a note attached to a Zotero item. Use this to save reading notes, "
         "summaries, or annotations on a paper. Supports HTML or plain text content."
@@ -894,6 +1065,7 @@ def create_note(
 
 
 @mcp.tool(
+    annotations=_WR,
     description=(
         "Add tags and/or move multiple items to a collection in one operation. "
         "Use this for bulk organization — e.g. tagging a set of search results or "
@@ -914,6 +1086,7 @@ def batch_organize(
 
 
 @mcp.tool(
+    annotations=_RR,
     description=(
         "Scan the Zotero library for duplicate items using DOI match and title "
         "similarity (>85%). Use this when the user wants to clean up their library "
@@ -932,10 +1105,11 @@ def find_duplicates(collection_key: str | None = None, limit: str | int = 100) -
 
 
 @mcp.tool(
+    annotations=_WR,
     description=(
         "Create a new collection (folder) in Zotero, optionally nested under a parent. "
         "Use this when the user wants to organize papers into a new group."
-    )
+    ),
 )
 @_handle_tool_errors
 def create_collection(name: str, parent_key: str | None = None) -> str:
@@ -945,6 +1119,7 @@ def create_collection(name: str, parent_key: str | None = None) -> str:
 
 
 @mcp.tool(
+    annotations=_RR,
     description=(
         "Diagnose Python SSL/TLS certificate configuration. Use when any tool "
         "reports CERTIFICATE_VERIFY_FAILED, SSL errors, or HTTPS failures "
@@ -966,6 +1141,7 @@ def check_ssl_health(probe: bool = True) -> str:
 
 
 @mcp.tool(
+    annotations=_RL,
     description=(
         "Audit the local Zotero SQLite database for collection/item keys that "
         "contain forbidden characters (0, 1, I, O). Such keys are rejected by "
@@ -989,6 +1165,7 @@ def audit_local_keys(include_items: bool = True) -> str:
 
 
 @mcp.tool(
+    annotations=_WIR,
     description=(
         "Add an existing Zotero item to a collection. Use this to organize a paper "
         "into a folder without moving it from other collections."
@@ -1041,6 +1218,7 @@ _ALLOWED_UPDATE_FIELDS = {
 
 
 @mcp.tool(
+    annotations=_DR,
     description=(
         "Update metadata fields on an existing Zotero item. Use this to correct "
         "titles, authors, dates, DOIs, or other bibliographic fields. "
@@ -1062,6 +1240,7 @@ def update_item(item_key: str, fields: dict) -> str:
 
 
 @mcp.tool(
+    annotations=_DR,
     description=(
         "Move Zotero items to trash (reversible). Use this when the user wants to "
         "delete papers. Accepts one or more item keys. Items can be restored from "
@@ -1085,7 +1264,7 @@ def trash_items(item_keys: str | list[str]) -> str:
         "Permanently delete ALL items in the Zotero trash. THIS IS IRREVERSIBLE. "
         "Always confirm with the user before calling this tool."
     ),
-    annotations={"destructiveHint": True},
+    annotations=_DR,
 )
 @_handle_tool_errors
 def empty_trash() -> str:
@@ -1095,6 +1274,7 @@ def empty_trash() -> str:
 
 
 @mcp.tool(
+    annotations=_WR,
     description=(
         "Manage tags in your Zotero library. Use this when the user asks about tags, "
         "wants to list/filter tags, remove a tag from all items, or rename a tag. "
@@ -1105,7 +1285,7 @@ def empty_trash() -> str:
 )
 @_handle_tool_errors
 def manage_tags(
-    action: str = "list",
+    action: Literal["list", "remove", "rename"] = "list",
     tag: str = "",
     new_tag: str = "",
     prefix: str = "",
@@ -1143,7 +1323,7 @@ def manage_tags(
         "a final journal version exists. Reports published DOI, journal name, and "
         "whether the published version is already in the library. Uses CrossRef and OpenAlex."
     ),
-    annotations={"readOnlyHint": True},
+    annotations=_RR,
 )
 @_handle_tool_errors
 def check_published_versions(item_keys: str | list[str]) -> str:
@@ -1232,6 +1412,7 @@ def check_published_versions(item_keys: str | list[str]) -> str:
 
 
 @mcp.tool(
+    annotations=_WR,
     description=(
         "Attach a PDF to a Zotero item. Can auto-download a free PDF via "
         "Unpaywall/PMC/bioRxiv, or accept a local file path. Use this when "
@@ -1297,6 +1478,7 @@ def _fetch_item_metadata(item_keys: list[str]) -> tuple[dict[str, dict], list[st
 
 
 @mcp.tool(
+    annotations=_WL,
     description=(
         "Insert live Zotero citation field codes into an existing Word document. "
         "Finds [@ITEM_KEY] markers in the .docx and replaces them with Zotero "
@@ -1377,12 +1559,13 @@ def insert_citations(document_path: str, output_path: str | None = None) -> str:
 
 
 @mcp.tool(
+    annotations=_WL,
     description=(
         "Create a new Word document from markdown text with live Zotero citations. "
         "Use [@ITEM_KEY] markers in the content for citations. Use this when writing "
         "a new document from scratch (e.g. literature review, manuscript draft). "
         "For adding citations to an existing document, use insert_citations instead."
-    )
+    ),
 )
 @_handle_tool_errors
 def write_cited_document(content: str, output_path: str) -> str:
@@ -1719,6 +1902,7 @@ def _build_fulltext_index(full_rebuild: bool = False, limit: int = 0) -> dict:
 
 
 @mcp.tool(
+    annotations=_WL,
     description=(
         "Build or update indexes for your Zotero library. Use this after adding "
         "new papers to enable graph queries and full-text search. "
@@ -1732,7 +1916,7 @@ def _build_fulltext_index(full_rebuild: bool = False, limit: int = 0) -> dict:
 )
 @_handle_tool_errors
 def build_index(
-    type: str = "graph",
+    type: Literal["graph", "fulltext", "both"] = "graph",
     full_rebuild: bool = False,
     limit: int = 0,
 ) -> str:
@@ -1777,7 +1961,18 @@ def build_index(
 )
 @_handle_tool_errors
 def query_knowledge_graph(
-    query_type: str,
+    query_type: Literal[
+        "influential",
+        "clusters",
+        "bridges",
+        "path",
+        "neighborhood",
+        "stats",
+        "timeline",
+        "topic_evolution",
+        "citation_velocity",
+        "trending",
+    ],
     doi: str = "",
     doi_a: str = "",
     doi_b: str = "",
@@ -1787,6 +1982,7 @@ def query_knowledge_graph(
     start_year: int = 0,
     end_year: int = 0,
     years: int = 3,
+    response_format: Literal["json", "markdown"] = "json",
 ) -> str:
     """Query the knowledge graph (uses cached graph)."""
     kg = _get_or_build_kg()
@@ -1832,7 +2028,7 @@ def query_knowledge_graph(
             "stats, timeline, topic_evolution, citation_velocity, trending"
         )
 
-    return json.dumps(result, ensure_ascii=False)
+    return _render(result, response_format)
 
 
 @mcp.tool(
@@ -1843,7 +2039,7 @@ def query_knowledge_graph(
         "Provide one or more item keys as seeds — the more seeds, the better "
         "the recommendations. Each result is flagged with in_library (true/false)."
     ),
-    annotations={"readOnlyHint": True},
+    annotations=_RR,
 )
 @_handle_tool_errors
 def find_related_papers(
@@ -1913,7 +2109,7 @@ def find_related_papers(
         "Returns matching papers with highlighted text snippets. "
         "Requires build_index(type='fulltext') to be run first."
     ),
-    annotations={"readOnlyHint": True},
+    annotations=_RL,
 )
 @_handle_tool_errors
 def search_fulltext(query: str, limit: str | int = 20) -> str:
@@ -1990,6 +2186,7 @@ def query_authors(
 
 
 @mcp.tool(
+    annotations=_RL,
     description=(
         "Export the knowledge graph as an interactive HTML visualization that opens "
         "in any browser. Use this when the user wants to see their citation network "
@@ -1998,7 +2195,7 @@ def query_authors(
         "'authors' (author nodes + co-authorship edges), "
         "'full' (both layers, papers capped at 200 by PageRank). "
         "Requires build_index(type='graph') to have been run first."
-    )
+    ),
 )
 @_handle_tool_errors
 def export_knowledge_graph(
@@ -2052,7 +2249,7 @@ def export_knowledge_graph(
         "(conditions, drugs, genes, biomarkers, methods, outcomes) from the returned "
         "abstracts and save them with store_entities."
     ),
-    annotations={"readOnlyHint": True},
+    annotations=_RR,
 )
 @_handle_tool_errors
 def get_unextracted_abstracts(limit: str | int = 50) -> str:
@@ -2078,6 +2275,7 @@ def get_unextracted_abstracts(limit: str | int = 50) -> str:
 
 
 @mcp.tool(
+    annotations=_WL,
     description=(
         "Store extracted biomedical entities for papers. Call this after extracting "
         "entities from abstracts (via get_unextracted_abstracts or any paper reading). "
@@ -2107,6 +2305,18 @@ def store_entities(results: str | list) -> str:
         {"condition", "biomarker", "drug", "method", "gene", "organism", "outcome", "dataset"}
     )
 
+    # Validate every entity type BEFORE opening the store (ZOT-12). upsert_*
+    # commits per row with no enclosing transaction, so raising mid-loop would
+    # leave a partially-written batch. Fail up front instead, making retries safe.
+    for item in results:
+        for ent in item.get("entities", []) or []:
+            ent_type = ent.get("type", "").strip().lower()
+            if ent.get("name", "").strip() and ent_type and ent_type not in _VALID_ENTITY_TYPES:
+                raise ValueError(
+                    f"Invalid entity type: {ent_type!r}. "
+                    f"Must be one of: {', '.join(sorted(_VALID_ENTITY_TYPES))}"
+                )
+
     papers_stored = 0
     entities_created = 0
     entities_reused = 0
@@ -2126,11 +2336,6 @@ def store_entities(results: str | list) -> str:
                 ent_type = ent.get("type", "").strip().lower()
                 if not ent_name or not ent_type:
                     continue
-                if ent_type not in _VALID_ENTITY_TYPES:
-                    raise ValueError(
-                        f"Invalid entity type: {ent_type!r}. "
-                        f"Must be one of: {', '.join(sorted(_VALID_ENTITY_TYPES))}"
-                    )
 
                 already_exists = store.entity_exists(ent_name, ent_type)
                 entity_id = store.upsert_entity(ent_name, ent_type)
@@ -2168,7 +2373,7 @@ def store_entities(results: str | list) -> str:
         "'shared_entities' (entities shared by two papers — requires doi_a and doi_b), "
         "'paper_entities' (all entities extracted from a paper — requires doi)."
     ),
-    annotations={"readOnlyHint": True},
+    annotations=_RL,
 )
 @_handle_tool_errors
 def search_entities(

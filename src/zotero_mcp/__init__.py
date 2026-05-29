@@ -1,6 +1,15 @@
 """Zotero MCP Server — Web API primary, local API optional fast path."""
 
-__version__ = "0.8.1"
+# Single-source the version from installed package metadata (ZOT-10) so the
+# in-package __version__, the wheel, and manifest.json cannot drift. Falls back
+# to a literal only when running from an uninstalled source tree.
+from importlib.metadata import PackageNotFoundError
+from importlib.metadata import version as _pkg_version
+
+try:
+    __version__ = _pkg_version("zotero-mcp-plus")
+except PackageNotFoundError:  # pragma: no cover — uninstalled source tree
+    __version__ = "0.0.0+unknown"
 
 # Opportunistically use the OS trust store for SSL verification. Fixes
 # CERTIFICATE_VERIFY_FAILED for third-party hosts (Nature, PMC, bioRxiv,

@@ -245,6 +245,7 @@ class WebClient:
         limit: int = 25,
         item_type: str | None = None,
         tag: str | None = None,
+        start: int = 0,
     ) -> list[dict]:
         """Search items via Web API. Excludes attachments and notes.
 
@@ -253,6 +254,7 @@ class WebClient:
             limit: Max results (1–100).
             item_type: Filter by Zotero item type, e.g. "journalArticle".
             tag: Filter by tag name (exact match).
+            start: Zero-based result offset for pagination (default 0).
 
         Returns:
             List of item summary dicts.
@@ -264,6 +266,8 @@ class WebClient:
             params["itemType"] = item_type
         if tag:
             params["tag"] = tag
+        if start:
+            params["start"] = start
         resp = self._web_client.get(
             "/items/top",
             params=params,
@@ -298,13 +302,18 @@ class WebClient:
             for c in resp.json()
         ]
 
-    def get_collection_items(self, collection_key: str, limit: int = 100) -> list[dict]:
+    def get_collection_items(
+        self, collection_key: str, limit: int = 100, start: int = 0
+    ) -> list[dict]:
         """Get items in a collection via Web API."""
         from zotero_mcp.local_client import _format_summary
 
+        params: dict = {"limit": limit}
+        if start:
+            params["start"] = start
         resp = self._web_client.get(
             f"/collections/{collection_key}/items/top",
-            params={"limit": limit},
+            params=params,
         )
         resp.raise_for_status()
         return [_format_summary(item) for item in resp.json()]
