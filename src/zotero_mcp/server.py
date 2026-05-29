@@ -27,6 +27,12 @@ if TYPE_CHECKING:
 
 logger = logging.getLogger(__name__)
 
+# Naming note (audit 2026-05-28, findings ZOT-01 / ZOT-02): tools use bare
+# names (search_items, create_item, ...) and the server is named "zotero"
+# rather than "zotero_mcp". Both are deliberate, recorded tradeoffs: the MCP
+# host namespaces every tool by server name (clients see mcp__zotero__<tool>),
+# so collision risk is mitigated at the routing layer, and renaming would break
+# existing references in user settings and skills.
 mcp = FastMCP(
     "zotero",
     instructions=(
@@ -39,9 +45,22 @@ mcp = FastMCP(
     ),
 )
 
+# Tool annotation presets (audit ZOT-03 / ZOT-04). readOnlyHint gates whether a
+# client treats the call as side-effect-free; destructiveHint/idempotentHint let
+# clients gate confirmation prompts; openWorldHint flags tools that reach
+# external/unbounded services (Zotero API, OpenAlex, CrossRef) vs. the local
+# knowledge graph / index.
+_RL = {"readOnlyHint": True, "destructiveHint": False, "idempotentHint": True, "openWorldHint": False}
+_RR = {"readOnlyHint": True, "destructiveHint": False, "idempotentHint": True, "openWorldHint": True}
+_WR = {"readOnlyHint": False, "destructiveHint": False, "idempotentHint": False, "openWorldHint": True}
+_WL = {"readOnlyHint": False, "destructiveHint": False, "idempotentHint": False, "openWorldHint": False}
+_WIR = {"readOnlyHint": False, "destructiveHint": False, "idempotentHint": True, "openWorldHint": True}
+_DR = {"readOnlyHint": False, "destructiveHint": True, "idempotentHint": False, "openWorldHint": True}
+
 _local: LocalClient | None = None
 _local_failed_at: float | None = None  # time.monotonic() when probe last failed
 _LOCAL_RETRY_INTERVAL = 300.0  # retry local API probe every 5 minutes
+_MAX_PDF_TEXT_CHARS = 50_000  # cap inline extracted PDF text in responses (ZOT-06)
 _web: WebClient | None = None
 _openalex = None  # OpenAlexClient singleton — typed as Any to avoid eager import
 _openalex_lock = threading.Lock()
@@ -275,7 +294,7 @@ def _handle_tool_errors(fn):
         "for any that are misconfigured. Use this first when tools return 'unavailable' errors "
         "or when starting a new session to verify connectivity."
     ),
-    annotations={"readOnlyHint": True},
+    annotations=_RR,
 )
 @_handle_tool_errors
 def server_status() -> str:
@@ -310,7 +329,7 @@ def _read_local_or_web(local_method: str, *args, **kwargs):
         "author, and tag matching. Filter by item_type (e.g. 'journalArticle', "
         "'book') or tag (exact tag name)."
     ),
-    annotations={"readOnlyHint": True},
+    annotations=_RR,
 )
 @_handle_tool_errors
 def search_items(
@@ -336,7 +355,7 @@ def search_items(
         "you need full bibliographic details (title, authors, DOI, abstract, dates) "
         "for a specific item. Set format='bibtex' for BibTeX export."
     ),
-    annotations={"readOnlyHint": True},
+    annotations=_RR,
 )
 @_handle_tool_errors
 def get_item(item_key: str, format: str = "json") -> str:
@@ -354,7 +373,7 @@ def get_item(item_key: str, format: str = "json") -> str:
         "parent relationships, and item counts. Use this when the user asks about their "
         "library organization or wants to browse/find a collection."
     ),
-    annotations={"readOnlyHint": True},
+    annotations=_RR,
 )
 @_handle_tool_errors
 def get_collections() -> str:
@@ -368,7 +387,7 @@ def get_collections() -> str:
         "Get all notes attached to a Zotero item. Use this when the user wants to "
         "read their annotations, reading notes, or comments on a paper."
     ),
-    annotations={"readOnlyHint": True},
+    annotations=_RR,
 )
 @_handle_tool_errors
 def get_notes(parent_key: str) -> str:
@@ -385,7 +404,7 @@ def get_notes(parent_key: str) -> str:
         "Returns availability: stored_remote_available, stored_local_available, "
         "linked_local_available, or metadata_only."
     ),
-    annotations={"readOnlyHint": True},
+    annotations=_RR,
 )
 @_handle_tool_errors
 def get_item_attachments(parent_key: str) -> str:
@@ -422,7 +441,7 @@ def get_item_attachments(parent_key: str) -> str:
         "Set extract_text=true to extract and return the text inline; "
         "otherwise returns a file path or PMCID for the caller to read."
     ),
-    annotations={"readOnlyHint": True},
+    annotations=_RR,
 )
 @_handle_tool_errors
 def get_pdf_content(item_key: str, extract_text: bool = False) -> str:
@@ -461,10 +480,24 @@ def get_pdf_content(item_key: str, extract_text: bool = False) -> str:
 
         text = extract_text_from_pdf(source)
         if text:
+            total_chars = len(text)
             result_dict["content_source"] = "extracted_text"
-            result_dict["text"] = text
             result_dict["page_count"] = text.count("\n\n") + 1
-            result_dict["char_count"] = len(text)
+            result_dict["total_chars"] = total_chars
+            # Cap inline text so a large PDF can't blow up the response (ZOT-06).
+            if total_chars > _MAX_PDF_TEXT_CHARS:
+                result_dict["text"] = text[:_MAX_PDF_TEXT_CHARS]
+                result_dict["truncated"] = True
+                result_dict["char_count"] = _MAX_PDF_TEXT_CHARS
+                result_dict["truncation_note"] = (
+                    f"Text truncated to {_MAX_PDF_TEXT_CHARS} of {total_chars} chars. "
+                    "Re-fetch without extract_text to get a file path you can read "
+                    "natively, or request a narrower section."
+                )
+            else:
+                result_dict["text"] = text
+                result_dict["truncated"] = False
+                result_dict["char_count"] = total_chars
             result_dict.pop("message", None)
         return result_dict
 
@@ -609,7 +642,7 @@ def get_pdf_content(item_key: str, extract_text: bool = False) -> str:
         "validity, before citing papers, or as part of a literature audit. "
         "Accepts one or more item keys."
     ),
-    annotations={"readOnlyHint": True},
+    annotations=_RR,
 )
 @_handle_tool_errors
 def check_retractions(item_keys: str | list[str]) -> str:
@@ -705,7 +738,7 @@ def check_retractions(item_keys: str | list[str]) -> str:
         "find related work, or trace the influence of a paper. Each result is "
         "flagged with in_library (true/false). Direction: 'cited_by', 'references', or 'both'."
     ),
-    annotations={"readOnlyHint": True},
+    annotations=_RR,
 )
 @_handle_tool_errors
 def get_citation_graph(item_key: str, direction: str = "both", limit: str | int = 20) -> str:
@@ -781,7 +814,7 @@ def get_citation_graph(item_key: str, direction: str = "both", limit: str | int 
         "List all items in a specific Zotero collection by its key. Use this when "
         "the user wants to see what's in a particular folder/collection."
     ),
-    annotations={"readOnlyHint": True},
+    annotations=_RR,
 )
 @_handle_tool_errors
 def get_collection_items(collection_key: str, limit: str | int = 100) -> str:
@@ -797,6 +830,7 @@ def get_collection_items(collection_key: str, limit: str | int = 100) -> str:
 
 
 @mcp.tool(
+    annotations=_WR,
     description=(
         "Add a paper to Zotero from any identifier: DOI, PMID, or URL (PubMed, "
         "bioRxiv, arXiv, publisher pages). Resolves metadata automatically and "
@@ -826,6 +860,7 @@ def create_item(
 
 
 @mcp.tool(
+    annotations=_WR,
     description=(
         "Create a Zotero item with manually provided metadata fields. Use this "
         "instead of create_item when you have structured metadata already (e.g. from "
@@ -875,6 +910,7 @@ def create_item_manual(
 
 
 @mcp.tool(
+    annotations=_WR,
     description=(
         "Create a note attached to a Zotero item. Use this to save reading notes, "
         "summaries, or annotations on a paper. Supports HTML or plain text content."
@@ -894,6 +930,7 @@ def create_note(
 
 
 @mcp.tool(
+    annotations=_WR,
     description=(
         "Add tags and/or move multiple items to a collection in one operation. "
         "Use this for bulk organization — e.g. tagging a set of search results or "
@@ -914,6 +951,7 @@ def batch_organize(
 
 
 @mcp.tool(
+    annotations=_RR,
     description=(
         "Scan the Zotero library for duplicate items using DOI match and title "
         "similarity (>85%). Use this when the user wants to clean up their library "
@@ -932,6 +970,7 @@ def find_duplicates(collection_key: str | None = None, limit: str | int = 100) -
 
 
 @mcp.tool(
+    annotations=_WR,
     description=(
         "Create a new collection (folder) in Zotero, optionally nested under a parent. "
         "Use this when the user wants to organize papers into a new group."
@@ -945,6 +984,7 @@ def create_collection(name: str, parent_key: str | None = None) -> str:
 
 
 @mcp.tool(
+    annotations=_RR,
     description=(
         "Diagnose Python SSL/TLS certificate configuration. Use when any tool "
         "reports CERTIFICATE_VERIFY_FAILED, SSL errors, or HTTPS failures "
@@ -966,6 +1006,7 @@ def check_ssl_health(probe: bool = True) -> str:
 
 
 @mcp.tool(
+    annotations=_RL,
     description=(
         "Audit the local Zotero SQLite database for collection/item keys that "
         "contain forbidden characters (0, 1, I, O). Such keys are rejected by "
@@ -989,6 +1030,7 @@ def audit_local_keys(include_items: bool = True) -> str:
 
 
 @mcp.tool(
+    annotations=_WIR,
     description=(
         "Add an existing Zotero item to a collection. Use this to organize a paper "
         "into a folder without moving it from other collections."
@@ -1041,6 +1083,7 @@ _ALLOWED_UPDATE_FIELDS = {
 
 
 @mcp.tool(
+    annotations=_DR,
     description=(
         "Update metadata fields on an existing Zotero item. Use this to correct "
         "titles, authors, dates, DOIs, or other bibliographic fields. "
@@ -1062,6 +1105,7 @@ def update_item(item_key: str, fields: dict) -> str:
 
 
 @mcp.tool(
+    annotations=_DR,
     description=(
         "Move Zotero items to trash (reversible). Use this when the user wants to "
         "delete papers. Accepts one or more item keys. Items can be restored from "
@@ -1085,7 +1129,7 @@ def trash_items(item_keys: str | list[str]) -> str:
         "Permanently delete ALL items in the Zotero trash. THIS IS IRREVERSIBLE. "
         "Always confirm with the user before calling this tool."
     ),
-    annotations={"destructiveHint": True},
+    annotations=_DR,
 )
 @_handle_tool_errors
 def empty_trash() -> str:
@@ -1095,6 +1139,7 @@ def empty_trash() -> str:
 
 
 @mcp.tool(
+    annotations=_WR,
     description=(
         "Manage tags in your Zotero library. Use this when the user asks about tags, "
         "wants to list/filter tags, remove a tag from all items, or rename a tag. "
@@ -1143,7 +1188,7 @@ def manage_tags(
         "a final journal version exists. Reports published DOI, journal name, and "
         "whether the published version is already in the library. Uses CrossRef and OpenAlex."
     ),
-    annotations={"readOnlyHint": True},
+    annotations=_RR,
 )
 @_handle_tool_errors
 def check_published_versions(item_keys: str | list[str]) -> str:
@@ -1232,6 +1277,7 @@ def check_published_versions(item_keys: str | list[str]) -> str:
 
 
 @mcp.tool(
+    annotations=_WR,
     description=(
         "Attach a PDF to a Zotero item. Can auto-download a free PDF via "
         "Unpaywall/PMC/bioRxiv, or accept a local file path. Use this when "
@@ -1297,6 +1343,7 @@ def _fetch_item_metadata(item_keys: list[str]) -> tuple[dict[str, dict], list[st
 
 
 @mcp.tool(
+    annotations=_WL,
     description=(
         "Insert live Zotero citation field codes into an existing Word document. "
         "Finds [@ITEM_KEY] markers in the .docx and replaces them with Zotero "
@@ -1377,6 +1424,7 @@ def insert_citations(document_path: str, output_path: str | None = None) -> str:
 
 
 @mcp.tool(
+    annotations=_WL,
     description=(
         "Create a new Word document from markdown text with live Zotero citations. "
         "Use [@ITEM_KEY] markers in the content for citations. Use this when writing "
@@ -1719,6 +1767,7 @@ def _build_fulltext_index(full_rebuild: bool = False, limit: int = 0) -> dict:
 
 
 @mcp.tool(
+    annotations=_WL,
     description=(
         "Build or update indexes for your Zotero library. Use this after adding "
         "new papers to enable graph queries and full-text search. "
@@ -1843,7 +1892,7 @@ def query_knowledge_graph(
         "Provide one or more item keys as seeds — the more seeds, the better "
         "the recommendations. Each result is flagged with in_library (true/false)."
     ),
-    annotations={"readOnlyHint": True},
+    annotations=_RR,
 )
 @_handle_tool_errors
 def find_related_papers(
@@ -1913,7 +1962,7 @@ def find_related_papers(
         "Returns matching papers with highlighted text snippets. "
         "Requires build_index(type='fulltext') to be run first."
     ),
-    annotations={"readOnlyHint": True},
+    annotations=_RL,
 )
 @_handle_tool_errors
 def search_fulltext(query: str, limit: str | int = 20) -> str:
@@ -1990,6 +2039,7 @@ def query_authors(
 
 
 @mcp.tool(
+    annotations=_RL,
     description=(
         "Export the knowledge graph as an interactive HTML visualization that opens "
         "in any browser. Use this when the user wants to see their citation network "
@@ -2052,7 +2102,7 @@ def export_knowledge_graph(
         "(conditions, drugs, genes, biomarkers, methods, outcomes) from the returned "
         "abstracts and save them with store_entities."
     ),
-    annotations={"readOnlyHint": True},
+    annotations=_RR,
 )
 @_handle_tool_errors
 def get_unextracted_abstracts(limit: str | int = 50) -> str:
@@ -2078,6 +2128,7 @@ def get_unextracted_abstracts(limit: str | int = 50) -> str:
 
 
 @mcp.tool(
+    annotations=_WL,
     description=(
         "Store extracted biomedical entities for papers. Call this after extracting "
         "entities from abstracts (via get_unextracted_abstracts or any paper reading). "
@@ -2107,6 +2158,18 @@ def store_entities(results: str | list) -> str:
         {"condition", "biomarker", "drug", "method", "gene", "organism", "outcome", "dataset"}
     )
 
+    # Validate every entity type BEFORE opening the store (ZOT-12). upsert_*
+    # commits per row with no enclosing transaction, so raising mid-loop would
+    # leave a partially-written batch. Fail up front instead, making retries safe.
+    for item in results:
+        for ent in item.get("entities", []) or []:
+            ent_type = ent.get("type", "").strip().lower()
+            if ent.get("name", "").strip() and ent_type and ent_type not in _VALID_ENTITY_TYPES:
+                raise ValueError(
+                    f"Invalid entity type: {ent_type!r}. "
+                    f"Must be one of: {', '.join(sorted(_VALID_ENTITY_TYPES))}"
+                )
+
     papers_stored = 0
     entities_created = 0
     entities_reused = 0
@@ -2126,11 +2189,6 @@ def store_entities(results: str | list) -> str:
                 ent_type = ent.get("type", "").strip().lower()
                 if not ent_name or not ent_type:
                     continue
-                if ent_type not in _VALID_ENTITY_TYPES:
-                    raise ValueError(
-                        f"Invalid entity type: {ent_type!r}. "
-                        f"Must be one of: {', '.join(sorted(_VALID_ENTITY_TYPES))}"
-                    )
 
                 already_exists = store.entity_exists(ent_name, ent_type)
                 entity_id = store.upsert_entity(ent_name, ent_type)
@@ -2168,7 +2226,7 @@ def store_entities(results: str | list) -> str:
         "'shared_entities' (entities shared by two papers — requires doi_a and doi_b), "
         "'paper_entities' (all entities extracted from a paper — requires doi)."
     ),
-    annotations={"readOnlyHint": True},
+    annotations=_RL,
 )
 @_handle_tool_errors
 def search_entities(

@@ -165,8 +165,24 @@ def format_status(caps: ServerCapabilities) -> dict:
         else:
             unavailable_tools.append(entry)
 
+    # Surface soft-config warnings the LLM can relay to the user (ZOT-11).
+    warnings: list[str] = []
+    cfg = load_config()
+    if not cfg.has_openalex:
+        warnings.append(
+            "OPENALEX_API_KEY not set — knowledge graph, citation graph, and "
+            "retraction checks will fail. Free key: https://openalex.org/users/me"
+        )
+    if cfg.polite_email == "zotero-mcp@example.com":
+        warnings.append(
+            "Polite-pool email is the placeholder 'zotero-mcp@example.com'. "
+            "Free full-text PDF lookup (Unpaywall) is disabled and external "
+            "rate limits are lower. Set ZOTERO_MCP_EMAIL to a real contact email."
+        )
+
     return {
         "modes": modes,
         "available_tools": available_tools,
         "unavailable_tools": unavailable_tools,
+        "warnings": warnings,
     }

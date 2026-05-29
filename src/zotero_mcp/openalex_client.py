@@ -54,9 +54,22 @@ class OpenAlexClient:
             resp = self._client.get(f"/works/doi:{doi}")
             if resp.status_code == 404:
                 return None
+            # Surface auth failures instead of swallowing them as "not found"
+            # (ZOT-09). OpenAlex requires a key as of 2026; without a valid one
+            # every call 401/403s, which is indistinguishable from a real 404
+            # unless we report it.
+            if resp.status_code in (401, 403):
+                logger.error(
+                    "OpenAlex auth failed (HTTP %s) for DOI %s", resp.status_code, doi
+                )
+                raise RuntimeError(
+                    f"OpenAlex authentication failed (HTTP {resp.status_code}). "
+                    "OpenAlex requires a free API key as of 2026: register at "
+                    "https://openalex.org/users/me and set OPENALEX_API_KEY."
+                )
             resp.raise_for_status()
             return resp.json()
-        except Exception:
+        except httpx.HTTPError:
             logger.warning("OpenAlex lookup failed for DOI %s", doi)
             return None
 

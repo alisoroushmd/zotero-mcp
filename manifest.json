@@ -2,7 +2,7 @@
   "dxt_version": "0.3",
   "name": "zotero-mcp-plus",
   "display_name": "Zotero",
-  "version": "0.8.3",
+  "version": "0.8.4",
   "description": "Search, organize, cite, and analyze your Zotero library",
   "author": {
     "name": "Ali Soroush",
@@ -18,7 +18,8 @@
         "ZOTERO_API_KEY": "${user_config.api_key}",
         "ZOTERO_USER_ID": "${user_config.user_id}",
         "OPENALEX_API_KEY": "${user_config.openalex_api_key}",
-        "SEMANTIC_SCHOLAR_API_KEY": "${user_config.semantic_scholar_api_key}"
+        "SEMANTIC_SCHOLAR_API_KEY": "${user_config.semantic_scholar_api_key}",
+        "ZOTERO_MCP_EMAIL": "${user_config.polite_email}"
       }
     }
   },
@@ -48,6 +49,12 @@
       "title": "Semantic Scholar API Key",
       "description": "Optional — improves rate limits for find_related_papers",
       "sensitive": true,
+      "required": false
+    },
+    "polite_email": {
+      "type": "string",
+      "title": "Contact Email (polite pool)",
+      "description": "Optional — your email for the OpenAlex/Unpaywall polite pool. Enables free full-text PDF lookup and better rate limits. Leave blank to disable.",
       "required": false
     }
   },
