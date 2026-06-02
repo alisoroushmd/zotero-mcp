@@ -2,7 +2,7 @@
   "dxt_version": "0.3",
   "name": "zotero-mcp-plus",
   "display_name": "Zotero",
-  "version": "0.8.5",
+  "version": "0.9.0",
   "description": "Search, organize, cite, and analyze your Zotero library",
   "long_description": "MCP server for Zotero. REQUIRES the `uv` Python package manager (https://docs.astral.sh/uv/) installed and on PATH — this extension launches the server via `uv run`. On macOS, GUI-launched apps may not inherit your shell PATH; if the extension fails to start, ensure `uv` is installed to a system-wide location (e.g. `/usr/local/bin` or via Homebrew) or that your launcher's PATH includes it. Needs ZOTERO_API_KEY and ZOTERO_USER_ID (zotero.org/settings/keys). OPENALEX_API_KEY (free, openalex.org/users/me) enables the knowledge-graph, citation-graph, and retraction tools.",
   "author": {

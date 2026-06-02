@@ -31,7 +31,8 @@ class KnowledgeGraph:
     def __init__(self) -> None:
         if not HAS_NETWORKX:
             raise ImportError(
-                "Knowledge graph requires networkx. Install with: pip install zotero-mcp[graph]"
+                "Knowledge graph requires networkx. "
+                "Install with: pip install 'zotero-mcp-plus[graph]'"
             )
         self._graph: nx.DiGraph = nx.DiGraph()
         self._paper_data: dict[str, dict] = {}

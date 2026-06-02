@@ -15,8 +15,36 @@ jobs:
       - run: pip install -e ".[dev,graph,fulltext]"
       - run: python -m pytest tests/ -v
 
+  # Gate the release on (a) the version the tag claims matching both manifests
+  # and (b) the built wheel importing cleanly in a fresh venv (ZOT-27).
+  release-gate:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Assert tag == pyproject == manifest version
+        run: |
+          python - <<'PY'
+          import json, os, tomllib
+          tag = os.environ["GITHUB_REF_NAME"].lstrip("v")
+          pyproj = tomllib.load(open("pyproject.toml", "rb"))["project"]["version"]
+          manifest = json.load(open("manifest.json"))["version"]
+          assert tag == pyproj == manifest, f"version mismatch: tag={tag} pyproject={pyproj} manifest={manifest}"
+          print(f"versions in sync: {tag}")
+          PY
+      - run: pip install build
+      - run: python -m build
+      - name: Smoke-test the built wheel in a clean venv
+        run: |
+          python -m venv /tmp/clean
+          /tmp/clean/bin/pip install dist/*.whl
+          /tmp/clean/bin/python -c "import zotero_mcp; print('version', zotero_mcp.__version__)"
+          /tmp/clean/bin/python -c "from zotero_mcp.server import mcp; print('server imports OK')"
+
   publish-pypi:
-    needs: test
+    needs: [test, release-gate]
     runs-on: ubuntu-latest
     environment: pypi
     permissions:
@@ -31,7 +59,7 @@ jobs:
       - uses: pypa/gh-action-pypi-publish@release/v1
 
   build-dxt:
-    needs: test
+    needs: [test, release-gate]
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4

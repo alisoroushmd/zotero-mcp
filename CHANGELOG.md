@@ -6,6 +6,104 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/).
 
 ## [Unreleased]
 
+## [0.9.0] - 2026-06-02
+
+Stability and distributability hardening pass (audit findings ZOT-13…ZOT-31).
+
+### Security
+
+- **graph_renderer XSS fixed (ZOT-13).** The exported knowledge-graph HTML
+  embedded paper/author metadata into a `<script>` tag via `json.dumps`, which
+  does not escape `<`/`>`/`&`. A title containing `</script>…` could break out
+  and execute arbitrary JS when the file was opened. `_json_for_script` now
+  unicode-escapes those characters plus U+2028/U+2029, and the info panel and
+  legend build DOM nodes with `textContent` instead of `innerHTML`.
+  (`graph_renderer.py`)
+
+### Fixed
+
+- **Opaque MCP errors eliminated (ZOT-14).** `_handle_tool_errors` now also
+  catches `httpx.HTTPError` (DNS/connect/transport) as `network_error`,
+  data-shape errors (`KeyError`/`IndexError`/`TypeError`/`AttributeError`) and
+  any other exception as `internal_error`, so no tool raises raw to the protocol
+  layer. `api_error` responses include a truncated Zotero response body for
+  actionable 4xx (e.g. "item version mismatch"). (`server.py`)
+- **Local-API failures fall back to the Web API (ZOT-15).** `_read_local_or_web`
+  previously fell back only on `RuntimeError`; a transiently unhealthy Zotero
+  desktop (mid-sync 500, locked DB, read timeout) surfaced an error instead of
+  using the cloud path. It now falls back on any `httpx.HTTPError`. (`server.py`)
+- **DOI casing no longer breaks graph back-links (ZOT-22).** Zotero stores DOIs
+  verbatim (often uppercase) while OpenAlex lowercases them, so uppercase DOIs
+  were stored with an empty `zotero_key`. A single `_norm_doi` chokepoint
+  normalizes DOIs across the citation-graph, knowledge-graph, and full-text
+  index paths. (`server.py`)
+- **`get_citation_graph` caps `references` (ZOT-19).** Previously unbounded; a
+  heavily-referenced review returned a large payload and fired one Zotero
+  duplicate-check call per reference. Now capped to `limit`. (`server.py`)
+- **`Retry-After` tolerates HTTP-date values (ZOT-24).** Parsing a date-valued
+  header no longer crashes the retry loop. (`web_client.py`, `openalex_client.py`)
+- **Destructive-op version probe hardened (ZOT-25).** `trash_items`,
+  `empty_trash`, and `remove_tag` fetch the library version through
+  `_retry_request` (429-aware) and raise if the header is absent instead of
+  defaulting to `"0"` (which guaranteed a 412 or acted on a stale assumption).
+  (`web_client.py`)
+- **Correct package name in install hints (ZOT-30).** Optional-extra error
+  messages now say `zotero-mcp-plus[graph]` / `[fulltext]` (the real
+  distribution name). (`knowledge_graph.py`, `text_extractor.py`)
+- **Stale tool reference fixed (ZOT-30).** The "build the graph first" error now
+  names `build_index(type='graph')`, not the removed `build_knowledge_graph`.
+  (`server.py`)
+
+### Added
+
+- **OpenAlex retry/backoff (ZOT-18).** `_get_with_retry` handles 429
+  (`Retry-After`), 5xx, and transport errors with capped exponential backoff on
+  every OpenAlex GET, so large graph builds no longer silently produce
+  incomplete data under rate limits. `get_references` resolves references in one
+  batched query instead of N threaded GETs. (`openalex_client.py`)
+- **SQLite hardening (ZOT-20, ZOT-21).** `GraphStore` opens with
+  `journal_mode=WAL` + `busy_timeout`, raises an actionable error on a corrupt
+  database, closes the connection if initialization fails, gates
+  schema-create/migrate on `PRAGMA user_version`, and offers a `batch()` context
+  that commits a bulk load once. (`graph_store.py`)
+- **NCBI eutils API key support (ZOT-28).** Set `NCBI_API_KEY` to raise the
+  PubMed rate limit from 3 to 10 req/s; all eutils calls go through a 429-aware
+  `_pubmed_get` wrapper. (`config.py`, `web_client.py`)
+- **HTTP client cleanup (ZOT-23).** `WebClient`, `LocalClient`, and the OpenAlex
+  client expose `close()`, registered via `atexit` for clean shutdown.
+- **Duplicate-check failures are surfaced (ZOT-26).** When the pre-create
+  duplicate search fails transiently, `create_item`/`create_item_manual`/
+  `create_item_from_url` return `dedup_check_failed: true` with a warning rather
+  than silently creating a possible duplicate. (`web_client.py`)
+- **Bounded knowledge-graph analytics (ZOT-30).** `clusters`, `timeline`,
+  `topic_evolution`, and author `clusters` results are capped via `_cap_list`
+  (returns `{items, count, total, truncated}` when capped). (`server.py`)
+- **CI/release artifact testing (ZOT-27).** New jobs build the wheel and import
+  it in a clean venv (base + extras), assert `pyproject`/`manifest`/tag versions
+  match, and run `uv lock --check`. Release is gated on these.
+
+### Changed
+
+- **`fastmcp` capped to the tested major: `>=3.2,<4` (ZOT-16).** An unbounded
+  floor let a fresh install resolve an untested major across fastmcp's 2.x→3.x
+  break. (`pyproject.toml`)
+- **DXT manifest documents the `uv` prerequisite (ZOT-17)** and the macOS
+  GUI-PATH caveat via `long_description`. (`manifest.json`)
+- **`get_notes` and `get_item_attachments` now return `{items, count}`** instead
+  of a bare list, for shape consistency with the paginated read tools (ZOT-31).
+  **(behavior change for callers parsing those tools' output.)** (`server.py`)
+- **Typed `Literal` enums** on `query_authors`, `search_entities`, and
+  `export_knowledge_graph`; `update_item.fields` accepts a JSON-string via
+  `_parse_dict_param`; bidirectional disambiguation pointers and a documented
+  `content_source` discriminator added to tool descriptions (ZOT-31).
+- **Graph DB default path is OS-native** (`~/Library/Application Support` on
+  macOS, `%LOCALAPPDATA%` on Windows), with backward-compatible reuse of an
+  existing `~/.local/share` database (ZOT-31). (`config.py`)
+
+> Note: 0.8.4 and 0.8.5 were tagged without dedicated changelog sections; their
+> changes (deferred ZOT-05/07/08 and the MCP best-practices pass) are captured in
+> the project's TASKS.md history and are superseded by this release.
+
 ## [0.8.3] - 2026-05-14
 
 ### Fixed

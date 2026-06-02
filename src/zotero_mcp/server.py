@@ -37,9 +37,10 @@ logger = logging.getLogger(__name__)
 mcp = FastMCP(
     "zotero",
     instructions=(
-        "Zotero MCP server. All tools work with just API credentials "
-        "(ZOTERO_API_KEY + ZOTERO_USER_ID). If Zotero desktop is also "
-        "running, reads are faster via the local API. "
+        "Zotero MCP server. Most tools work with just API credentials "
+        "(ZOTERO_API_KEY + ZOTERO_USER_ID). The knowledge-graph, citation-graph, "
+        "and retraction tools additionally need OPENALEX_API_KEY (free). If "
+        "Zotero desktop is also running, reads are faster via the local API. "
         "Call server_status to check available modes. "
         "Use the prompts (literature_audit, build_and_explore, add_and_verify, "
         "extract_entities) for guided multi-step workflows."
@@ -196,6 +197,21 @@ def _validate_key(value: str, name: str = "key") -> None:
 def _clamp_limit(value: str | int, lo: int = 1, hi: int = 100) -> int:
     """Clamp a limit parameter to a safe range."""
     return max(lo, min(hi, int(value)))
+
+
+def _cap_list(result, limit: int):
+    """Cap a list result, wrapping in a {items, count, truncated} envelope (ZOT-30).
+
+    Knowledge-graph analytics (clusters, timeline, topic_evolution) can return
+    one row per node on a large library. Capping at the tool layer keeps a
+    single query from overflowing the caller's context window. Non-list results
+    pass through unchanged.
+    """
+    if not isinstance(result, list):
+        return result
+    if len(result) <= limit:
+        return result
+    return {"items": result[:limit], "count": limit, "total": len(result), "truncated": True}
 
 
 def _md_scalar(v) -> str:
@@ -359,6 +375,28 @@ def _parse_list_param(value: str | list | None) -> list | None:
         return parsed if isinstance(parsed, list) else [value]
     except (json.JSONDecodeError, TypeError):
         return [value]  # Treat bare string as single-item list
+
+
+def _parse_dict_param(value: str | dict | None, name: str = "fields") -> dict:
+    """Parse a parameter that may arrive as a JSON string instead of a dict.
+
+    The dict analogue of ``_parse_list_param`` (ZOT-31): some MCP clients send
+    object-typed arguments as a JSON-encoded string. Without this, ``fields``
+    arriving as a string would raise ``AttributeError`` on ``.keys()``.
+    """
+    if value is None:
+        return {}
+    if isinstance(value, dict):
+        return value
+    if isinstance(value, str):
+        try:
+            parsed = json.loads(value)
+        except (json.JSONDecodeError, TypeError) as exc:
+            raise ValueError(f"{name} must be a JSON object, got invalid JSON: {value!r}") from exc
+        if not isinstance(parsed, dict):
+            raise ValueError(f"{name} must be a JSON object, got {type(parsed).__name__}")
+        return parsed
+    raise ValueError(f"{name} must be a dict or JSON object string, got {type(value).__name__}")
 
 
 def _error_response(code: str, message: str, **extra) -> dict:
@@ -586,18 +624,24 @@ def get_collections(response_format: Literal["json", "markdown"] = "json") -> st
 )
 @_handle_tool_errors
 def get_notes(parent_key: str) -> str:
-    """Get all notes attached to a parent item."""
+    """Get all notes attached to a parent item.
+
+    Returns ``{items, count}`` for shape consistency with the other
+    list-returning read tools (ZOT-31).
+    """
     _validate_key(parent_key, "parent_key")
     results = _read_local_or_web("get_notes", parent_key.strip())
-    return json.dumps(results, ensure_ascii=False)
+    return json.dumps({"items": results, "count": len(results)}, ensure_ascii=False)
 
 
 @mcp.tool(
     description=(
         "List file attachments (PDFs, etc.) on a Zotero item with availability status. "
-        "Use this to check whether a paper has a PDF before trying to read it. "
-        "Returns availability: stored_remote_available, stored_local_available, "
-        "linked_local_available, or metadata_only."
+        "Use this to check whether a paper HAS a PDF before fetching it; to actually "
+        "read the content, use get_pdf_content. "
+        "Returns {items, count} where each item's availability is one of: "
+        "stored_remote_available, stored_local_available, linked_local_available, "
+        "or metadata_only."
     ),
     annotations=_RR,
 )
@@ -625,16 +669,20 @@ def get_item_attachments(parent_key: str) -> str:
                 "availability": link_mode_map.get(link_mode, "metadata_only"),
             }
         )
-    return json.dumps(results, ensure_ascii=False)
+    return json.dumps({"items": results, "count": len(results)}, ensure_ascii=False)
 
 
 @mcp.tool(
     description=(
         "Get the full text of a paper in the library. Routes to the best available source: "
         "PubMed Central, local PDF, web PDF download, or free open-access PDF. "
-        "Use this when the user wants to read a paper's content. "
+        "Use this when the user wants to read a paper's content; to only CHECK whether a "
+        "PDF exists without fetching it, use get_item_attachments first. "
         "Set extract_text=true to extract and return the text inline; "
-        "otherwise returns a file path or PMCID for the caller to read."
+        "otherwise returns a file path or PMCID for the caller to read. "
+        "The response always includes a content_source field (one of: pmc, local_pdf, "
+        "web_pdf, free_pdf_<source>, extracted_text, not_found) that determines which "
+        "other fields are present."
     ),
     annotations=_RR,
 )
@@ -1046,7 +1094,10 @@ def get_collection_items(
         "Add a paper to Zotero from any identifier: DOI, PMID, or URL (PubMed, "
         "bioRxiv, arXiv, publisher pages). Resolves metadata automatically and "
         "checks for duplicates. Use this when the user wants to save a paper to "
-        "their library. Optional title is only used for bare URLs that can't be scraped."
+        "their library. Optional title is only used for bare URLs that can't be scraped. "
+        "If you only have structured fields (title/authors/etc.) and no DOI/PMID/URL "
+        "to resolve, use create_item_manual instead. The result includes "
+        "dedup_check_failed=true if the duplicate check could not be completed."
     ),
 )
 @_handle_tool_errors
@@ -1302,9 +1353,12 @@ _ALLOWED_UPDATE_FIELDS = {
     ),
 )
 @_handle_tool_errors
-def update_item(item_key: str, fields: dict) -> str:
+def update_item(item_key: str, fields: dict | str) -> str:
     """Update item fields. Uses optimistic locking with version check."""
     _validate_key(item_key, "item_key")
+    fields = _parse_dict_param(fields, "fields")  # tolerate JSON-string input (ZOT-31)
+    if not fields:
+        raise ValueError("fields must not be empty")
     disallowed = set(fields.keys()) - _ALLOWED_UPDATE_FIELDS
     if disallowed:
         raise ValueError(
@@ -1558,7 +1612,8 @@ def _fetch_item_metadata(item_keys: list[str]) -> tuple[dict[str, dict], list[st
     description=(
         "Insert live Zotero citation field codes into an existing Word document. "
         "Finds [@ITEM_KEY] markers in the .docx and replaces them with Zotero "
-        "field codes. Use this to add citations to a document the user already has. "
+        "field codes. Use this to add citations to a document the user already has; "
+        "to create a NEW .docx from markdown instead, use write_cited_document. "
         "Preserves existing formatting, styles, images, and layout."
     ),
 )
@@ -1707,7 +1762,7 @@ def _get_or_build_kg() -> KnowledgeGraph:
         with GraphStore() as store:
             if store.get_last_sync() is None:
                 raise RuntimeError(
-                    "Knowledge graph not yet built. Run build_knowledge_graph first."
+                    "Knowledge graph not yet built. Run build_index(type='graph') first."
                 )
             kg = KnowledgeGraph()
             kg.build_from_store(store)
@@ -1911,7 +1966,16 @@ def _build_fulltext_index(full_rebuild: bool = False, limit: int = 0) -> dict:
     from concurrent.futures import ThreadPoolExecutor, as_completed
 
     from zotero_mcp.graph_store import GraphStore
-    from zotero_mcp.text_extractor import extract_text_from_pdf, index_paper_text
+    from zotero_mcp.text_extractor import (
+        PYPDF_INSTALL_HINT,
+        extract_text_from_pdf,
+        index_paper_text,
+        pypdf_available,
+    )
+
+    # Fail fast with one actionable message instead of N opaque per-PDF failures.
+    if not pypdf_available():
+        return {"error": "missing_dependency", "message": PYPDF_INSTALL_HINT}
 
     web = _get_web()
     store = GraphStore()
@@ -1924,7 +1988,7 @@ def _build_fulltext_index(full_rebuild: bool = False, limit: int = 0) -> dict:
         total = len(items)
 
         if not full_rebuild:
-            items = [it for it in items if it["DOI"] not in already_indexed]
+            items = [it for it in items if _norm_doi(it["DOI"]) not in already_indexed]
         skipped = total - len(items)
 
         if limit > 0:
@@ -1936,7 +2000,7 @@ def _build_fulltext_index(full_rebuild: bool = False, limit: int = 0) -> dict:
         def _extract_one(item: dict) -> dict:
             """Extract text for a single item. No sqlite writes (not thread-safe)."""
             item_key = item["key"]
-            item_doi = item["DOI"]
+            item_doi = _norm_doi(item["DOI"])  # match the papers table key (ZOT-22)
 
             try:
                 children = _read_local_or_web("get_children", item_key, item_type="attachment")
@@ -2056,7 +2120,7 @@ def build_index(
         "'trending' (papers with accelerating citation rates — optional limit, years window). "
         "Requires build_index(type='graph') to be run first."
     ),
-    annotations={"readOnlyHint": True},
+    annotations=_RL,
 )
 @_handle_tool_errors
 def query_knowledge_graph(
@@ -2086,12 +2150,16 @@ def query_knowledge_graph(
     """Query the knowledge graph (uses cached graph)."""
     kg = _get_or_build_kg()
 
+    # On a large library these can enumerate many rows; cap to `limit` so a
+    # single query can't blow the caller's context window (ZOT-30).
+    lim = _clamp_limit(limit, lo=1, hi=200)
+
     if query_type == "influential":
-        result = kg.get_influential_papers(top_n=limit)
+        result = kg.get_influential_papers(top_n=lim)
     elif query_type == "clusters":
-        result = kg.get_clusters()
+        result = _cap_list(kg.get_clusters(), lim)
     elif query_type == "bridges":
-        result = kg.get_bridge_papers(top_n=limit)
+        result = kg.get_bridge_papers(top_n=lim)
     elif query_type == "path":
         if not doi_a or not doi_b:
             raise ValueError("path query requires doi_a and doi_b")
@@ -2103,16 +2171,22 @@ def query_knowledge_graph(
     elif query_type == "stats":
         result = kg.get_stats()
     elif query_type == "timeline":
-        result = kg.get_timeline(
-            topic=topic or None,
-            start_year=start_year or None,
-            end_year=end_year or None,
+        result = _cap_list(
+            kg.get_timeline(
+                topic=topic or None,
+                start_year=start_year or None,
+                end_year=end_year or None,
+            ),
+            lim,
         )
     elif query_type == "topic_evolution":
-        result = kg.get_topic_evolution(
-            start_year=start_year or None,
-            end_year=end_year or None,
-            limit=limit,
+        result = _cap_list(
+            kg.get_topic_evolution(
+                start_year=start_year or None,
+                end_year=end_year or None,
+                limit=lim,
+            ),
+            lim,
         )
     elif query_type == "citation_velocity":
         if not doi:
@@ -2247,17 +2321,18 @@ def search_fulltext(query: str, limit: str | int = 20) -> str:
         "'clusters' (author community groupings). "
         "Requires build_index(type='graph') to be run first."
     ),
-    annotations={"readOnlyHint": True},
+    annotations=_RL,
 )
 @_handle_tool_errors
 def query_authors(
-    query_type: str,
+    query_type: Literal["prolific", "influential", "coauthors_of", "network", "clusters"],
     author_name: str = "",
     limit: int = 10,
     depth: int = 1,
 ) -> str:
     """Query the author co-citation network."""
     kg = _get_or_build_kg()
+    limit = _clamp_limit(limit, lo=1, hi=200)
 
     if query_type == "prolific":
         result = kg.get_prolific_authors(top_n=limit)
@@ -2274,7 +2349,7 @@ def query_authors(
         author_id = kg._resolve_author(author_name)
         result = kg.get_author_network(author_id, depth=depth)
     elif query_type == "clusters":
-        result = kg.get_author_clusters()
+        result = _cap_list(kg.get_author_clusters(), limit)
     else:
         raise ValueError(
             f"Unknown query_type: {query_type!r}. "
@@ -2298,7 +2373,7 @@ def query_authors(
 )
 @_handle_tool_errors
 def export_knowledge_graph(
-    view: str = "citations",
+    view: Literal["citations", "authors", "full"] = "citations",
     path: str = "",
 ) -> str:
     """Export knowledge graph as interactive HTML.
@@ -2476,7 +2551,7 @@ def store_entities(results: str | list) -> str:
 )
 @_handle_tool_errors
 def search_entities(
-    query_type: str,
+    query_type: Literal["by_name", "by_type", "co_occurrence", "shared_entities", "paper_entities"],
     entity_name: str = "",
     entity_type: str = "",
     doi: str = "",

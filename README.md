@@ -270,8 +270,9 @@ Adds pypdf for extracting text from PDFs. Used by `build_index(type='fulltext')`
 | `OPENALEX_API_KEY`         | For analysis/graph tools | Required for `check_retractions`, `get_citation_graph`, `check_published_versions`, and all knowledge-graph tools — free at [openalex.org/users/me](https://openalex.org/users/me) |
 | `ZOTERO_MCP_EMAIL`         | No       | Your email address. Sent in User-Agent headers to CrossRef/OpenAlex polite pools and required for Unpaywall PDF lookup in `attach_pdf`. Without it, Unpaywall PDF fetches are skipped. |
 | `SEMANTIC_SCHOLAR_API_KEY` | No       | Improves rate limits for `find_related_papers` — free at [semanticscholar.org](https://www.semanticscholar.org/product/api) |
+| `NCBI_API_KEY`             | No       | Raises the PubMed/eutils rate limit from 3 to 10 req/s — helps bulk identifier resolution and graph builds. Free at [ncbi.nlm.nih.gov/account](https://www.ncbi.nlm.nih.gov/account/settings/). |
 | `ZOTERO_DATA_DIR`          | No       | Override path to Zotero desktop data directory (default: `~/Zotero`). Used by `audit_local_keys` and the local PDF path resolver in `get_pdf_content`. |
-| `ZOTERO_MCP_GRAPH_DB`      | No       | Override path for the knowledge-graph SQLite database (default: `~/.local/share/zotero-mcp/graph.sqlite` or `$XDG_DATA_HOME/zotero-mcp/graph.sqlite`). |
+| `ZOTERO_MCP_GRAPH_DB`      | No       | Override path for the knowledge-graph SQLite database (default: OS-native per-user data dir — `~/Library/Application Support/zotero-mcp/` on macOS, `%LOCALAPPDATA%\zotero-mcp\` on Windows, `~/.local/share/zotero-mcp/` elsewhere; an existing legacy `~/.local/share` DB is reused). |
 | `XDG_DATA_HOME`            | No       | Standard XDG override for the default graph DB location. |
 | `PARENT_WATCHDOG_DISABLE`  | No       | Set to `1` to disable the orphan-process watchdog that kills the server when the parent process (Claude.app, uvx, etc.) exits. |
 
