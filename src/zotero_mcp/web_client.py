@@ -158,6 +158,22 @@ def _is_valid_pdf(content: bytes) -> bool:
     return len(content) >= 5 and content[:5] == b"%PDF-"
 
 
+def _parse_retry_after(value: str | None, fallback: float) -> float:
+    """Parse a Retry-After header to seconds, tolerating HTTP-date values (ZOT-24).
+
+    RFC 7231 allows Retry-After to be either delta-seconds or an HTTP-date. We
+    only honor the numeric form; a date (which a CDN/proxy in front of the API
+    may send) or any junk falls back to ``fallback`` instead of crashing the
+    retry loop with ``ValueError``.
+    """
+    if not value:
+        return fallback
+    try:
+        return float(value)
+    except (ValueError, TypeError):
+        return fallback
+
+
 def _retry_request(
     fn,
     max_attempts: int = 3,
@@ -180,7 +196,9 @@ def _retry_request(
     for attempt in range(1, max_attempts):
         if resp.status_code != 429:
             return resp
-        retry_after = float(resp.headers.get("Retry-After", base_delay * (2 ** (attempt - 1))))
+        retry_after = _parse_retry_after(
+            resp.headers.get("Retry-After"), base_delay * (2 ** (attempt - 1))
+        )
         delay = min(retry_after, 30.0)
         logger.warning(
             "Rate limited (429), retrying in %.1fs (attempt %d/%d)",
@@ -236,6 +254,29 @@ class WebClient:
             base_url="https://eutils.ncbi.nlm.nih.gov/entrez/eutils",
             timeout=TIMEOUT,
         )
+        from zotero_mcp.config import get_config
+
+        self._ncbi_api_key = get_config().ncbi_api_key
+        # Set by the dedup helpers when a duplicate check fails transiently (ZOT-26).
+        self._dedup_check_failed = False
+
+    def close(self) -> None:
+        """Close all pooled HTTP clients (ZOT-23).
+
+        Idempotent: ``httpx.Client.close()`` is safe to call more than once.
+        Called from an ``atexit`` handler in server.py for clean shutdown.
+        """
+        for client in (self._web_client, self._translate_client, self._pubmed_client):
+            try:
+                client.close()
+            except Exception:  # pragma: no cover — best-effort cleanup
+                pass
+
+    def __enter__(self) -> WebClient:
+        return self
+
+    def __exit__(self, *_) -> None:
+        self.close()
 
     # -- Web API read methods (primary read path) --
 
@@ -356,6 +397,19 @@ class WebClient:
         resp.raise_for_status()
         return resp.content
 
+    def _pubmed_get(self, path: str, params: dict) -> httpx.Response:
+        """GET an NCBI eutils endpoint with the API key and 429 retry (ZOT-28).
+
+        NCBI throttles anonymous callers to 3 req/s; an ``NCBI_API_KEY`` raises
+        that to 10 and is injected here when configured. Routed through
+        ``_retry_request`` so a 429 during bulk resolution is retried instead of
+        producing sporadic failures.
+        """
+        merged = dict(params)
+        if self._ncbi_api_key:
+            merged["api_key"] = self._ncbi_api_key
+        return _retry_request(lambda: self._pubmed_client.get(path, params=merged))
+
     def resolve_pmid_to_pmcid(self, pmid: str) -> str | None:
         """Convert a PubMed ID to a PubMed Central ID.
 
@@ -366,7 +420,7 @@ class WebClient:
             PMCID string (e.g. "PMC9046468"), or None if not in PMC.
         """
         try:
-            resp = self._pubmed_client.get(
+            resp = self._pubmed_get(
                 "/esearch.fcgi",
                 params={"db": "pmc", "term": f"{pmid}[pmid]", "retmode": "json"},
             )
@@ -481,7 +535,14 @@ class WebClient:
         return result
 
     def _check_duplicate_doi(self, doi: str) -> dict | None:
-        """Check if a DOI already exists in the library. Returns item summary or None."""
+        """Check if a DOI already exists in the library. Returns item summary or None.
+
+        On a transient check failure (timeout/429/network), sets
+        ``self._dedup_check_failed`` so the caller can warn the user that the
+        no-duplicate guarantee did not hold (ZOT-26), instead of silently
+        creating a duplicate.
+        """
+        self._dedup_check_failed = False
         if not doi:
             return None
         # Try local first (faster), fall back to web search
@@ -495,6 +556,7 @@ class WebClient:
                     return item
         except Exception as exc:
             logger.warning("Duplicate DOI check failed for %s: %s", doi, exc)
+            self._dedup_check_failed = True
         return None
 
     def _check_duplicate_title(self, title: str, threshold: float = 0.90) -> dict | None:
@@ -519,6 +581,7 @@ class WebClient:
             t = _re.sub(r"\s+", " ", t)
             return t
 
+        self._dedup_check_failed = False
         normalized = _normalize(title)
         if not normalized:
             return None
@@ -532,7 +595,9 @@ class WebClient:
                 results = self._local.search_items(search_query, limit=20)
             else:
                 results = self.search_items(search_query, limit=20)
-        except Exception:
+        except Exception as exc:
+            logger.warning("Duplicate title check failed for %r: %s", title[:60], exc)
+            self._dedup_check_failed = True
             return None
 
         for item in results:
@@ -731,13 +796,33 @@ class WebClient:
 
         key = self._extract_created_key(resp.json())
         logger.info("Created item %s from identifier %s", key, identifier)
-        return {
-            "key": key,
-            "title": metadata.get("title", ""),
-            "DOI": metadata.get("DOI", ""),
-            "date": metadata.get("date", ""),
-            "note": "Item created on Zotero web. Sync Zotero desktop to see it locally.",
-        }
+        return self._with_dedup_warning(
+            {
+                "key": key,
+                "title": metadata.get("title", ""),
+                "DOI": metadata.get("DOI", ""),
+                "date": metadata.get("date", ""),
+                "note": "Item created on Zotero web. Sync Zotero desktop to see it locally.",
+            }
+        )
+
+    def _with_dedup_warning(self, result: dict) -> dict:
+        """Annotate a creation result if the duplicate check failed (ZOT-26).
+
+        When the pre-create dedup search errored transiently, the "no duplicate"
+        conclusion is not trustworthy. Surfacing this lets the caller/user know
+        the item may already exist rather than assuming a clean create.
+        """
+        if self._dedup_check_failed:
+            result = {
+                **result,
+                "dedup_check_failed": True,
+                "dedup_warning": (
+                    "Could not verify the item is not a duplicate (the duplicate "
+                    "check failed transiently). It may already exist in the library."
+                ),
+            }
+        return result
 
     def _resolve_identifier(self, identifier: str) -> dict:
         """Resolve PMID/DOI/URL to Zotero item metadata.
@@ -800,7 +885,7 @@ class WebClient:
         elif identifier.startswith("10.") or "doi.org" in identifier:
             doi = identifier.replace("https://doi.org/", "").replace("http://doi.org/", "")
             try:
-                search_resp = self._pubmed_client.get(
+                search_resp = self._pubmed_get(
                     "/esearch.fcgi",
                     params={"db": "pubmed", "term": f"{doi}[doi]", "retmode": "json"},
                 )
@@ -815,7 +900,7 @@ class WebClient:
             return None
 
         try:
-            resp = self._pubmed_client.get(
+            resp = self._pubmed_get(
                 "/efetch.fcgi",
                 params={"db": "pubmed", "id": pmid, "rettype": "xml", "retmode": "xml"},
             )
@@ -1167,12 +1252,14 @@ class WebClient:
 
         key = self._extract_created_key(resp.json())
         logger.info("Created item %s from URL %s", key, url)
-        return {
-            "key": key,
-            "title": metadata.get("title", ""),
-            "item_type": metadata.get("itemType", "webpage"),
-            "note": "Item created on Zotero web. Sync Zotero desktop to see it locally.",
-        }
+        return self._with_dedup_warning(
+            {
+                "key": key,
+                "title": metadata.get("title", ""),
+                "item_type": metadata.get("itemType", "webpage"),
+                "note": "Item created on Zotero web. Sync Zotero desktop to see it locally.",
+            }
+        )
 
     @staticmethod
     def _extract_doi_from_url(url: str) -> str:
@@ -1301,12 +1388,14 @@ class WebClient:
         resp.raise_for_status()
 
         key = self._extract_created_key(resp.json())
-        return {
-            "key": key,
-            "title": title,
-            "item_type": item_type,
-            "note": "Item created on Zotero web. Sync Zotero desktop to see it locally.",
-        }
+        return self._with_dedup_warning(
+            {
+                "key": key,
+                "title": title,
+                "item_type": item_type,
+                "note": "Item created on Zotero web. Sync Zotero desktop to see it locally.",
+            }
+        )
 
     def create_note(
         self,
@@ -1429,7 +1518,7 @@ class WebClient:
                     else:
                         results["skipped"].append(key)
                 elif resp.status_code == 429:
-                    retry_after = int(resp.headers.get("Retry-After", "5"))
+                    retry_after = _parse_retry_after(resp.headers.get("Retry-After"), 5.0)
                     time.sleep(min(retry_after, 10))
                     resp = self._web_client.patch(
                         f"/items/{key}",
@@ -1538,6 +1627,30 @@ class WebClient:
         logger.info("Updated item %s to version %d", item_key, new_version)
         return {"key": item_key, "version": new_version}
 
+    def _library_version(self) -> str:
+        """Fetch the current library version for If-Unmodified-Since-Version (ZOT-25).
+
+        Routed through ``_retry_request`` so a 429 on the version probe is
+        retried rather than silently yielding version ``"0"`` (which would make
+        the subsequent destructive DELETE always 412, or worse act on a stale
+        assumption). Raises if the header is missing instead of defaulting.
+
+        Returns:
+            The library version string from ``Last-Modified-Version``.
+
+        Raises:
+            RuntimeError: if the version header is absent from the response.
+        """
+        resp = _retry_request(lambda: self._web_client.get("/items", params={"limit": 0}))
+        resp.raise_for_status()
+        version = resp.headers.get("Last-Modified-Version")
+        if version is None:
+            raise RuntimeError(
+                "Could not determine the current Zotero library version "
+                "(no Last-Modified-Version header). Aborting destructive operation."
+            )
+        return version
+
     def trash_items(self, item_keys: list[str]) -> dict:
         """Move items to Zotero trash (reversible).
 
@@ -1553,9 +1666,7 @@ class WebClient:
         trashed: list[str] = []
         failed: list[str] = []
 
-        # Get current library version
-        resp = self._web_client.get("/items", params={"limit": 0})
-        version = resp.headers.get("Last-Modified-Version", "0")
+        version = self._library_version()
 
         # Chunk into batches of 50
         for i in range(0, len(item_keys), 50):
@@ -1584,9 +1695,7 @@ class WebClient:
         Returns:
             Dict with status.
         """
-        # Get current library version
-        resp = self._web_client.get("/items", params={"limit": 0})
-        version = resp.headers.get("Last-Modified-Version", "0")
+        version = self._library_version()
 
         resp = self._web_client.delete(
             "/items/trash",
@@ -1680,9 +1789,7 @@ class WebClient:
         Returns:
             Dict with "tag" and "status".
         """
-        # Get current library version for the If-Unmodified-Since-Version header
-        resp = self._web_client.get("/items", params={"limit": 0})
-        version = resp.headers.get("Last-Modified-Version", "0")
+        version = self._library_version()
 
         resp = self._web_client.delete(
             f"/tags/{quote(tag, safe='')}",
@@ -1988,7 +2095,7 @@ class WebClient:
         # 2. Try PubMed Central
         if not _is_preprint_doi(doi):  # Skip bioRxiv/medRxiv DOIs for PMC
             try:
-                id_resp = self._pubmed_client.get(
+                id_resp = self._pubmed_get(
                     "/esearch.fcgi",
                     params={"db": "pmc", "term": f"{doi}[doi]", "retmode": "json"},
                 )

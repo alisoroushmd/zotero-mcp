@@ -6,10 +6,17 @@ survives between MCP sessions and supports incremental updates.
 
 from __future__ import annotations
 
+import logging
 import sqlite3
 from pathlib import Path
 
 from zotero_mcp.config import get_config
+
+logger = logging.getLogger(__name__)
+
+# Bump when the schema (tables/columns) changes. Gates _create_tables/_migrate
+# so the DDL runs once per database, not on every GraphStore() construction.
+SCHEMA_VERSION = 1
 
 
 class GraphStore:
@@ -21,11 +28,67 @@ class GraphStore:
 
     def __init__(self, db_path: str | None = None) -> None:
         self._db_path = db_path or get_config().effective_graph_db_path
-        Path(self._db_path).parent.mkdir(parents=True, exist_ok=True)
-        self._conn = sqlite3.connect(self._db_path)
-        self._conn.row_factory = sqlite3.Row
+        if self._db_path != ":memory:":
+            Path(self._db_path).parent.mkdir(parents=True, exist_ok=True)
+        try:
+            self._conn = sqlite3.connect(self._db_path)
+        except sqlite3.DatabaseError as exc:  # corrupt/unreadable file
+            raise RuntimeError(
+                f"Could not open the knowledge-graph database at {self._db_path}: {exc}. "
+                "If the file is corrupted (e.g. a cloud-sync conflict copy), delete it "
+                "and rebuild with build_index(type='graph', full_rebuild=True)."
+            ) from exc
+
+        # Everything after connect() must be cleaned up if it raises (ZOT-20):
+        # otherwise the open connection (holding a file lock) leaks.
+        try:
+            self._conn.row_factory = sqlite3.Row
+            # WAL allows concurrent readers during a write (KG build + a query);
+            # busy_timeout waits instead of failing immediately on a locked DB.
+            self._conn.execute("PRAGMA journal_mode=WAL")
+            self._conn.execute("PRAGMA busy_timeout=10000")
+            self._conn.execute("PRAGMA synchronous=NORMAL")
+            self._init_schema()
+        except sqlite3.DatabaseError as exc:
+            self._conn.close()
+            raise RuntimeError(
+                f"Knowledge-graph database at {self._db_path} is unusable: {exc}. "
+                "Delete it and rebuild with build_index(type='graph', full_rebuild=True)."
+            ) from exc
+        except Exception:
+            self._conn.close()
+            raise
+
+    def _init_schema(self) -> None:
+        """Create/migrate the schema once, gated on PRAGMA user_version (ZOT-21).
+
+        The DDL is idempotent (IF NOT EXISTS / column guards), but running it on
+        every construction churns commits and PRAGMA reads. Gating on
+        user_version makes migrations explicitly versioned and skips the work
+        for an already-current database.
+        """
+        version = self._conn.execute("PRAGMA user_version").fetchone()[0]
+        if version >= SCHEMA_VERSION:
+            return
         self._create_tables()
         self._migrate()
+        self._conn.execute(f"PRAGMA user_version={SCHEMA_VERSION}")
+        self._conn.commit()
+
+    # Batch-commit support (ZOT-20): per-row commits in the upsert_* methods are
+    # one fsync each, which is slow over a large library and amplifies lock
+    # contention. Wrapping a bulk load in `with store.batch():` defers all those
+    # commits to a single commit on exit.
+    _defer_commit: bool = False
+
+    def _commit(self) -> None:
+        """Commit unless inside a deferred batch."""
+        if not self._defer_commit:
+            self._conn.commit()
+
+    def batch(self) -> _BatchContext:
+        """Defer per-row commits to a single commit on context exit (ZOT-20)."""
+        return _BatchContext(self)
 
     def _create_tables(self) -> None:
         self._conn.executescript("""
@@ -143,14 +206,14 @@ class GraphStore:
                    updated_at=CURRENT_TIMESTAMP""",
             (doi, zotero_key, title, year, authors, openalex_id, publication_date, abstract),
         )
-        self._conn.commit()
+        self._commit()
 
     def upsert_citation(self, citing_doi: str, cited_doi: str) -> None:
         self._conn.execute(
             "INSERT OR IGNORE INTO citations (citing_doi, cited_doi) VALUES (?, ?)",
             (citing_doi, cited_doi),
         )
-        self._conn.commit()
+        self._commit()
 
     def get_paper(self, doi: str) -> dict | None:
         row = self._conn.execute("SELECT * FROM papers WHERE doi = ?", (doi,)).fetchone()
@@ -210,7 +273,7 @@ class GraphStore:
                 "INSERT OR REPLACE INTO sync_state (key, value) VALUES ('library_version', ?)",
                 (str(library_version),),
             )
-        self._conn.commit()
+        self._commit()
 
     def upsert_topic(
         self,
@@ -245,7 +308,7 @@ class GraphStore:
                    score=excluded.score""",
             (doi, topic_id, topic_name, subfield, field, domain, score),
         )
-        self._conn.commit()
+        self._commit()
 
     def upsert_author(
         self,
@@ -273,7 +336,7 @@ class GraphStore:
                    updated_at=CURRENT_TIMESTAMP""",
             (openalex_author_id, display_name, orcid, institution),
         )
-        self._conn.commit()
+        self._commit()
 
     def upsert_paper_author(
         self,
@@ -294,7 +357,7 @@ class GraphStore:
                VALUES (?, ?, ?)""",
             (doi, openalex_author_id, position),
         )
-        self._conn.commit()
+        self._commit()
 
     def get_topics_for_doi(self, doi: str) -> list[dict]:
         """Return all topic associations for a given DOI.
@@ -364,7 +427,7 @@ class GraphStore:
                VALUES (?, CURRENT_TIMESTAMP, ?, ?)""",
             (doi, page_count, char_count),
         )
-        self._conn.commit()
+        self._commit()
 
     def get_indexed_dois(self) -> set[str]:
         """Return the set of DOIs that have been full-text indexed.
@@ -415,7 +478,7 @@ class GraphStore:
         """
         self._conn.execute("DELETE FROM paper_fulltext WHERE doi = ?", (doi,))
         self._conn.execute("DELETE FROM fulltext_state WHERE doi = ?", (doi,))
-        self._conn.commit()
+        self._commit()
 
     # -- Entity CRUD methods --
 
@@ -436,7 +499,7 @@ class GraphStore:
             "INSERT OR IGNORE INTO entities (name, entity_type) VALUES (?, ?)",
             (normalized, entity_type),
         )
-        self._conn.commit()
+        self._commit()
         row = self._conn.execute(
             "SELECT entity_id FROM entities WHERE name = ? AND entity_type = ?",
             (normalized, entity_type),
@@ -459,7 +522,7 @@ class GraphStore:
                VALUES (?, ?, ?)""",
             (doi, entity_id, confidence),
         )
-        self._conn.commit()
+        self._commit()
 
     def get_entities_for_doi(self, doi: str) -> list[dict]:
         """Return all entities linked to a paper.
@@ -631,3 +694,25 @@ class GraphStore:
 
     def __exit__(self, *_) -> None:
         self.close()
+
+
+class _BatchContext:
+    """Defers per-row commits across a bulk load to a single commit (ZOT-20).
+
+    On a clean exit, all deferred writes are committed once. On an exception,
+    the in-flight transaction is rolled back so a partial batch is not persisted.
+    """
+
+    def __init__(self, store: GraphStore) -> None:
+        self._store = store
+
+    def __enter__(self) -> GraphStore:
+        self._store._defer_commit = True
+        return self._store
+
+    def __exit__(self, exc_type, *_) -> None:
+        self._store._defer_commit = False
+        if exc_type is None:
+            self._store._conn.commit()
+        else:
+            self._store._conn.rollback()

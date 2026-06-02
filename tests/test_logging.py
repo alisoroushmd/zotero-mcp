@@ -87,6 +87,7 @@ def test_openalex_get_references_logs_on_fetch_failure(caplog):
             "get",
             side_effect=httpx.ConnectError("down"),
         ),
+        patch("zotero_mcp.openalex_client.time.sleep"),  # skip retry backoff
         caplog.at_level(logging.WARNING, logger="zotero_mcp.openalex_client"),
     ):
         result = client.get_references("10.1234/test")

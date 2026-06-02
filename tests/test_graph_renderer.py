@@ -97,6 +97,42 @@ def test_render_html_embeds_json():
     assert "d3.v7.min.js" in html
 
 
+def test_render_html_escapes_script_breakout():
+    """A title containing </script> cannot break out of the data <script> tag (ZOT-13)."""
+    data = {
+        "nodes": [{"id": "x", "label": "Evil</script><script>alert(1)</script>"}],
+        "edges": [],
+        "group_labels": {},
+    }
+    html = _render_html(data)
+    # Isolate the embedded data block (between the assignment and its closing tag).
+    marker = "window.__GRAPH_DATA = "
+    start = html.index(marker) + len(marker)
+    end = html.index(";</script>", start)
+    data_block = html[start:end]
+    # No raw markup may survive inside the data block.
+    assert "</script>" not in data_block
+    assert "<" not in data_block and ">" not in data_block
+    # The escaped form must be present and still parse back to the original value.
+    assert "\\u003c/script\\u003e" in data_block
+    roundtrip = json.loads(data_block)
+    assert roundtrip["nodes"][0]["label"] == "Evil</script><script>alert(1)</script>"
+
+
+def test_render_html_escapes_ampersand_and_line_separators():
+    """& and U+2028/U+2029 are unicode-escaped for safe script embedding (ZOT-13)."""
+    label = "a & b" + chr(0x2028) + "c" + chr(0x2029) + "d"
+    data = {"nodes": [{"id": "x", "label": label}], "edges": [], "group_labels": {}}
+    html = _render_html(data)
+    marker = "window.__GRAPH_DATA = "
+    start = html.index(marker) + len(marker)
+    end = html.index(";</script>", start)
+    data_block = html[start:end]
+    assert "\\u0026" in data_block
+    assert chr(0x2028) not in data_block and chr(0x2029) not in data_block
+    assert json.loads(data_block)["nodes"][0]["label"] == label
+
+
 def test_render_html_valid_structure():
     """Output is well-formed HTML with required elements."""
     data = {"nodes": [], "edges": [], "group_labels": {}}

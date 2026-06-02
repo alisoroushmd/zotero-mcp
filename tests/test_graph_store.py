@@ -17,6 +17,59 @@ def tmp_db():
     os.unlink(path)
 
 
+def test_legacy_db_is_migrated_and_versioned(tmp_db):
+    """A pre-0.7.0 papers table gets the new columns and user_version set (ZOT-21)."""
+    import sqlite3
+
+    from zotero_mcp.graph_store import SCHEMA_VERSION
+
+    conn = sqlite3.connect(tmp_db)
+    conn.execute(
+        "CREATE TABLE papers (doi TEXT PRIMARY KEY, zotero_key TEXT, title TEXT, "
+        "year INTEGER, authors TEXT, openalex_id TEXT, updated_at TIMESTAMP)"
+    )
+    conn.commit()
+    conn.close()
+
+    store = GraphStore(tmp_db)
+    cols = {r[1] for r in store._conn.execute("PRAGMA table_info(papers)").fetchall()}
+    assert "publication_date" in cols
+    assert "abstract" in cols
+    assert store._conn.execute("PRAGMA user_version").fetchone()[0] == SCHEMA_VERSION
+    store.close()
+
+
+def test_corrupt_db_raises_actionable_error(tmp_db):
+    """Opening a corrupted DB file raises a clear, actionable error (ZOT-20)."""
+    with open(tmp_db, "wb") as f:
+        f.write(b"not a sqlite database " * 50)
+    with pytest.raises(RuntimeError, match="rebuild|corrupt|unusable"):
+        GraphStore(tmp_db)
+
+
+def test_batch_defers_commits(tmp_db):
+    """store.batch() persists all rows and commits once on exit (ZOT-20)."""
+    store = GraphStore(tmp_db)
+    with store.batch() as s:
+        for i in range(5):
+            s.upsert_paper(f"10.1/{i}", "K", "T", 2020, "A", "W")
+    count = store._conn.execute("SELECT COUNT(*) FROM papers").fetchone()[0]
+    assert count == 5
+    store.close()
+
+
+def test_batch_rolls_back_on_error(tmp_db):
+    """An exception inside store.batch() rolls back the partial batch (ZOT-20)."""
+    store = GraphStore(tmp_db)
+    with pytest.raises(ValueError):
+        with store.batch() as s:
+            s.upsert_paper("10.1/ok", "K", "T", 2020, "A", "W")
+            raise ValueError("boom")
+    count = store._conn.execute("SELECT COUNT(*) FROM papers").fetchone()[0]
+    assert count == 0
+    store.close()
+
+
 def test_upsert_and_get_paper(tmp_db):
     """Papers can be stored and retrieved by DOI."""
     store = GraphStore(tmp_db)

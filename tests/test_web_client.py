@@ -961,3 +961,45 @@ def test_batch_organize_handles_412_retry():
     assert "ITEM2" in result["updated_keys"]
     assert result["updated_count"] == 1
     assert result["failed_count"] == 0
+
+
+# -- NCBI eutils API key injection (ZOT-28) --
+
+
+@respx.mock
+def test_pubmed_get_injects_ncbi_api_key(monkeypatch):
+    """When NCBI_API_KEY is set, _pubmed_get adds it to eutils query params."""
+    from zotero_mcp.config import _reset_config
+
+    monkeypatch.setenv("NCBI_API_KEY", "secret-ncbi-key")
+    _reset_config()
+    try:
+        route = respx.get(f"{PUBMED_BASE}/esearch.fcgi").mock(
+            return_value=httpx.Response(200, json={"esearchresult": {"idlist": ["999"]}})
+        )
+        client = WebClient(api_key="k", user_id="1")
+        client.resolve_pmid_to_pmcid("12345")
+        assert route.called
+        sent_url = str(route.calls.last.request.url)
+        assert "api_key=secret-ncbi-key" in sent_url
+    finally:
+        _reset_config()
+
+
+@respx.mock
+def test_pubmed_get_omits_key_when_unset(monkeypatch):
+    """Without NCBI_API_KEY, no api_key param is sent."""
+    from zotero_mcp.config import _reset_config
+
+    monkeypatch.delenv("NCBI_API_KEY", raising=False)
+    _reset_config()
+    try:
+        route = respx.get(f"{PUBMED_BASE}/esearch.fcgi").mock(
+            return_value=httpx.Response(200, json={"esearchresult": {"idlist": ["999"]}})
+        )
+        client = WebClient(api_key="k", user_id="1")
+        client.resolve_pmid_to_pmcid("12345")
+        assert route.called
+        assert "api_key=" not in str(route.calls.last.request.url)
+    finally:
+        _reset_config()

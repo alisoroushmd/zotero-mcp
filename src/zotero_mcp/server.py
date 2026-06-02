@@ -119,7 +119,23 @@ def _cleanup_temp_files() -> None:
         _temp_files.clear()
 
 
+def _cleanup_clients() -> None:
+    """Close pooled HTTP clients at process exit (ZOT-23).
+
+    The WebClient/LocalClient/OpenAlex singletons hold persistent httpx.Client
+    pools. Closing them on shutdown releases sockets cleanly and silences
+    ResourceWarning, which matters for a distributable package and for tests.
+    """
+    for obj in (_web, _local, _openalex):
+        if obj is not None and hasattr(obj, "close"):
+            try:
+                obj.close()
+            except Exception:  # pragma: no cover — best-effort cleanup
+                pass
+
+
 atexit.register(_cleanup_temp_files)
+atexit.register(_cleanup_clients)
 
 _ZOTERO_KEY_RE = re.compile(r"^[A-Za-z0-9]+$")
 
@@ -360,11 +376,21 @@ def _error_response(code: str, message: str, **extra) -> dict:
 
 
 def _handle_tool_errors(fn):
-    """Decorator that converts common exceptions to structured JSON error responses.
+    """Decorator that converts exceptions to structured JSON error responses.
 
-    Catches ValueError (bad input), RuntimeError (unavailable/config), and
-    httpx.HTTPStatusError (API errors), and returns a JSON-encoded error dict
-    instead of raising so the LLM receives a readable error message.
+    No tool wrapped by this decorator should ever raise to the MCP layer, where
+    the error would surface to the user as an opaque protocol failure. The catch
+    order is most-specific first:
+
+    - ``ValueError`` (incl. ``json.JSONDecodeError``) -> ``invalid_input``
+    - ``httpx.HTTPStatusError`` -> ``api_error`` (status code + truncated body so
+      the caller can act on Zotero's explanation, e.g. "item version mismatch")
+    - ``httpx.TimeoutException`` -> ``timeout``
+    - any other ``httpx.HTTPError`` (connect/read/DNS/protocol) -> ``network_error``
+    - ``RuntimeError`` -> ``unavailable`` (config / mode-unavailable)
+    - ``KeyError``/``IndexError``/``TypeError``/``AttributeError`` ->
+      ``internal_error`` (an unexpected API response shape, not the user's fault)
+    - any remaining ``Exception`` -> ``internal_error`` catch-all
     """
 
     @functools.wraps(fn)
@@ -374,10 +400,17 @@ def _handle_tool_errors(fn):
         except ValueError as exc:
             return json.dumps(_error_response("invalid_input", str(exc)))
         except httpx.HTTPStatusError as exc:
+            # Include a truncated response body — Zotero 4xx/409/412 responses
+            # often carry the actual reason (invalid field, version mismatch).
+            try:
+                body = exc.response.text[:200]
+            except Exception:  # pragma: no cover — body unreadable
+                body = ""
             return json.dumps(
                 _error_response(
                     "api_error",
-                    f"Zotero API returned {exc.response.status_code}",
+                    f"Zotero API returned {exc.response.status_code}"
+                    + (f": {body}" if body else ""),
                     status_code=exc.response.status_code,
                 )
             )
@@ -388,8 +421,34 @@ def _handle_tool_errors(fn):
                     "Zotero API timed out. Try again or reduce the operation size.",
                 )
             )
+        except httpx.HTTPError as exc:
+            # Connect errors, read errors, DNS failures, protocol errors — every
+            # transport-layer failure that is not a status or timeout error.
+            return json.dumps(
+                _error_response(
+                    "network_error",
+                    f"Network error contacting an external service "
+                    f"({exc.__class__.__name__}). Check your connection and retry.",
+                )
+            )
         except RuntimeError as exc:
             return json.dumps(_error_response("unavailable", str(exc)))
+        except (KeyError, IndexError, TypeError, AttributeError) as exc:
+            logger.exception("Unexpected data-shape error in %s", fn.__name__)
+            return json.dumps(
+                _error_response(
+                    "internal_error",
+                    f"Unexpected response shape ({exc.__class__.__name__}: {exc}).",
+                )
+            )
+        except Exception as exc:  # noqa: BLE001 — final safety net; never raise to MCP
+            logger.exception("Unhandled error in %s", fn.__name__)
+            return json.dumps(
+                _error_response(
+                    "internal_error",
+                    f"Unexpected error ({exc.__class__.__name__}: {exc}).",
+                )
+            )
 
     return _wrapper
 
@@ -416,11 +475,25 @@ def server_status() -> str:
 
 
 def _read_local_or_web(local_method: str, *args, **kwargs):
-    """Try local API first (faster), fall back to web API for reads."""
+    """Try local API first (faster), fall back to web API for reads.
+
+    The local Zotero desktop API is an optional fast path; the Web API is the
+    primary source of truth. Any local failure must fall through to the web —
+    not only "desktop not running" (``RuntimeError``) but also a transiently
+    unhealthy desktop (mid-sync 500, locked DB, read timeout), which surfaces as
+    an ``httpx.HTTPError``. Catching only ``RuntimeError`` here (the original
+    bug, ZOT-15) defeated the cloud-primary design whenever desktop was up but
+    momentarily failing.
+    """
     try:
         local = _get_local()
         return getattr(local, local_method)(*args, **kwargs)
-    except RuntimeError:
+    except (RuntimeError, httpx.HTTPError) as local_exc:
+        logger.debug(
+            "Local API read (%s) failed (%s); falling back to Web API",
+            local_method,
+            local_exc.__class__.__name__,
+        )
         try:
             return getattr(_get_web(), local_method)(*args, **kwargs)
         except httpx.TimeoutException as exc:
@@ -929,8 +1002,11 @@ def get_citation_graph(
         result["cited_by_count"] = len(cited_by)
 
     if direction in ("references", "both"):
-        references = openalex.get_references(doi)
+        # Cap references to limit_int (ZOT-19): an unbounded list both bloats
+        # the response and fans out one Zotero duplicate-check call per ref.
+        references = openalex.get_references(doi, limit=limit_int)
         result["references"] = _add_library_flags(references)
+        result["references_count"] = len(references)
 
     return json.dumps(result, ensure_ascii=False)
 
@@ -1651,6 +1727,26 @@ def _extract_openalex_id(url: str) -> str:
     return url.split("/")[-1] if "/" in url else url
 
 
+def _norm_doi(doi: str) -> str:
+    """Canonicalize a DOI for use as a graph key (ZOT-22).
+
+    Strips any ``https://doi.org/`` prefix and lowercases. DOIs are
+    case-insensitive, but Zotero stores them verbatim (often with uppercase,
+    e.g. ``10.1016/J.GIE...``) while OpenAlex normalizes to lowercase. Without
+    a single normalization chokepoint, ``key_by_doi`` lookups miss for
+    uppercase DOIs, so those papers were stored with an empty ``zotero_key`` —
+    breaking every "is this in my library" back-link. Normalizing both sides
+    here also prevents duplicate paper rows for the same DOI in different cases
+    (the ``papers.doi`` PRIMARY KEY is case-sensitive).
+    """
+    doi = (doi or "").strip()
+    for prefix in ("https://doi.org/", "http://doi.org/"):
+        if doi.lower().startswith(prefix):
+            doi = doi[len(prefix) :]
+            break
+    return doi.lower()
+
+
 def _index_works(works, key_by_doi, store, openalex):
     """Index OpenAlex works into the graph store.
 
@@ -1670,7 +1766,7 @@ def _index_works(works, key_by_doi, store, openalex):
     work_refs: dict[str, list[str]] = {}
 
     for work in works:
-        doi = (work.get("doi") or "").replace("https://doi.org/", "")
+        doi = _norm_doi(work.get("doi") or "")
         if not doi:
             continue
         authorships = work.get("authorships", [])
@@ -1719,12 +1815,12 @@ def _index_works(works, key_by_doi, store, openalex):
     id_to_doi: dict[str, str] = {}
     for w in works:
         oa_id = _extract_openalex_id(w.get("id", ""))
-        d = (w.get("doi") or "").replace("https://doi.org/", "")
+        d = _norm_doi(w.get("doi") or "")
         if oa_id and d:
             id_to_doi[oa_id] = d
 
     if unknown_ids:
-        resolved = openalex.resolve_ids_to_dois(unknown_ids)
+        resolved = {oa: _norm_doi(d) for oa, d in openalex.resolve_ids_to_dois(unknown_ids).items()}
         id_to_doi.update(resolved)
         for oa_id, ref_doi in resolved.items():
             store.upsert_paper(
@@ -1772,7 +1868,7 @@ def _build_knowledge_graph(full_rebuild: bool = False) -> dict:
 
         if is_incremental:
             existing_dois = store.get_doi_set()
-            items = [item for item in items if item["DOI"] not in existing_dois]
+            items = [item for item in items if _norm_doi(item["DOI"]) not in existing_dois]
             if not items:
                 kg = _get_or_build_kg()
                 stats = kg.get_stats()
@@ -1781,8 +1877,11 @@ def _build_knowledge_graph(full_rebuild: bool = False) -> dict:
                 stats["mode"] = "sync"
                 return stats
 
+        # bulk_get_works queries OpenAlex by DOI (it normalizes case server-side),
+        # but key_by_doi must be keyed by the normalized DOI so _index_works'
+        # lookup (also normalized) matches and the zotero_key is populated (ZOT-22).
         doi_list = [item["DOI"] for item in items]
-        key_by_doi = {item["DOI"]: item["key"] for item in items}
+        key_by_doi = {_norm_doi(item["DOI"]): item["key"] for item in items}
 
         works = openalex.bulk_get_works(doi_list)
         counts = _index_works(works, key_by_doi, store, openalex)

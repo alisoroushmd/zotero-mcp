@@ -114,6 +114,28 @@ def test_create_item_manual_detects_duplicate_title():
 
 
 @respx.mock
+def test_create_item_manual_surfaces_dedup_check_failure():
+    """When the dedup check fails transiently, the result flags it (ZOT-26)."""
+    client = _make_client()
+    respx.post(f"{BASE}/items").mock(
+        return_value=httpx.Response(
+            200, json={"successful": {"0": {"key": "NEWKEY", "data": {"key": "NEWKEY"}}}}
+        )
+    )
+    # Simulate the duplicate search erroring (timeout/429): the helper sets the
+    # flag and returns None (no duplicate found).
+    with mock.patch.object(client, "search_items", side_effect=httpx.ReadTimeout("boom")):
+        result = client.create_item_manual(
+            item_type="journalArticle",
+            title="A Brand New Paper Title",
+        )
+
+    assert result["key"] == "NEWKEY"
+    assert result.get("dedup_check_failed") is True
+    assert "duplicate" in result.get("dedup_warning", "").lower()
+
+
+@respx.mock
 def test_create_item_manual_checks_doi_first():
     """create_item_manual checks DOI before title similarity."""
     client = _make_client()

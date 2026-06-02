@@ -347,3 +347,61 @@ def test_reconstruct_abstract_returns_none_for_missing():
     assert OpenAlexClient.reconstruct_abstract({}) is None
     assert OpenAlexClient.reconstruct_abstract({"abstract_inverted_index": None}) is None
     assert OpenAlexClient.reconstruct_abstract({"abstract_inverted_index": {}}) is None
+
+
+def test_reconstruct_abstract_caps_length():
+    """A pathologically long abstract is capped (ZOT-30)."""
+    from zotero_mcp.openalex_client import _MAX_ABSTRACT_CHARS
+
+    # 20000 single-char words -> ~40000 chars, well over the cap.
+    inv = {str(i): [i] for i in range(20000)}
+    result = OpenAlexClient.reconstruct_abstract({"abstract_inverted_index": inv})
+    assert result is not None
+    assert len(result) <= _MAX_ABSTRACT_CHARS + 1  # +1 for the ellipsis
+
+
+# --- Retry / rate-limit behavior (ZOT-18, ZOT-24) ---
+
+
+@respx.mock
+def test_get_work_retries_on_429(monkeypatch):
+    """A 429 is retried after honoring Retry-After (ZOT-18)."""
+    monkeypatch.setattr("zotero_mcp.openalex_client.time.sleep", lambda *_: None)
+    route = respx.get(f"{OPENALEX_BASE}/works/doi:10.1/x").mock(
+        side_effect=[
+            httpx.Response(429, headers={"Retry-After": "1"}),
+            httpx.Response(200, json={"id": "https://openalex.org/W1", "title": "OK"}),
+        ]
+    )
+    client = OpenAlexClient()
+    result = client.get_work("10.1/x")
+    assert result is not None
+    assert result["title"] == "OK"
+    assert route.call_count == 2
+
+
+@respx.mock
+def test_get_work_retries_on_5xx(monkeypatch):
+    """A 503 is retried with backoff (ZOT-18)."""
+    monkeypatch.setattr("zotero_mcp.openalex_client.time.sleep", lambda *_: None)
+    route = respx.get(f"{OPENALEX_BASE}/works/doi:10.1/y").mock(
+        side_effect=[
+            httpx.Response(503),
+            httpx.Response(200, json={"id": "https://openalex.org/W2", "title": "Recovered"}),
+        ]
+    )
+    client = OpenAlexClient()
+    result = client.get_work("10.1/y")
+    assert result is not None
+    assert result["title"] == "Recovered"
+    assert route.call_count == 2
+
+
+def test_parse_retry_after_tolerates_http_date():
+    """Retry-After parsing falls back when given an HTTP-date, not seconds (ZOT-24)."""
+    from zotero_mcp.openalex_client import _parse_retry_after
+
+    assert _parse_retry_after("5", 99.0) == 5.0
+    assert _parse_retry_after("Wed, 21 Oct 2026 07:28:00 GMT", 99.0) == 99.0
+    assert _parse_retry_after(None, 99.0) == 99.0
+    assert _parse_retry_after("garbage", 7.0) == 7.0

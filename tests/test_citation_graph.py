@@ -66,15 +66,21 @@ def test_get_references_returns_list():
             },
         )
     )
-    respx.get(f"{OPENALEX_BASE}/works/W88888").mock(
+    # References are now resolved via a single batched filter query (ZOT-18),
+    # not one GET per referenced work.
+    respx.get(f"{OPENALEX_BASE}/works").mock(
         return_value=httpx.Response(
             200,
             json={
-                "id": "https://openalex.org/W88888",
-                "doi": "https://doi.org/10.9999/referenced",
-                "title": "Referenced Paper",
-                "publication_year": 2020,
-                "authorships": [{"author": {"display_name": "Lee A"}}],
+                "results": [
+                    {
+                        "id": "https://openalex.org/W88888",
+                        "doi": "https://doi.org/10.9999/referenced",
+                        "title": "Referenced Paper",
+                        "publication_year": 2020,
+                        "authorships": [{"author": {"display_name": "Lee A"}}],
+                    }
+                ]
             },
         )
     )

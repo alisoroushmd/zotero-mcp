@@ -162,6 +162,96 @@ def test_handle_tool_errors_passes_through_success():
     assert good_tool() == '{"ok": true}'
 
 
+def test_handle_tool_errors_includes_api_response_body():
+    """api_error includes a truncated response body for actionable 4xx (ZOT-14/30)."""
+    import json as _json
+
+    import httpx
+
+    import zotero_mcp.server as srv
+
+    @srv._handle_tool_errors
+    def conflict_tool():
+        req = httpx.Request("PATCH", "https://api.zotero.org/items/X")
+        resp = httpx.Response(412, request=req, text="item version mismatch")
+        raise httpx.HTTPStatusError("412", request=req, response=resp)
+
+    result = _json.loads(conflict_tool())
+    assert result["error"] == "api_error"
+    assert result["status_code"] == 412
+    assert "item version mismatch" in result["message"]
+
+
+def test_handle_tool_errors_catches_transport_error():
+    """A non-timeout httpx transport error becomes a structured network_error (ZOT-14)."""
+    import json as _json
+
+    import httpx
+
+    import zotero_mcp.server as srv
+
+    @srv._handle_tool_errors
+    def dns_tool():
+        raise httpx.ConnectError("Name or service not known")
+
+    result = _json.loads(dns_tool())
+    assert result["error"] == "network_error"
+    assert "ConnectError" in result["message"]
+
+
+def test_handle_tool_errors_catches_data_shape_error():
+    """A KeyError from an unexpected API response becomes internal_error (ZOT-14)."""
+    import json as _json
+
+    import zotero_mcp.server as srv
+
+    @srv._handle_tool_errors
+    def shape_tool():
+        return {"a": 1}["missing"]
+
+    result = _json.loads(shape_tool())
+    assert result["error"] == "internal_error"
+
+
+def test_handle_tool_errors_catchall():
+    """Any other exception is caught by the final safety net (ZOT-14)."""
+    import json as _json
+
+    import zotero_mcp.server as srv
+
+    @srv._handle_tool_errors
+    def odd_tool():
+        raise ZeroDivisionError("boom")
+
+    result = _json.loads(odd_tool())
+    assert result["error"] == "internal_error"
+    assert "ZeroDivisionError" in result["message"]
+
+
+def test_read_local_or_web_falls_back_on_local_http_error():
+    """A local-API HTTP error (e.g. 500 mid-sync) falls back to the Web API (ZOT-15)."""
+    import httpx
+
+    import zotero_mcp.server as srv
+
+    mock_local = MagicMock()
+    req = httpx.Request("GET", "http://localhost:23119/api/users/0/items")
+    resp = httpx.Response(500, request=req)
+    mock_local.search_items.side_effect = httpx.HTTPStatusError("500", request=req, response=resp)
+
+    mock_web = MagicMock()
+    mock_web.search_items.return_value = [{"key": "FROMWEB"}]
+
+    with (
+        patch.object(srv, "_get_local", return_value=mock_local),
+        patch.object(srv, "_get_web", return_value=mock_web),
+    ):
+        result = srv._read_local_or_web("search_items", "q", 10)
+
+    assert result == [{"key": "FROMWEB"}]
+    mock_web.search_items.assert_called_once()
+
+
 # -- manage_tags tool routing --
 
 
@@ -552,3 +642,42 @@ def test_find_related_papers_flags_in_library():
     assert recs[0]["in_library"] is True
     assert recs[0]["zotero_key"] == "REC001"
     assert recs[1]["in_library"] is False
+
+
+# -- DOI normalization for graph back-links (ZOT-22) --
+
+
+def test_norm_doi_lowercases_and_strips_prefix():
+    """_norm_doi canonicalizes case and strips the doi.org prefix (ZOT-22)."""
+    import zotero_mcp.server as srv
+
+    assert srv._norm_doi("10.1016/J.GIE.2020.01.001") == "10.1016/j.gie.2020.01.001"
+    assert srv._norm_doi("https://doi.org/10.1/AbC") == "10.1/abc"
+    assert srv._norm_doi("  10.1/X  ") == "10.1/x"
+    assert srv._norm_doi("") == ""
+
+
+def test_index_works_populates_zotero_key_for_uppercase_doi(tmp_path):
+    """An uppercase Zotero DOI still matches OpenAlex's lowercase DOI (ZOT-22)."""
+    import zotero_mcp.server as srv
+    from zotero_mcp.graph_store import GraphStore
+
+    store = GraphStore(str(tmp_path / "g.sqlite"))
+    # Zotero DOI is uppercase; OpenAlex returns it lowercased.
+    key_by_doi = {srv._norm_doi("10.1016/J.GIE.2020.001"): "ZKEY1"}
+    works = [
+        {
+            "id": "https://openalex.org/W1",
+            "doi": "https://doi.org/10.1016/j.gie.2020.001",
+            "title": "Paper",
+            "publication_year": 2020,
+            "authorships": [],
+            "referenced_works": [],
+        }
+    ]
+    mock_oa = MagicMock()
+    srv._index_works(works, key_by_doi, store, mock_oa)
+    paper = store.get_paper("10.1016/j.gie.2020.001")
+    assert paper is not None
+    assert paper["zotero_key"] == "ZKEY1"  # would be "" before the fix
+    store.close()

@@ -10,7 +10,11 @@ license = "MIT"
 requires-python = ">=3.11"
 dependencies = [
     "defusedxml>=0.7.1",
-    "fastmcp>=2.3.0",
+    # Cap the major version to the tested line (ZOT-16): fastmcp had a breaking
+    # 2.x -> 3.x bump, and the committed uv.lock resolves 3.x. An unbounded
+    # floor let a fresh install resolve an untested major. Bump the cap only
+    # after testing against the next major.
+    "fastmcp>=3.2,<4",
     "httpx>=0.27.0",
     "python-docx>=1.1.0",
     # Use OS trust store for HTTPS — avoids broken/stale bundled CA bundles

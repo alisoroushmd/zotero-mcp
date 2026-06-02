@@ -7,6 +7,7 @@ Import this module instead of calling os.environ.get() in individual modules.
 from __future__ import annotations
 
 import os
+import sys
 from dataclasses import dataclass
 
 
@@ -23,6 +24,10 @@ class Config:
 
     # Optional: improves rate limits for find_related_papers
     semantic_scholar_api_key: str = ""
+
+    # Optional: NCBI eutils API key — raises the rate limit from 3 to 10 req/s
+    # and is passed on all PubMed efetch/esearch/elink calls when set (ZOT-28).
+    ncbi_api_key: str = ""
 
     # Optional: polite email for external APIs (CrossRef, OpenAlex)
     polite_email: str = "zotero-mcp@example.com"
@@ -58,8 +63,29 @@ class Config:
 
     @property
     def default_graph_db_path(self) -> str:
-        """Default path for the graph SQLite database."""
-        data_home = self.xdg_data_home or os.path.expanduser("~/.local/share")
+        """Default path for the graph SQLite database (OS-native, ZOT-31).
+
+        Honors ``XDG_DATA_HOME`` if set. Otherwise uses the platform's
+        conventional per-user data directory: ``~/Library/Application Support``
+        on macOS, ``%LOCALAPPDATA%`` on Windows, ``~/.local/share`` elsewhere.
+        Avoids a hard dependency on ``platformdirs`` while still being correct
+        on each platform.
+        """
+        # Backward compatibility: if a DB already exists at the historical XDG
+        # location, keep using it so existing users don't silently lose their
+        # built graph when upgrading.
+        legacy = os.path.join(os.path.expanduser("~/.local/share"), "zotero-mcp", "graph.sqlite")
+        if not self.xdg_data_home and os.path.exists(legacy):
+            return legacy
+
+        if self.xdg_data_home:
+            data_home = self.xdg_data_home
+        elif sys.platform == "darwin":
+            data_home = os.path.expanduser("~/Library/Application Support")
+        elif sys.platform == "win32":
+            data_home = os.environ.get("LOCALAPPDATA") or os.path.expanduser("~\\AppData\\Local")
+        else:
+            data_home = os.path.expanduser("~/.local/share")
         return os.path.join(data_home, "zotero-mcp", "graph.sqlite")
 
     @property
@@ -80,6 +106,7 @@ def load_config() -> Config:
         zotero_user_id=os.environ.get("ZOTERO_USER_ID", ""),
         openalex_api_key=os.environ.get("OPENALEX_API_KEY", ""),
         semantic_scholar_api_key=os.environ.get("SEMANTIC_SCHOLAR_API_KEY", ""),
+        ncbi_api_key=os.environ.get("NCBI_API_KEY", ""),
         polite_email=os.environ.get("ZOTERO_MCP_EMAIL", "zotero-mcp@example.com"),
         graph_db_path=os.environ.get("ZOTERO_MCP_GRAPH_DB", ""),
         zotero_data_dir=os.environ.get("ZOTERO_DATA_DIR", ""),

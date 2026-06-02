@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import logging
+import time
 
 import httpx
 
@@ -12,6 +13,25 @@ logger = logging.getLogger(__name__)
 
 OPENALEX_BASE = "https://api.openalex.org"
 TIMEOUT = 10.0
+_MAX_RETRIES = 3
+_BASE_BACKOFF = 1.5  # seconds; doubled each attempt
+_MAX_RETRY_AFTER = 30.0  # cap a server-supplied Retry-After sleep
+_MAX_ABSTRACT_CHARS = 10_000  # defensive cap on reconstructed abstracts (ZOT-30)
+
+
+def _parse_retry_after(value: str | None, fallback: float) -> float:
+    """Parse a Retry-After header value to seconds.
+
+    Per RFC 7231 the header may be delta-seconds OR an HTTP-date. We only honor
+    the numeric form; anything else (a date, or junk) falls back to ``fallback``
+    so a date-valued header never crashes the retry loop (ZOT-24).
+    """
+    if not value:
+        return fallback
+    try:
+        return float(value)
+    except (ValueError, TypeError):
+        return fallback
 
 
 class OpenAlexClient:
@@ -35,6 +55,70 @@ class OpenAlexClient:
             timeout=TIMEOUT,
         )
 
+    def close(self) -> None:
+        """Close the pooled HTTP client (ZOT-23)."""
+        self._client.close()
+
+    def _get_with_retry(self, path: str, params: dict | None = None) -> httpx.Response:
+        """GET with backoff on 429/5xx and transport errors (ZOT-18).
+
+        OpenAlex enforces ~10 req/s and 100k/day. Without this, a rate-limited
+        response silently degraded callers to empty results, producing an
+        incomplete graph with no error. Honors ``Retry-After`` on 429 (capped),
+        exponential backoff on 5xx and transport errors.
+
+        Args:
+            path: Request path relative to the OpenAlex base URL.
+            params: Optional query parameters.
+
+        Returns:
+            The successful ``httpx.Response`` (caller handles 404 / status codes).
+
+        Raises:
+            httpx.HTTPError: if all retries are exhausted.
+        """
+        last_exc: Exception | None = None
+        for attempt in range(_MAX_RETRIES):
+            backoff = _BASE_BACKOFF * (2**attempt)
+            try:
+                resp = self._client.get(path, params=params)
+            except httpx.HTTPError as exc:
+                last_exc = exc
+                if attempt == _MAX_RETRIES - 1:
+                    raise
+                logger.warning(
+                    "OpenAlex transport error (%s) on %s; retry %d/%d",
+                    exc.__class__.__name__,
+                    path,
+                    attempt + 1,
+                    _MAX_RETRIES,
+                )
+                time.sleep(backoff)
+                continue
+
+            if resp.status_code == 429:
+                if attempt == _MAX_RETRIES - 1:
+                    return resp  # let the caller see the 429 via raise_for_status
+                sleep_for = min(
+                    _parse_retry_after(resp.headers.get("Retry-After"), backoff),
+                    _MAX_RETRY_AFTER,
+                )
+                logger.warning("OpenAlex 429; sleeping %.1fs before retry", sleep_for)
+                time.sleep(sleep_for)
+                continue
+
+            if 500 <= resp.status_code < 600 and attempt < _MAX_RETRIES - 1:
+                logger.warning("OpenAlex %d on %s; retry %d", resp.status_code, path, attempt + 1)
+                time.sleep(backoff)
+                continue
+
+            return resp
+
+        # Unreachable on success; only hit if loop exits via transport-error path.
+        if last_exc is not None:
+            raise last_exc
+        raise RuntimeError("OpenAlex request failed after retries")  # pragma: no cover
+
     def get_work(self, doi: str) -> dict | None:
         """Get work metadata by DOI.
 
@@ -51,7 +135,7 @@ class OpenAlexClient:
             doi = doi[len("http://doi.org/") :]
 
         try:
-            resp = self._client.get(f"/works/doi:{doi}")
+            resp = self._get_with_retry(f"/works/doi:{doi}")
             if resp.status_code == 404:
                 return None
             # Surface auth failures instead of swallowing them as "not found"
@@ -112,7 +196,7 @@ class OpenAlexClient:
             return []
 
         try:
-            resp = self._client.get(
+            resp = self._get_with_retry(
                 "/works",
                 params={
                     "filter": f"cites:{openalex_id}",
@@ -127,42 +211,59 @@ class OpenAlexClient:
             logger.warning("Failed to fetch citing works for DOI %s", doi)
             return []
 
-    def get_references(self, doi: str) -> list[dict]:
+    def get_references(self, doi: str, limit: int = 20) -> list[dict]:
         """Get works referenced by the given DOI.
 
-        Fetches referenced works in parallel (up to 5 concurrent).
-        Limited to first 20 references to avoid excessive API calls.
+        Resolves the referenced works in a single batched query via the
+        ``openalex:`` filter (ZOT-18) rather than N individual GETs in a thread
+        pool. This cuts up to ``limit`` requests down to one, removes the
+        per-request rate-limit blind spot, and goes through ``_get_with_retry``.
 
         Args:
             doi: DOI of the target paper.
+            limit: Maximum number of references to resolve.
 
         Returns:
-            List of work summary dicts.
+            List of work summary dicts (order follows the API response).
         """
-        from concurrent.futures import ThreadPoolExecutor
-
         work = self.get_work(doi)
         if not work:
             return []
 
-        ref_ids = work.get("referenced_works", [])[:20]
-        if not ref_ids:
+        ref_urls = work.get("referenced_works", [])[: max(0, limit)]
+        if not ref_urls:
             return []
 
-        def _fetch_one(ref_url: str) -> dict | None:
-            ref_id = ref_url.split("/")[-1]
+        ref_ids = [url.split("/")[-1] for url in ref_urls if url]
+        works = self._bulk_get_works_by_openalex_id(ref_ids)
+        return [self._format_work_summary(w) for w in works]
+
+    def _bulk_get_works_by_openalex_id(
+        self, openalex_ids: list[str], batch_size: int = 50
+    ) -> list[dict]:
+        """Batch-fetch full work dicts by OpenAlex ID via the ``openalex:`` filter.
+
+        Args:
+            openalex_ids: OpenAlex work IDs (e.g. ["W123", "W456"]).
+            batch_size: Max IDs per request.
+
+        Returns:
+            List of raw OpenAlex work dicts (missing IDs are simply absent).
+        """
+        all_works: list[dict] = []
+        for i in range(0, len(openalex_ids), batch_size):
+            batch = openalex_ids[i : i + batch_size]
+            id_filter = "openalex:" + "|".join(batch)
             try:
-                resp = self._client.get(f"/works/{ref_id}")
-                if resp.status_code == 200:
-                    return self._format_work_summary(resp.json())
+                resp = self._get_with_retry(
+                    "/works",
+                    params={"filter": id_filter, "per_page": batch_size},
+                )
+                resp.raise_for_status()
+                all_works.extend(resp.json().get("results", []))
             except Exception as exc:
-                logger.warning("OpenAlex reference fetch failed for %s: %s", ref_id, exc)
-            return None
-
-        with ThreadPoolExecutor(max_workers=5) as pool:
-            fetched = list(pool.map(_fetch_one, ref_ids))
-
-        return [r for r in fetched if r is not None]
+                logger.warning("OpenAlex ref batch %d failed: %s", i, exc)
+        return all_works
 
     def check_published_version(self, doi: str) -> dict:
         """Check if a preprint DOI has been formally published in a journal.
@@ -229,7 +330,7 @@ class OpenAlexClient:
             batch = dois[i : i + batch_size]
             doi_filter = "doi:" + "|".join(batch)
             try:
-                resp = self._client.get(
+                resp = self._get_with_retry(
                     "/works",
                     params={"filter": doi_filter, "per_page": batch_size},
                 )
@@ -257,7 +358,7 @@ class OpenAlexClient:
             batch = openalex_ids[i : i + batch_size]
             id_filter = "openalex:" + "|".join(batch)
             try:
-                resp = self._client.get(
+                resp = self._get_with_retry(
                     "/works",
                     params={
                         "filter": id_filter,
@@ -321,7 +422,12 @@ class OpenAlexClient:
                 positions[pos] = word
         if not positions:
             return None
-        return " ".join(positions[i] for i in sorted(positions))
+        text = " ".join(positions[i] for i in sorted(positions))
+        # Defensive cap (ZOT-30): a malformed/huge inverted index should never
+        # produce a multi-MB string fed to the LLM or stored in SQLite.
+        if len(text) > _MAX_ABSTRACT_CHARS:
+            text = text[:_MAX_ABSTRACT_CHARS].rstrip() + "…"
+        return text
 
     @staticmethod
     def extract_authorships(work: dict) -> list[dict]:

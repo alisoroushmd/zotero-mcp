@@ -32,6 +32,13 @@ class LocalClient:
                     "Call server_status to check which modes are available."
                 ) from err
 
+    def close(self) -> None:
+        """Close the pooled HTTP client (ZOT-23)."""
+        try:
+            self._client.close()
+        except Exception:  # pragma: no cover — best-effort cleanup
+            pass
+
     def _get(self, path: str, params: dict | None = None) -> httpx.Response:
         """GET request to local API with connection error handling."""
         try:
