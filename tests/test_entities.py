@@ -107,6 +107,39 @@ class TestStoreEntities:
         names = {e["name"] for e in entities}
         assert names == {"cdx2", "gastric cancer"}
 
+    def test_store_entities_normalizes_uppercase_doi(self, tmp_db):
+        """An uppercase entity DOI links to the normalized papers row (ZOT-22 review)."""
+        from zotero_mcp.server import search_entities, store_entities
+
+        store = GraphStore(tmp_db)
+        # Paper stored under the normalized (lowercase) DOI, as _index_works does.
+        store.upsert_paper(
+            doi="10.1016/j.gie.2023.01.001",
+            zotero_key="ZK",
+            title="GIM paper",
+            year=2023,
+            authors="A",
+            openalex_id="W9",
+        )
+        store.close()
+
+        # Entity stored against the UPPERCASE DOI from raw Zotero metadata.
+        payload = json.dumps(
+            [
+                {
+                    "doi": "10.1016/J.GIE.2023.01.001",
+                    "entities": [{"name": "CDX2", "type": "biomarker"}],
+                }
+            ]
+        )
+        assert json.loads(store_entities(payload))["stored"] == 1
+
+        # The link must be visible when queried by either casing (both normalize).
+        for query_doi in ("10.1016/J.GIE.2023.01.001", "10.1016/j.gie.2023.01.001"):
+            res = json.loads(search_entities(query_type="paper_entities", doi=query_doi))
+            names = {e["name"] for e in res["entities"]}
+            assert "cdx2" in names, f"entity link orphaned for DOI {query_doi}"
+
     def test_store_entities_from_list(self, tmp_db):
         """store_entities accepts a parsed list directly."""
         from zotero_mcp.server import store_entities

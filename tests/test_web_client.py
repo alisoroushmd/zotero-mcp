@@ -1003,3 +1003,45 @@ def test_pubmed_get_omits_key_when_unset(monkeypatch):
         assert "api_key=" not in str(route.calls.last.request.url)
     finally:
         _reset_config()
+
+
+# -- Retry-After hostile-value handling (ZOT-24 review) --
+
+
+def test_parse_retry_after_rejects_hostile_values():
+    """web_client _parse_retry_after rejects negative/nan/inf (ZOT-24 review)."""
+    from zotero_mcp.web_client import _parse_retry_after
+
+    assert _parse_retry_after("5", 9.0) == 5.0
+    assert _parse_retry_after("-5", 9.0) == 9.0
+    assert _parse_retry_after("nan", 9.0) == 9.0
+    assert _parse_retry_after("inf", 9.0) == 9.0
+    assert _parse_retry_after("Wed, 21 Oct 2026 07:28:00 GMT", 9.0) == 9.0
+    assert _parse_retry_after(None, 9.0) == 9.0
+
+
+# -- Stale dedup flag does not leak across pooled-client calls (ZOT-26 review) --
+
+
+@respx.mock
+def test_dedup_flag_does_not_leak_to_url_create():
+    """A prior transient dedup failure must not flag a later DOI-less URL create."""
+    client = WebClient(api_key="k", user_id="1")
+    # Poison the flag as if a previous create had a dedup-check failure.
+    client._dedup_check_failed = True
+
+    # Translation /web returns a webpage stub with NO DOI -> no dedup check runs.
+    respx.post("https://translate.zotero.org/web").mock(
+        return_value=httpx.Response(
+            200, json=[{"itemType": "webpage", "title": "Some Page", "url": "https://x.test"}]
+        )
+    )
+    respx.post(f"{WEB_BASE}/users/1/items").mock(
+        return_value=httpx.Response(
+            200, json={"successful": {"0": {"key": "URLKEY", "data": {"key": "URLKEY"}}}}
+        )
+    )
+    result = client.create_item_from_url("https://x.test/page")
+    assert result["key"] == "URLKEY"
+    # The stale flag must have been reset at entry, so no false warning.
+    assert "dedup_check_failed" not in result

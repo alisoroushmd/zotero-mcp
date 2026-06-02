@@ -719,7 +719,18 @@ def get_pdf_content(item_key: str, extract_text: bool = False) -> str:
         """If extract_text is requested, extract text from PDF source and add to result."""
         if not extract_text:
             return result_dict
-        from zotero_mcp.text_extractor import extract_text_from_pdf
+        from zotero_mcp.text_extractor import extract_text_from_pdf, pypdf_available
+
+        # Without the [fulltext] extra, keep the path-based result usable (the
+        # caller can read the PDF natively) instead of raising (ZOT-30 review).
+        if not pypdf_available():
+            result_dict["text_extraction"] = "unavailable"
+            result_dict["text_extraction_note"] = (
+                "Inline text extraction requires the [fulltext] extra "
+                "(pip install 'zotero-mcp-plus[fulltext]'). The PDF path/PMCID "
+                "above is still usable for native reading."
+            )
+            return result_dict
 
         text = extract_text_from_pdf(source)
         if text:
@@ -1820,50 +1831,57 @@ def _index_works(works, key_by_doi, store, openalex):
     all_ref_ids: set[str] = set()
     work_refs: dict[str, list[str]] = {}
 
-    for work in works:
-        doi = _norm_doi(work.get("doi") or "")
-        if not doi:
-            continue
-        authorships = work.get("authorships", [])
-        authors = "; ".join(a.get("author", {}).get("display_name", "") for a in authorships[:3])
-        pub_date = (work.get("publication_date") or "")[:7]  # YYYY-MM
-        abstract = OpenAlexClient.reconstruct_abstract(work)
-        store.upsert_paper(
-            doi=doi,
-            zotero_key=key_by_doi.get(doi, ""),
-            title=work.get("title", ""),
-            year=work.get("publication_year", 0),
-            authors=authors,
-            openalex_id=work.get("id", ""),
-            publication_date=pub_date,
-            abstract=abstract,
-        )
-        papers_added += 1
-
-        for topic in OpenAlexClient.extract_topics(work):
-            store.upsert_topic(doi=doi, **topic)
-            topics_indexed += 1
-
-        for auth in OpenAlexClient.extract_authorships(work):
-            store.upsert_author(
-                openalex_author_id=auth["openalex_author_id"],
-                display_name=auth["display_name"],
-                orcid=auth.get("orcid", ""),
-                institution=auth.get("institution", ""),
+    # Batch the per-work upserts into a single transaction (ZOT-20): one commit
+    # instead of one fsync per paper/topic/author over the whole library. The
+    # network call (resolve_ids_to_dois) happens AFTER this block, outside any
+    # open transaction, so it never blocks readers.
+    with store.batch():
+        for work in works:
+            doi = _norm_doi(work.get("doi") or "")
+            if not doi:
+                continue
+            authorships = work.get("authorships", [])
+            authors = "; ".join(
+                a.get("author", {}).get("display_name", "") for a in authorships[:3]
             )
-            store.upsert_paper_author(
+            pub_date = (work.get("publication_date") or "")[:7]  # YYYY-MM
+            abstract = OpenAlexClient.reconstruct_abstract(work)
+            store.upsert_paper(
                 doi=doi,
-                openalex_author_id=auth["openalex_author_id"],
-                position=auth.get("position", 0),
+                zotero_key=key_by_doi.get(doi, ""),
+                title=work.get("title", ""),
+                year=work.get("publication_year", 0),
+                authors=authors,
+                openalex_id=work.get("id", ""),
+                publication_date=pub_date,
+                abstract=abstract,
             )
-            authors_indexed += 1
+            papers_added += 1
 
-        ref_ids = [_extract_openalex_id(url) for url in work.get("referenced_works", [])]
-        if ref_ids:
-            work_refs[doi] = ref_ids
-            all_ref_ids.update(ref_ids)
+            for topic in OpenAlexClient.extract_topics(work):
+                store.upsert_topic(doi=doi, **topic)
+                topics_indexed += 1
 
-    # Resolve OpenAlex IDs to DOIs
+            for auth in OpenAlexClient.extract_authorships(work):
+                store.upsert_author(
+                    openalex_author_id=auth["openalex_author_id"],
+                    display_name=auth["display_name"],
+                    orcid=auth.get("orcid", ""),
+                    institution=auth.get("institution", ""),
+                )
+                store.upsert_paper_author(
+                    doi=doi,
+                    openalex_author_id=auth["openalex_author_id"],
+                    position=auth.get("position", 0),
+                )
+                authors_indexed += 1
+
+            ref_ids = [_extract_openalex_id(url) for url in work.get("referenced_works", [])]
+            if ref_ids:
+                work_refs[doi] = ref_ids
+                all_ref_ids.update(ref_ids)
+
+    # Resolve OpenAlex IDs to DOIs (network call — outside any transaction)
     known_oa_ids = {_extract_openalex_id(w.get("id", "")) for w in works if w.get("id")}
     unknown_ids = list(all_ref_ids - known_oa_ids)
 
@@ -1874,9 +1892,16 @@ def _index_works(works, key_by_doi, store, openalex):
         if oa_id and d:
             id_to_doi[oa_id] = d
 
+    # Resolve unknown reference IDs to DOIs via the network BEFORE opening the
+    # second transaction, so no write transaction is held across a network call.
+    resolved: dict[str, str] = {}
     if unknown_ids:
         resolved = {oa: _norm_doi(d) for oa, d in openalex.resolve_ids_to_dois(unknown_ids).items()}
         id_to_doi.update(resolved)
+
+    citations_added = 0
+    # Second batch: resolved-reference paper stubs + citation edges (one commit).
+    with store.batch():
         for oa_id, ref_doi in resolved.items():
             store.upsert_paper(
                 doi=ref_doi,
@@ -1887,13 +1912,12 @@ def _index_works(works, key_by_doi, store, openalex):
                 openalex_id=f"https://openalex.org/{oa_id}",
             )
 
-    citations_added = 0
-    for citing_doi, ref_ids in work_refs.items():
-        for ref_id in ref_ids:
-            cited_doi = id_to_doi.get(ref_id)
-            if cited_doi:
-                store.upsert_citation(citing_doi=citing_doi, cited_doi=cited_doi)
-                citations_added += 1
+        for citing_doi, ref_ids in work_refs.items():
+            for ref_id in ref_ids:
+                cited_doi = id_to_doi.get(ref_id)
+                if cited_doi:
+                    store.upsert_citation(citing_doi=citing_doi, cited_doi=cited_doi)
+                    citations_added += 1
 
     return {
         "papers_indexed": papers_added,
@@ -2163,11 +2187,12 @@ def query_knowledge_graph(
     elif query_type == "path":
         if not doi_a or not doi_b:
             raise ValueError("path query requires doi_a and doi_b")
-        result = kg.get_path(doi_a, doi_b)
+        # Graph nodes are normalized DOIs (ZOT-22); normalize lookups to match.
+        result = kg.get_path(_norm_doi(doi_a), _norm_doi(doi_b))
     elif query_type == "neighborhood":
         if not doi:
             raise ValueError("neighborhood query requires doi")
-        result = kg.get_neighborhood(doi, depth=depth)
+        result = kg.get_neighborhood(_norm_doi(doi), depth=depth)
     elif query_type == "stats":
         result = kg.get_stats()
     elif query_type == "timeline":
@@ -2191,7 +2216,7 @@ def query_knowledge_graph(
     elif query_type == "citation_velocity":
         if not doi:
             raise ValueError("citation_velocity query requires doi")
-        result = kg.get_citation_velocity(doi)
+        result = kg.get_citation_velocity(_norm_doi(doi))
     elif query_type == "trending":
         result = kg.get_trending(top_n=limit, years=years)
     else:
@@ -2497,7 +2522,9 @@ def store_entities(results: str | list) -> str:
 
     with GraphStore() as store:
         for item in results:
-            doi = item.get("doi", "").strip()
+            # Normalize so entity links join the papers table, whose doi key is
+            # normalized (ZOT-22); a raw uppercase DOI would orphan the link.
+            doi = _norm_doi(item.get("doi", ""))
             if not doi:
                 continue
             entities = item.get("entities", [])
@@ -2631,7 +2658,8 @@ def search_entities(
         elif query_type == "shared_entities":
             if not doi_a or not doi_b:
                 raise ValueError("shared_entities query requires doi_a and doi_b")
-            shared = store.get_shared_entities(doi_a, doi_b)
+            # Entity links are keyed by normalized DOI (ZOT-22); normalize lookups.
+            shared = store.get_shared_entities(_norm_doi(doi_a), _norm_doi(doi_b))
             return json.dumps(
                 {"query": "shared_entities", "doi_a": doi_a, "doi_b": doi_b, "shared": shared},
                 ensure_ascii=False,
@@ -2640,7 +2668,7 @@ def search_entities(
         elif query_type == "paper_entities":
             if not doi:
                 raise ValueError("paper_entities query requires doi")
-            entities = store.get_entities_for_doi(doi)
+            entities = store.get_entities_for_doi(_norm_doi(doi))
             return json.dumps(
                 {"query": "paper_entities", "doi": doi, "entities": entities},
                 ensure_ascii=False,

@@ -405,3 +405,14 @@ def test_parse_retry_after_tolerates_http_date():
     assert _parse_retry_after("Wed, 21 Oct 2026 07:28:00 GMT", 99.0) == 99.0
     assert _parse_retry_after(None, 99.0) == 99.0
     assert _parse_retry_after("garbage", 7.0) == 7.0
+
+
+def test_parse_retry_after_rejects_hostile_values():
+    """Negative / nan / inf Retry-After fall back so time.sleep never crashes (ZOT-24 review)."""
+    from zotero_mcp.openalex_client import _parse_retry_after
+
+    assert _parse_retry_after("-5", 9.0) == 9.0
+    assert _parse_retry_after("nan", 9.0) == 9.0
+    assert _parse_retry_after("inf", 9.0) == 9.0
+    assert _parse_retry_after("-inf", 9.0) == 9.0
+    assert _parse_retry_after("0", 9.0) == 0.0  # zero is valid (sleep 0 is fine)

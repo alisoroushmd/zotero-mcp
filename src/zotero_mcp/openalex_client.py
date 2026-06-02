@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import logging
+import math
 import time
 
 import httpx
@@ -29,9 +30,12 @@ def _parse_retry_after(value: str | None, fallback: float) -> float:
     if not value:
         return fallback
     try:
-        return float(value)
+        parsed = float(value)
     except (ValueError, TypeError):
         return fallback
+    if not math.isfinite(parsed) or parsed < 0:
+        return fallback
+    return parsed
 
 
 class OpenAlexClient:

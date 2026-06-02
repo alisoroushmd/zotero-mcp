@@ -681,3 +681,55 @@ def test_index_works_populates_zotero_key_for_uppercase_doi(tmp_path):
     assert paper is not None
     assert paper["zotero_key"] == "ZKEY1"  # would be "" before the fix
     store.close()
+
+
+# -- KG query DOI normalization (ZOT-22 review) --
+
+
+def test_query_knowledge_graph_normalizes_doi_inputs():
+    """path/neighborhood/citation_velocity normalize DOIs to match graph nodes (ZOT-22 review)."""
+
+    import zotero_mcp.server as srv
+
+    mock_kg = MagicMock()
+    mock_kg.get_neighborhood.return_value = {"ok": True}
+    mock_kg.get_path.return_value = []
+    mock_kg.get_citation_velocity.return_value = []
+
+    with patch.object(srv, "_get_or_build_kg", return_value=mock_kg):
+        srv.query_knowledge_graph(query_type="neighborhood", doi="10.1016/J.GIE.2023.01.001")
+        mock_kg.get_neighborhood.assert_called_once()
+        assert mock_kg.get_neighborhood.call_args.args[0] == "10.1016/j.gie.2023.01.001"
+
+        srv.query_knowledge_graph(
+            query_type="path",
+            doi_a="https://doi.org/10.1/A",
+            doi_b="10.2/B",
+        )
+        assert mock_kg.get_path.call_args.args == ("10.1/a", "10.2/b")
+
+        srv.query_knowledge_graph(query_type="citation_velocity", doi="10.3/CcC")
+        assert mock_kg.get_citation_velocity.call_args.args[0] == "10.3/ccc"
+
+
+def test_get_pdf_content_extract_text_degrades_without_pypdf():
+    """extract_text=True without pypdf returns the path result, not an error (ZOT-30 review)."""
+    import json as _json
+
+    import zotero_mcp.server as srv
+
+    mock_web = MagicMock()
+    mock_web.get_item.return_value = {"key": "K", "DOI": "", "title": "T", "extra": "", "url": ""}
+    # Force the local-PDF branch to yield a path.
+    mock_local = MagicMock()
+    mock_local.get_item.return_value = mock_web.get_item.return_value
+
+    with (
+        patch.object(srv, "_get_local", side_effect=RuntimeError("no local")),
+        patch.object(srv, "_get_web", return_value=mock_web),
+        patch("zotero_mcp.text_extractor.pypdf_available", return_value=False),
+    ):
+        # Even if no PDF source is found, the tool must not raise an internal_error
+        # purely because pypdf is missing; it returns a structured result.
+        result = _json.loads(srv.get_pdf_content("K", extract_text=True))
+    assert result.get("error") != "internal_error"

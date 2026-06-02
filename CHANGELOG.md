@@ -100,6 +100,25 @@ Stability and distributability hardening pass (audit findings ZOT-13…ZOT-31).
   macOS, `%LOCALAPPDATA%` on Windows), with backward-compatible reuse of an
   existing `~/.local/share` database (ZOT-31). (`config.py`)
 
+### Fixed (adversarial-review follow-ups, same release)
+
+- **DOI normalization extended to query paths (ZOT-32).** The build-time
+  `_norm_doi` change had relocated the uppercase-DOI back-link breakage to
+  query-time; `query_knowledge_graph` (path/neighborhood/citation_velocity) and
+  the entity subsystem (`store_entities` write, `search_entities`
+  paper_entities/shared_entities reads) now normalize too. (`server.py`)
+- **`Retry-After` rejects hostile values (ZOT-33).** Negative / `nan` / `inf`
+  fall back instead of crashing `time.sleep`. (`web_client.py`, `openalex_client.py`)
+- **`get_pdf_content(extract_text=True)` degrades gracefully (ZOT-34)** when the
+  `[fulltext]` extra is missing, returning the PDF path with a note instead of
+  an `internal_error`. (`server.py`)
+- **No stale dedup-warning leak (ZOT-35).** `_dedup_check_failed` is reset at
+  each create entrypoint so a prior transient failure can't flag a later
+  DOI-less URL create. (`web_client.py`)
+- **Knowledge-graph build batches its writes (ZOT-36).** `_index_works` wraps
+  upserts in `store.batch()` (network resolution outside the transaction),
+  realizing the single-commit perf win. (`server.py`)
+
 > Note: 0.8.4 and 0.8.5 were tagged without dedicated changelog sections; their
 > changes (deferred ZOT-05/07/08 and the MCP best-practices pass) are captured in
 > the project's TASKS.md history and are superseded by this release.

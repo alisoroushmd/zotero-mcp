@@ -66,6 +66,26 @@ Durable backlog for this repo. Severity: `[high]` / `[med]` / `[low]`.
   `{items, count}` on get_notes/get_item_attachments; OS-native graph DB path;
   `OPENALEX_API_KEY` noted in server instructions. completed 2026-06-02.
 
+### 2026-06-02 adversarial-review follow-ups (regressions caught + fixed)
+
+- `[high]` ZOT-32 — `_norm_doi` extended to KG query inputs (path/neighborhood/
+  citation_velocity) and the entity subsystem (store_entities write +
+  search_entities paper_entities/shared_entities reads). The build-time DOI
+  normalization had relocated the back-link breakage to query-time; now fixed at
+  both ends. completed 2026-06-02.
+- `[med]` ZOT-33 — `_parse_retry_after` (web_client + openalex) rejects
+  negative/`nan`/`inf` values so `time.sleep` can't crash a retry loop on a
+  hostile Retry-After header. completed 2026-06-02.
+- `[med]` ZOT-34 — `get_pdf_content(extract_text=True)` degrades gracefully when
+  pypdf is missing (returns the path result with a note) instead of raising
+  `internal_error`. completed 2026-06-02.
+- `[low]` ZOT-35 — `_dedup_check_failed` reset at each create entrypoint so a
+  prior call's transient failure can't leak a false warning onto a later
+  DOI-less URL create (pooled client is process-wide). completed 2026-06-02.
+- `[low]` ZOT-36 — `_index_works` wraps its upserts in two `store.batch()`
+  transactions (network resolution outside both), realizing the per-row-commit
+  perf win the `batch()` API was built for. completed 2026-06-02.
+
 ### 2026-05-28 audit
 
 - `[med]` ZOT-03 — added annotations (readOnly/destructive/idempotent) to all

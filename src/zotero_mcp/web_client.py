@@ -5,6 +5,7 @@ from __future__ import annotations
 import hashlib
 import ipaddress
 import logging
+import math
 import re
 import time
 from pathlib import Path
@@ -162,16 +163,20 @@ def _parse_retry_after(value: str | None, fallback: float) -> float:
     """Parse a Retry-After header to seconds, tolerating HTTP-date values (ZOT-24).
 
     RFC 7231 allows Retry-After to be either delta-seconds or an HTTP-date. We
-    only honor the numeric form; a date (which a CDN/proxy in front of the API
-    may send) or any junk falls back to ``fallback`` instead of crashing the
-    retry loop with ``ValueError``.
+    only honor a finite, non-negative numeric form; a date, junk, or a hostile
+    value (negative / nan / inf) falls back to ``fallback`` — otherwise
+    ``time.sleep(-5)`` / ``time.sleep(nan)`` would crash the retry loop, the
+    opposite of hardening it (ZOT-24 review).
     """
     if not value:
         return fallback
     try:
-        return float(value)
+        parsed = float(value)
     except (ValueError, TypeError):
         return fallback
+    if not math.isfinite(parsed) or parsed < 0:
+        return fallback
+    return parsed
 
 
 def _retry_request(
@@ -1186,6 +1191,10 @@ class WebClient:
         from datetime import date
 
         _validate_url(url)
+        # Reset so a prior call's transient dedup failure can't leak into this
+        # result on the DOI-less webpage-stub path that runs no dedup check
+        # (the pooled client is process-wide) (ZOT-26 review).
+        self._dedup_check_failed = False
 
         metadata = None
 
@@ -1335,6 +1344,7 @@ class WebClient:
         Returns:
             Dict with "key" and "title".
         """
+        self._dedup_check_failed = False  # avoid stale flag leak (ZOT-26 review)
         metadata: dict = {
             "itemType": item_type,
             "title": title,
