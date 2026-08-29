@@ -9,6 +9,7 @@ import time
 import httpx
 
 from zotero_mcp.config import get_config
+from zotero_mcp.web_client import _polite_user_agent
 
 logger = logging.getLogger(__name__)
 
@@ -50,7 +51,10 @@ class OpenAlexClient:
         cfg = get_config()
         api_key = api_key or cfg.openalex_api_key
         email = email or cfg.polite_email
-        headers = {"User-Agent": f"zotero-mcp/1.0 (mailto:{email})"}
+        # Shared polite-UA helper (ZOT-39): omits the mailto: clause for
+        # placeholder emails (e.g. the zotero-mcp@example.com default) instead
+        # of sending a fake identity, and carries the real package/version.
+        headers = {"User-Agent": _polite_user_agent(email)}
         if api_key:
             headers["Authorization"] = f"Bearer {api_key}"
         self._client = httpx.Client(

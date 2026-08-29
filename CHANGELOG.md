@@ -6,6 +6,170 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/).
 
 ## [Unreleased]
 
+### Added
+
+- **Attachment migration: convert existing `imported_*` attachments to
+  `linked_file`, reclaiming Zotero cloud storage quota without losing a
+  file.** `attach_pdf` stopped *creating* quota-consuming attachments, but
+  every attachment created before that change still occupies the quota. This
+  adds the one-way migration for them. (`attachment_migration.py`)
+
+  New tools: `plan_attachment_migration` (read-only dry run),
+  `migrate_attachments` (dry run by default; `apply=true` to act), and
+  `inspect_trash` (list trash contents before an irreversible purge). Also
+  available as a CLI: `zotero-migrate-attachments`, which is a dry run
+  unless `--apply` is passed.
+
+  `imported_file` is the safe default. `imported_url` snapshots require
+  explicit opt-in and are accepted only when already downloaded locally and
+  validated as exactly one regular file; cloud-only or multi-resource
+  snapshots are skipped so companion files cannot be silently lost. Where
+  PDF bytes live is detected per attachment rather than assumed: files
+  present under `storage/<key>/` are copied, and cloud-only ones are fetched
+  via `GET /items/<key>/file`. Its redirect is followed with a clean HTTP
+  client so the Zotero API key is never forwarded, and presigned URL details
+  are redacted from failure output.
+
+  Ordering is chosen so that a crash at any point leaves the library
+  recoverable: bytes are written and hash-verified on local disk (the digest
+  is computed from the file re-read from disk, and downloads are additionally
+  checked against Zotero's server-side MD5), then the replacement
+  `linked_file` attachment is created, and only then is the original
+  trashed. An attachment whose replacement failed is never trashed, and one
+  failure does not abort the run.
+
+  `DELETE /items/trash` is global. Before trashing, the migration atomically
+  persists its library-bound ownership keys in the destination directory.
+  The separate `--apply --empty-trash` invocation loads that journal and
+  refuses to fire when the trash holds anything the migration did not put
+  there, including across process restarts. It also refuses outright after a
+  partially failed one-shot run.
+
+  Attachments with no bytes anywhere (absent locally, no server-side file)
+  are reported and skipped, never trashed. Attachments the server holds no
+  file for free no quota and are skipped by default
+  (`--include-local-only` converts them anyway). Re-runs are idempotent: a
+  parent that already links the same path is skipped. Local storage lookup
+  rejects traversal and symlink sources and requires resolved containment.
+  A destination inside Zotero's own `storage/` tree is rejected, since Zotero
+  prunes that tree and would delete the links out from under itself. An empty
+  replacement key also fails closed before the original can be trashed.
+
+  **Tradeoff, same as `attach_pdf`'s:** linked files do not sync across
+  devices. After migrating, the bytes exist only on this machine — back up
+  the linked-attachment directory accordingly.
+
+### Changed
+
+- **`attach_pdf` now stores PDFs locally by default instead of uploading them
+  to Zotero cloud storage.** The previous implementation created every
+  attachment as `linkMode: "imported_file"` and pushed the bytes to Zotero
+  storage via the Web API, which consumes the account's file-storage quota.
+  Once that quota filled, the upload-authorization request began returning
+  HTTP 413 (`File would exceed quota`) and PDF attachment failed for every
+  paper — 15 of 27 papers in one weekly literature scan were banked with no
+  PDF. Local-only storage was the intended behavior all along.
+
+  `attach_pdf` now writes the PDF into a local directory and creates a
+  `linked_file` attachment pointing at it. Nothing is uploaded, so the quota
+  is never touched and HTTP 413 cannot occur. Re-attaching byte-identical
+  content reuses the existing file rather than duplicating it, and a name
+  collision with *different* content gets a numeric suffix instead of
+  silently overwriting. If item creation fails, only a file this call wrote
+  is removed — a caller-supplied source file is never deleted.
+
+  **Tradeoff:** linked files do not sync across devices. The attachment item
+  syncs; the bytes stay on the machine that fetched them. Set
+  `ZOTERO_ATTACHMENT_MODE=imported` to restore the previous upload behavior
+  (note that linked-file attachments are also not valid in group libraries).
+
+  New env vars: `ZOTERO_LINKED_ATTACHMENT_DIR` (default
+  `<ZOTERO_DATA_DIR>/linked-attachments`) and `ZOTERO_ATTACHMENT_MODE`
+  (`linked` | `imported`, default `linked`).
+  (`web_client.py`, `config.py`)
+
+- **`check_retractions` and `check_published_versions` cap `item_keys` at 50
+  per call (ZOT-42).** Each key costs a Zotero read plus CrossRef and
+  OpenAlex round-trips, so an unbounded batch could run for minutes and
+  hammer external APIs. Oversized batches are truncated (first 50 processed,
+  never rejected) and the response reports `truncated`/`submitted`/
+  `processed` plus a note telling the caller to resubmit the rest.
+  (`server.py`)
+
+- **Docs corrected (audit ride-alongs).** CLAUDE.md/AGENTS.md told
+  developers to `pip install zotero-mcp[graph]` — a *different project* on
+  PyPI; the correct name is `zotero-mcp-plus`, and the docs now warn about
+  the collision explicitly. Stale "36 tools" counts updated to 39. README
+  gains a "Developing against a live install" note documenting that a
+  `uvx --from '… @ file://…'` install caches the built wheel, so local
+  source edits don't reach the running server until a version bump,
+  `uvx --reinstall`, or `uv cache clean` — plus a full client restart.
+  (`CLAUDE.md`, `AGENTS.md`, `README.md`)
+
+### Fixed
+
+- **`manage_tags(action="remove")` no longer 405s.** `WebClient.remove_tag`
+  issued `DELETE /tags/<name>` (path form), which the Zotero Web API rejects
+  with HTTP 405 Method Not Allowed — tags with spaces or emoji (e.g.
+  `❓ Multiple DOI`) failed outright. Tag deletion now uses the documented
+  `DELETE /tags?tag=<url-encoded name>` query-parameter form (httpx handles the
+  encoding), keeping the `If-Unmodified-Since-Version` guard. Added a
+  special-character regression test. (`web_client.py`)
+
+Static-audit hardening pass, findings ZOT-37…ZOT-43 (ZOT-42 and the doc
+corrections are listed under Changed above):
+
+- **`manage_tags` is now annotated destructive (ZOT-37).** It carried `_WR`
+  (`destructiveHint: False`), but `action="remove"` deletes a tag from every
+  item in the library and `action="rename"` rewrites it library-wide — the
+  same blast radius as `update_item`, which is `_DR`. Clients that gate
+  confirmation on `destructiveHint` were silently skipping it. The tool
+  description now says so and tells the LLM to confirm first. (`server.py`)
+
+- **`find_related_papers` no longer leaks an HTTP client per call, and
+  Semantic Scholar failures surface instead of vanishing (ZOT-38).** Each
+  call built a fresh `SemanticScholarClient` (a pooled `httpx.Client` that
+  was never closed), violating the repo's own pooling rule. The client is
+  now a lazy module-level singleton (`_get_s2()`, mirroring
+  `_get_openalex()`) closed via the `_cleanup_clients` atexit handler. The
+  blanket `except Exception → []` in `get_recommendations` is gone: an API
+  or transport failure now propagates to `_handle_tool_errors` as a
+  structured error instead of masquerading as "no recommendations". The
+  429 Retry-After header is parsed tolerantly (HTTP-date falls back to 5s
+  rather than crashing `int()`). (`semantic_scholar_client.py`, `server.py`)
+
+- **OpenAlex no longer receives a fake polite-pool identity (ZOT-39).** The
+  client sent `mailto:zotero-mcp@example.com` (the placeholder default)
+  unconditionally in its User-Agent, contradicting the documented
+  `_polite_user_agent()` behavior. It now routes through that shared helper,
+  which omits `mailto:` for placeholder domains. The UA product string is
+  also `zotero-mcp-plus/<version>` everywhere instead of the frozen
+  `zotero-mcp/1.0` — `zotero-mcp` is a different project on PyPI, so the
+  old string misattributed traffic. (`openalex_client.py`, `web_client.py`)
+
+- **Zotero Web API reads now retry on 429 and honor the `Backoff` header
+  (ZOT-40).** All library read GETs, including attachment-migration inventory
+  and trash inspection, pagination for DOI/tag operations, attachment
+  downloads, and destructive-operation version probes, now go through
+  `WebClient._read_get()`: 429s retry with Retry-After honored, and Zotero's
+  `Backoff` header (sent on 2xx when the server is overloaded) is recorded so
+  the next read sleeps out the window (capped at 30s). (`web_client.py`,
+  `attachment_migration.py`)
+
+- **`query_knowledge_graph(query_type="trending")` respects the limit clamp
+  (ZOT-41).** The trending branch passed the raw `limit` to `get_trending()`
+  while every sibling branch used the clamped value — a `limit=100000`
+  request could blow the context window the clamp exists to protect.
+  (`server.py`)
+
+- **`insert_citations` can no longer destroy the document it is editing
+  (ZOT-43).** With no `output_path` it overwrites its source .docx in place;
+  a crash mid-`doc.save()` (disk full, interrupt) left a truncated,
+  unopenable file with the original already gone. Saves now write to a
+  sibling temp file and `os.replace()` over the target, so the overwrite is
+  all-or-nothing and the original survives any failure.
+  (`citation_writer.py`)
+
 ## [0.9.0] - 2026-06-02
 
 Stability and distributability hardening pass (audit findings ZOT-13…ZOT-31).

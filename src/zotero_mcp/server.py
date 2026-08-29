@@ -96,7 +96,13 @@ _MAX_PDF_TEXT_CHARS = 50_000  # cap inline extracted PDF text in responses (ZOT-
 _web: WebClient | None = None
 _openalex = None  # OpenAlexClient singleton — typed as Any to avoid eager import
 _openalex_lock = threading.Lock()
+_s2 = None  # SemanticScholarClient singleton — was created per call, leaking a pooled httpx.Client each time (ZOT-38)
+_s2_lock = threading.Lock()
 _init_lock = threading.Lock()
+# Cap fan-out batch tools (check_retractions / check_published_versions): each key
+# costs a Zotero read + CrossRef + OpenAlex round-trips, so an unbounded batch can
+# run for minutes and hammer external APIs (ZOT-42).
+_MAX_BATCH_KEYS = 50
 
 # Temp file tracking for cleanup at exit.
 _temp_files: list[str] = []
@@ -127,7 +133,7 @@ def _cleanup_clients() -> None:
     pools. Closing them on shutdown releases sockets cleanly and silences
     ResourceWarning, which matters for a distributable package and for tests.
     """
-    for obj in (_web, _local, _openalex):
+    for obj in (_web, _local, _openalex, _s2):
         if obj is not None and hasattr(obj, "close"):
             try:
                 obj.close()
@@ -362,6 +368,47 @@ def _get_openalex():
 
             _openalex = OpenAlexClient()
     return _openalex
+
+
+def _get_s2():
+    """Lazy-initialize the SemanticScholarClient singleton (thread-safe, ZOT-38).
+
+    Mirrors ``_get_openalex()``: one pooled ``httpx.Client`` shared across calls
+    and closed via ``_cleanup_clients`` at exit, instead of a fresh unclosed
+    client per ``find_related_papers`` call.
+    """
+    global _s2
+    if _s2 is not None:
+        return _s2
+    with _s2_lock:
+        if _s2 is None:
+            from zotero_mcp.semantic_scholar_client import SemanticScholarClient
+
+            _s2 = SemanticScholarClient(api_key=get_config().semantic_scholar_api_key)
+    return _s2
+
+
+def _truncate_batch_keys(keys: list) -> tuple[list, dict]:
+    """Cap a batch tool's key list at ``_MAX_BATCH_KEYS`` (ZOT-42).
+
+    Returns the (possibly truncated) key list plus extra payload fields
+    describing the truncation, for the caller to merge into its JSON result.
+    An oversized batch is truncated (first N processed) rather than rejected
+    so partial progress is never thrown away.
+    """
+    submitted = len(keys)
+    if submitted <= _MAX_BATCH_KEYS:
+        return keys, {}
+    return keys[:_MAX_BATCH_KEYS], {
+        "truncated": True,
+        "submitted": submitted,
+        "processed": _MAX_BATCH_KEYS,
+        "note": (
+            f"item_keys is capped at {_MAX_BATCH_KEYS} per call; the remaining "
+            f"{submitted - _MAX_BATCH_KEYS} key(s) were not checked. "
+            "Resubmit them in a follow-up call."
+        ),
+    }
 
 
 def _parse_list_param(value: str | list | None) -> list | None:
@@ -915,6 +962,7 @@ def check_retractions(item_keys: str | list[str]) -> str:
         raise ValueError("item_keys must not be empty")
     for k in keys:
         _validate_key(k, "item_key")
+    keys, truncation = _truncate_batch_keys(keys)  # ZOT-42
 
     web = _get_web()
     openalex = _get_openalex()
@@ -980,6 +1028,7 @@ def check_retractions(item_keys: str | list[str]) -> str:
             "checked": len(results),
             "retracted_count": retracted_count,
             "corrected_count": corrected_count,
+            **truncation,
         },
         ensure_ascii=False,
     )
@@ -1403,7 +1452,9 @@ def trash_items(item_keys: str | list[str]) -> str:
 @mcp.tool(
     description=(
         "Permanently delete ALL items in the Zotero trash. THIS IS IRREVERSIBLE. "
-        "Always confirm with the user before calling this tool."
+        "This is a GLOBAL operation — it destroys everything in the trash, not just "
+        "items you recently trashed. Call inspect_trash first to see what is in there, "
+        "and always confirm with the user before calling this tool."
     ),
     annotations=_DR,
 )
@@ -1415,13 +1466,194 @@ def empty_trash() -> str:
 
 
 @mcp.tool(
-    annotations=_WR,
+    description=(
+        "List everything currently in the Zotero trash, with item type and title. "
+        "Use this BEFORE empty_trash so the user can see exactly what would be "
+        "permanently destroyed — empty_trash is global and irreversible."
+    ),
+    annotations=_RR,
+)
+@_handle_tool_errors
+def inspect_trash() -> str:
+    """List trash contents so the user can review before an irreversible purge."""
+    from zotero_mcp.attachment_migration import list_trash
+
+    items = list_trash(_get_web())
+    return json.dumps({"items": items, "count": len(items)}, ensure_ascii=False)
+
+
+def _parse_migration_modes(modes: str) -> tuple[str, ...]:
+    """Parse and validate the comma-separated link-mode selector."""
+    from zotero_mcp.attachment_migration import MIGRATABLE_MODES
+
+    selected = tuple(m.strip() for m in (modes or "").split(",") if m.strip())
+    if not selected:
+        raise ValueError(f"modes must name at least one of: {', '.join(MIGRATABLE_MODES)}")
+    unknown = [m for m in selected if m not in MIGRATABLE_MODES]
+    if unknown:
+        raise ValueError(
+            f"Unknown link mode(s): {', '.join(unknown)}. "
+            f"Valid modes: {', '.join(MIGRATABLE_MODES)}"
+        )
+    return selected
+
+
+def _plan_to_dict(plan, include_moves: bool = True) -> dict:
+    """Render a MigrationPlan as a JSON-safe dict."""
+    skip_reasons: dict[str, int] = {}
+    for s in plan.skipped:
+        skip_reasons[s.reason] = skip_reasons.get(s.reason, 0) + 1
+    payload = {
+        "dest_dir": plan.dest_dir,
+        "modes": list(plan.modes),
+        "library_attachments": plan.total_attachments,
+        "to_migrate": len(plan.moves),
+        "copy_from_disk": plan.copy_count,
+        "download_from_cloud": plan.download_count,
+        "frees_quota": plan.quota_freeing_count,
+        "known_bytes": plan.known_bytes,
+        "skipped": len(plan.skipped),
+        "skip_reasons": skip_reasons,
+    }
+    if include_moves:
+        payload["moves"] = [
+            {
+                "key": m.record.key,
+                "parent_key": m.record.parent_key,
+                "link_mode": m.record.link_mode,
+                "filename": m.record.filename,
+                "action": m.action,
+                "dest_path": m.dest_path,
+                "size_bytes": m.record.local_size,
+            }
+            for m in plan.moves
+        ]
+    return payload
+
+
+@mcp.tool(
+    description=(
+        "Plan a migration of Zotero imported (cloud-stored) attachments to linked files, "
+        "which keeps every PDF on local disk but frees Zotero cloud storage quota. "
+        "READ-ONLY: inventories the library, reports which attachments would be converted, "
+        "which must be downloaded from the cloud first, and which are skipped and why. "
+        "Nothing is written, downloaded, or trashed. Run this before migrate_attachments."
+    ),
+    annotations=_RR,
+)
+@_handle_tool_errors
+def plan_attachment_migration(
+    modes: str = "imported_file",
+    dest_dir: str = "",
+    include_local_only: bool = False,
+    limit: int = 0,
+    response_format: Literal["json", "markdown"] = "markdown",
+) -> str:
+    """Dry-run inventory and plan for the imported -> linked attachment migration.
+
+    Args:
+        modes: Comma-separated link modes to convert. The safe default is
+            "imported_file". "imported_url" requires explicit opt-in and is
+            skipped unless its local snapshot is validated as one file.
+        dest_dir: Where linked files would be written. Defaults to the
+            configured linked-attachment directory.
+        include_local_only: Also plan attachments Zotero holds no cloud file
+            for. Those free no quota, so they are excluded by default.
+        limit: Cap the number of planned moves (0 = no cap).
+        response_format: "markdown" renders the human report; "json" returns
+            structured counts plus the move list.
+    """
+    from zotero_mcp.attachment_migration import build_plan, inventory, render_plan
+
+    selected = _parse_migration_modes(modes)
+    plan = build_plan(
+        inventory(_get_web()),
+        dest_dir=_validate_path(dest_dir) if dest_dir else None,
+        modes=selected,
+        quota_only=not include_local_only,
+        limit=limit or None,
+    )
+    if response_format == "markdown":
+        return render_plan(plan)
+    return json.dumps(_plan_to_dict(plan), ensure_ascii=False)
+
+
+@mcp.tool(
+    description=(
+        "Convert Zotero imported (cloud-stored) attachments into linked files: copy or "
+        "download each file to local disk, hash-verify it, create a linked_file "
+        "attachment, then move the original to the trash. Frees cloud storage quota "
+        "while keeping every file locally. DEFAULTS TO A DRY RUN — pass apply=true to "
+        "make changes, and only after showing the user plan_attachment_migration output. "
+        "Never empties the trash; use inspect_trash then empty_trash for that, so the "
+        "user can review what would be permanently destroyed."
+    ),
+    annotations=_DR,
+)
+@_handle_tool_errors
+def migrate_attachments(
+    apply: bool = False,
+    modes: str = "imported_file",
+    dest_dir: str = "",
+    include_local_only: bool = False,
+    limit: int = 0,
+    trash_originals: bool = True,
+) -> str:
+    """Run the imported -> linked_file attachment migration.
+
+    Args:
+        apply: Must be True to change anything. False (default) reports the plan.
+        modes: Comma-separated link modes to convert. imported_url requires
+            explicit opt-in and local single-file validation.
+        dest_dir: Destination for linked files. Defaults to the configured
+            linked-attachment directory.
+        include_local_only: Also convert attachments that hold no cloud storage.
+        limit: Cap the number of attachments migrated (0 = no cap).
+        trash_originals: Move each successfully replaced original to the trash.
+            Originals whose replacement failed are always left alone.
+    """
+    from zotero_mcp.attachment_migration import run_migration
+
+    selected = _parse_migration_modes(modes)
+    plan, result, _ = run_migration(
+        _get_web(),
+        dry_run=not apply,
+        modes=selected,
+        dest_dir=_validate_path(dest_dir) if dest_dir else None,
+        quota_only=not include_local_only,
+        limit=limit or None,
+        trash=trash_originals,
+        empty_trash=False,
+    )
+    payload = {
+        **result.summary(),
+        "plan": _plan_to_dict(plan, include_moves=False),
+        "failures": [
+            {"key": o.key, "filename": o.filename, "error": o.error} for o in result.failed
+        ][:25],
+        "trashed_keys": result.trashed,
+    }
+    if apply and result.trashed:
+        payload["next_step"] = (
+            "Quota is not reclaimed until the trash is emptied. Call inspect_trash, "
+            "show the user what is in there, then call empty_trash only if they confirm."
+        )
+    return json.dumps(payload, ensure_ascii=False)
+
+
+@mcp.tool(
+    # _DR not _WR (ZOT-37): 'remove' deletes a tag from every item in the library
+    # and 'rename' rewrites it library-wide — destructive like update_item, so
+    # clients should gate confirmation the same way.
+    annotations=_DR,
     description=(
         "Manage tags in your Zotero library. Use this when the user asks about tags, "
         "wants to list/filter tags, remove a tag from all items, or rename a tag. "
         "Actions: 'list' (browse tags, optional prefix filter), "
-        "'remove' (delete a tag from every item — requires tag), "
-        "'rename' (change a tag name library-wide — requires tag and new_tag)."
+        "'remove' (DESTRUCTIVE: deletes the tag from every item in the library, "
+        "not reversible — requires tag), "
+        "'rename' (rewrites the tag on every item library-wide — requires tag and "
+        "new_tag). Confirm with the user before 'remove' or 'rename'."
     ),
 )
 @_handle_tool_errors
@@ -1483,6 +1715,7 @@ def check_published_versions(item_keys: str | list[str]) -> str:
         raise ValueError("item_keys must not be empty")
     for k in keys:
         _validate_key(k, "item_key")
+    keys, truncation = _truncate_batch_keys(keys)  # ZOT-42
 
     web = _get_web()
     openalex = _get_openalex()
@@ -1547,6 +1780,7 @@ def check_published_versions(item_keys: str | list[str]) -> str:
             "results": results,
             "checked": len(results),
             "published_count": published_count,
+            **truncation,
         },
         ensure_ascii=False,
     )
@@ -2218,7 +2452,9 @@ def query_knowledge_graph(
             raise ValueError("citation_velocity query requires doi")
         result = kg.get_citation_velocity(_norm_doi(doi))
     elif query_type == "trending":
-        result = kg.get_trending(top_n=limit, years=years)
+        # Use the clamped `lim` like every sibling branch (ZOT-41) — raw `limit`
+        # bypassed the context-window cap.
+        result = kg.get_trending(top_n=lim, years=years)
     else:
         raise ValueError(
             f"Unknown query_type: {query_type!r}. "
@@ -2245,8 +2481,6 @@ def find_related_papers(
     limit: str | int = 10,
 ) -> str:
     """Get paper recommendations from Semantic Scholar."""
-    from zotero_mcp.semantic_scholar_client import SemanticScholarClient
-
     keys = _parse_list_param(item_keys) or []
     if not keys:
         raise ValueError("item_keys must not be empty")
@@ -2271,7 +2505,9 @@ def find_related_papers(
             }
         )
 
-    s2 = SemanticScholarClient(api_key=get_config().semantic_scholar_api_key)
+    # Singleton client (ZOT-38); S2 failures now propagate to _handle_tool_errors
+    # as structured errors instead of being swallowed into an empty list.
+    s2 = _get_s2()
     recommendations = s2.get_recommendations(dois, limit=limit_int)
 
     # Flag which recommendations are already in library

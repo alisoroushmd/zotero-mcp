@@ -38,6 +38,18 @@ class Config:
     # Optional: Zotero desktop data directory (default: ~/Zotero)
     zotero_data_dir: str = ""
 
+    # Optional: where attach_pdf writes PDFs for linked-file attachments
+    # (default: <zotero_data_dir>/linked-attachments)
+    linked_attachment_dir: str = ""
+
+    # How attach_pdf stores files. "linked" (default) writes the PDF to
+    # linked_attachment_dir and creates a linked_file attachment: the file
+    # stays on local disk and consumes NO Zotero cloud storage quota.
+    # "imported" restores the legacy behavior of uploading into Zotero
+    # storage, which syncs across devices but counts against the quota and
+    # fails with HTTP 413 once it is full.
+    attachment_mode: str = "linked"
+
     # Derived: XDG data directory for graph store default
     xdg_data_home: str = ""
 
@@ -98,6 +110,28 @@ class Config:
         """Resolved Zotero desktop data directory (explicit override or default)."""
         return self.zotero_data_dir or os.path.expanduser("~/Zotero")
 
+    @property
+    def effective_linked_attachment_dir(self) -> str:
+        """Resolved directory for linked-file PDF attachments.
+
+        Defaults to ``<zotero_data_dir>/linked-attachments``. Kept out of
+        Zotero's own ``storage/`` tree, which Zotero manages and prunes for
+        imported files only.
+        """
+        explicit = os.path.expanduser(self.linked_attachment_dir)
+        if explicit:
+            return explicit
+        return os.path.join(self.effective_zotero_data_dir, "linked-attachments")
+
+    @property
+    def uses_linked_attachments(self) -> bool:
+        """True when attach_pdf should create local linked_file attachments.
+
+        Default. Set ``ZOTERO_ATTACHMENT_MODE=imported`` to upload into
+        Zotero cloud storage instead (legacy behavior, consumes quota).
+        """
+        return self.attachment_mode.strip().lower() != "imported"
+
 
 def load_config() -> Config:
     """Load configuration from environment variables."""
@@ -110,6 +144,8 @@ def load_config() -> Config:
         polite_email=os.environ.get("ZOTERO_MCP_EMAIL", "zotero-mcp@example.com"),
         graph_db_path=os.environ.get("ZOTERO_MCP_GRAPH_DB", ""),
         zotero_data_dir=os.environ.get("ZOTERO_DATA_DIR", ""),
+        linked_attachment_dir=os.environ.get("ZOTERO_LINKED_ATTACHMENT_DIR", ""),
+        attachment_mode=os.environ.get("ZOTERO_ATTACHMENT_MODE", "linked"),
         xdg_data_home=os.environ.get("XDG_DATA_HOME", ""),
     )
 

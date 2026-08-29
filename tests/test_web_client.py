@@ -790,15 +790,47 @@ def test_get_tags_passes_prefix_as_q():
 
 @respx.mock
 def test_remove_tag_sends_delete():
-    """remove_tag DELETEs the tag and returns status removed."""
+    """remove_tag DELETEs via /tags?tag=<name> (query param), not /tags/<name>.
+
+    The Zotero Web API only supports tag deletion through the query-parameter
+    form; DELETE on the /tags/<name> path segment returns 405 Method Not Allowed.
+    """
     respx.get(f"{BASE_TAG}/items").mock(
         return_value=httpx.Response(200, json=[], headers={"Last-Modified-Version": "5"})
     )
-    delete_route = respx.delete(f"{BASE_TAG}/tags/old-tag").mock(return_value=httpx.Response(204))
+    delete_route = respx.delete(f"{BASE_TAG}/tags").mock(return_value=httpx.Response(204))
     client = WebClient(api_key="k", user_id="12345")
     result = client.remove_tag("old-tag")
     assert result["status"] == "removed"
     assert delete_route.called
+    req = delete_route.calls[0].request
+    assert req.url.path == "/users/12345/tags"
+    assert req.url.params["tag"] == "old-tag"
+    assert req.headers["If-Unmodified-Since-Version"] == "5"
+
+
+@respx.mock
+def test_remove_tag_encodes_special_characters_in_query():
+    """Tags with spaces/emoji ride in the url-encoded query param (regression: #405).
+
+    Real-world trigger: the '❓ Multiple DOI' tag failed with HTTP 405 because
+    the tag was interpolated into the DELETE path instead of the query string.
+    """
+    respx.get(f"{BASE_TAG}/items").mock(
+        return_value=httpx.Response(200, json=[], headers={"Last-Modified-Version": "9"})
+    )
+    delete_route = respx.delete(f"{BASE_TAG}/tags").mock(return_value=httpx.Response(204))
+    client = WebClient(api_key="k", user_id="12345")
+    tag = "❓ Multiple DOI"
+    result = client.remove_tag(tag)
+    assert result["status"] == "removed"
+    req = delete_route.calls[0].request
+    assert req.url.path == "/users/12345/tags"
+    # httpx decodes the param back to the original value ...
+    assert req.url.params["tag"] == tag
+    # ... but the wire form must be percent-encoded (no raw spaces/emoji).
+    raw_query = req.url.query.decode()
+    assert " " not in raw_query and "❓" not in raw_query
 
 
 @respx.mock

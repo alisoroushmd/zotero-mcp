@@ -10,10 +10,12 @@ import re
 import time
 from pathlib import Path
 from typing import TYPE_CHECKING
-from urllib.parse import quote, urlencode, urlparse
+from urllib.parse import urlencode, urlparse
 
 import defusedxml.ElementTree as ElementTree
 import httpx
+
+from zotero_mcp import __version__
 
 if TYPE_CHECKING:
     from zotero_mcp.local_client import LocalClient
@@ -97,19 +99,37 @@ def _is_usable_polite_email(email: str) -> bool:
     return not any(low.endswith(d) for d in placeholder_domains)
 
 
-def _polite_user_agent() -> str:
+# Real package name + version instead of a hardcoded "zotero-mcp/1.0" (ZOT-39):
+# "zotero-mcp" is a different project on PyPI, and a frozen version string
+# misattributes traffic in polite-pool logs.
+_UA_PRODUCT = f"zotero-mcp-plus/{__version__}"
+
+
+def _polite_user_agent(email: str | None = None) -> str:
     """Return a User-Agent string for polite-pool APIs.
 
-    Includes mailto: only when the configured email is a real address.
-    Falls back to a generic string so CrossRef/OpenAlex still accept the request.
+    Includes mailto: only when the email is a real address (placeholder
+    domains are omitted). Falls back to a generic string so CrossRef/OpenAlex
+    still accept the request.
+
+    Args:
+        email: Optional explicit email; when None the configured polite
+            email is used (ZOT-39 — lets OpenAlexClient route its
+            constructor override through the same placeholder filtering).
     """
-    email = _get_polite_email()
+    if email is None:
+        email = _get_polite_email()
     if _is_usable_polite_email(email):
-        return f"zotero-mcp/1.0 (mailto:{email})"
-    return "zotero-mcp/1.0"
+        return f"{_UA_PRODUCT} (mailto:{email})"
+    return _UA_PRODUCT
 
 
 SEARCH_TIMEOUT = httpx.Timeout(45.0, connect=5.0)  # searches can be slow on large libraries
+
+# Cap any single sleep driven by a server header (Retry-After via
+# _retry_request uses its own 30s cap; this one bounds Zotero `Backoff`
+# waits, ZOT-40) so a hostile/buggy header can't stall a tool call.
+_MAX_BACKOFF_SLEEP = 30.0
 
 
 # medRxiv/bioRxiv DOI prefixes (medRxiv migrated from 10.1101 to 10.64898)
@@ -264,6 +284,9 @@ class WebClient:
         self._ncbi_api_key = get_config().ncbi_api_key
         # Set by the dedup helpers when a duplicate check fails transiently (ZOT-26).
         self._dedup_check_failed = False
+        # monotonic deadline from Zotero's `Backoff` header (ZOT-40); reads
+        # sleep out any remaining window before hitting the API again.
+        self._backoff_until = 0.0
 
     def close(self) -> None:
         """Close all pooled HTTP clients (ZOT-23).
@@ -284,6 +307,34 @@ class WebClient:
         self.close()
 
     # -- Web API read methods (primary read path) --
+    # All read GETs go through _read_get (ZOT-40): a Zotero 429 is retried with
+    # Retry-After honored via _retry_request, and the separate Zotero `Backoff`
+    # header (sent on 2xx when the server is overloaded) is tracked so the next
+    # read waits out the window. Write paths do not consult the backoff state.
+
+    def _read_get(
+        self,
+        path: str,
+        *,
+        params: dict | None = None,
+        timeout: httpx.Timeout | object = httpx.USE_CLIENT_DEFAULT,
+    ) -> httpx.Response:
+        """GET a Zotero Web API path with 429 retry and Backoff honor (ZOT-40).
+
+        Sleeps out any backoff window a previous response requested, issues the
+        GET through ``_retry_request``, then records a new window if this
+        response carries a ``Backoff`` header. The state is a single float;
+        concurrent readers racing on it at worst sleep slightly long or short,
+        so it is deliberately lock-free.
+        """
+        wait = self._backoff_until - time.monotonic()
+        if wait > 0:
+            time.sleep(min(wait, _MAX_BACKOFF_SLEEP))
+        resp = _retry_request(lambda: self._web_client.get(path, params=params, timeout=timeout))
+        backoff = _parse_retry_after(resp.headers.get("Backoff"), 0.0)
+        if backoff > 0:
+            self._backoff_until = time.monotonic() + min(backoff, _MAX_BACKOFF_SLEEP)
+        return resp
 
     def search_items(
         self,
@@ -314,11 +365,7 @@ class WebClient:
             params["tag"] = tag
         if start:
             params["start"] = start
-        resp = self._web_client.get(
-            "/items/top",
-            params=params,
-            timeout=SEARCH_TIMEOUT,
-        )
+        resp = self._read_get("/items/top", params=params, timeout=SEARCH_TIMEOUT)
         resp.raise_for_status()
         return [_format_summary(item) for item in resp.json()]
 
@@ -327,7 +374,7 @@ class WebClient:
         params = {}
         if fmt == "bibtex":
             params["format"] = "bibtex"
-        resp = self._web_client.get(f"/items/{item_key}", params=params)
+        resp = self._read_get(f"/items/{item_key}", params=params)
         resp.raise_for_status()
         if fmt == "bibtex":
             return resp.text
@@ -336,7 +383,7 @@ class WebClient:
 
     def get_collections(self) -> list[dict]:
         """List all collections via Web API."""
-        resp = self._web_client.get("/collections")
+        resp = self._read_get("/collections")
         resp.raise_for_status()
         return [
             {
@@ -357,10 +404,7 @@ class WebClient:
         params: dict = {"limit": limit}
         if start:
             params["start"] = start
-        resp = self._web_client.get(
-            f"/collections/{collection_key}/items/top",
-            params=params,
-        )
+        resp = self._read_get(f"/collections/{collection_key}/items/top", params=params)
         resp.raise_for_status()
         return [_format_summary(item) for item in resp.json()]
 
@@ -369,7 +413,7 @@ class WebClient:
         params = {}
         if item_type:
             params["itemType"] = item_type
-        resp = self._web_client.get(f"/items/{parent_key}/children", params=params or None)
+        resp = self._read_get(f"/items/{parent_key}/children", params=params or None)
         resp.raise_for_status()
         return [item.get("data", item) for item in resp.json()]
 
@@ -398,7 +442,7 @@ class WebClient:
         Raises:
             httpx.HTTPStatusError: If the download fails (404, 403, etc.).
         """
-        resp = self._web_client.get(f"/items/{attachment_key}/file")
+        resp = self._read_get(f"/items/{attachment_key}/file")
         resp.raise_for_status()
         return resp.content
 
@@ -1651,7 +1695,7 @@ class WebClient:
         Raises:
             RuntimeError: if the version header is absent from the response.
         """
-        resp = _retry_request(lambda: self._web_client.get("/items", params={"limit": 0}))
+        resp = self._read_get("/items", params={"limit": 0})
         resp.raise_for_status()
         version = resp.headers.get("Last-Modified-Version")
         if version is None:
@@ -1740,7 +1784,7 @@ class WebClient:
                 "itemType": "-attachment",
                 "format": "json",
             }
-            resp = self._web_client.get(
+            resp = self._read_get(
                 "/items/top",
                 params=params,
                 timeout=SEARCH_TIMEOUT,
@@ -1779,7 +1823,7 @@ class WebClient:
         start = 0
         while True:
             params["start"] = start
-            resp = self._web_client.get("/tags", params=params)
+            resp = self._read_get("/tags", params=params)
             resp.raise_for_status()
             page = resp.json()
             if not page:
@@ -1801,8 +1845,12 @@ class WebClient:
         """
         version = self._library_version()
 
+        # Zotero deletes tags via DELETE /tags?tag=<url-encoded name> (query
+        # param). The /tags/<name> path form is not a valid endpoint and returns
+        # 405 Method Not Allowed. httpx percent-encodes the param value.
         resp = self._web_client.delete(
-            f"/tags/{quote(tag, safe='')}",
+            "/tags",
+            params={"tag": tag},
             headers={"If-Unmodified-Since-Version": str(version)},
         )
         resp.raise_for_status()
@@ -1828,9 +1876,7 @@ class WebClient:
         items: list[dict] = []
         start = 0
         while True:
-            resp = self._web_client.get(
-                "/items", params={"tag": old_tag, "limit": 100, "start": start}
-            )
+            resp = self._read_get("/items", params={"tag": old_tag, "limit": 100, "start": start})
             resp.raise_for_status()
             page = resp.json()
             if not page:
@@ -1939,6 +1985,11 @@ class WebClient:
                 ),
             }
 
+        from zotero_mcp.config import get_config
+
+        if get_config().uses_linked_attachments:
+            return self._attach_linked_file(parent_key, pdf_bytes, filename, source)
+
         # Step 1: Create attachment item
         attachment_data = [
             {
@@ -2021,7 +2072,7 @@ class WebClient:
         except Exception:
             # Clean up orphaned attachment item so it doesn't pollute the library
             try:
-                ver_resp = self._web_client.get("/items", params={"limit": 0})
+                ver_resp = self._read_get("/items", params={"limit": 0})
                 version = ver_resp.headers.get("Last-Modified-Version", "0")
                 self._web_client.delete(
                     "/items",
@@ -2045,6 +2096,103 @@ class WebClient:
             "filename": filename,
             "source": source,
             "size_bytes": file_size,
+        }
+
+    @staticmethod
+    def _resolve_link_destination(base: Path, filename: str, pdf_bytes: bytes) -> tuple[Path, bool]:
+        """Pick a stable on-disk path for a linked-file PDF.
+
+        Returns ``(destination, already_present)``. If a file with the same
+        name already holds byte-identical content, it is reused rather than
+        rewritten, so re-attaching the same PDF is idempotent. If the name is
+        taken by *different* content, a numeric suffix is added instead of
+        silently overwriting someone else's file.
+        """
+        safe_name = Path(filename).name or "attachment.pdf"
+        candidate = base / safe_name
+        if not candidate.exists():
+            return candidate, False
+        try:
+            if candidate.read_bytes() == pdf_bytes:
+                return candidate, True
+        except OSError:
+            pass
+
+        stem, suffix = candidate.stem, candidate.suffix
+        for counter in range(1, 1000):
+            alt = base / f"{stem}-{counter}{suffix}"
+            if not alt.exists():
+                return alt, False
+            try:
+                if alt.read_bytes() == pdf_bytes:
+                    return alt, True
+            except OSError:
+                continue
+        # Pathological: 1000 same-named distinct PDFs. Fall back to a digest.
+        digest = hashlib.sha256(pdf_bytes).hexdigest()[:12]
+        return base / f"{stem}-{digest}{suffix}", False
+
+    def _attach_linked_file(
+        self,
+        parent_key: str,
+        pdf_bytes: bytes,
+        filename: str,
+        source: str,
+    ) -> dict:
+        """Write the PDF to local disk and create a linked_file attachment.
+
+        This is the default path. Nothing is uploaded, so the Zotero cloud
+        storage quota is never touched and HTTP 413 cannot occur. The
+        tradeoff is that linked files do not sync to other devices — the
+        item metadata syncs, the bytes stay on this machine.
+        """
+        from zotero_mcp.config import get_config
+
+        base = Path(get_config().effective_linked_attachment_dir).expanduser()
+        base.mkdir(parents=True, exist_ok=True)
+
+        dest, already_present = self._resolve_link_destination(base, filename, pdf_bytes)
+        wrote_file = False
+        if not already_present:
+            dest.write_bytes(pdf_bytes)
+            wrote_file = True
+
+        attachment_data = [
+            {
+                "itemType": "attachment",
+                "parentItem": parent_key,
+                "linkMode": "linked_file",
+                "title": dest.name,
+                "contentType": "application/pdf",
+                "path": str(dest),
+            }
+        ]
+        try:
+            resp = self._web_client.post("/items", json=attachment_data)
+            resp.raise_for_status()
+            attach_key = self._extract_created_key(resp.json())
+        except Exception:
+            # Only remove what this call created; never delete a pre-existing file.
+            if wrote_file:
+                try:
+                    dest.unlink(missing_ok=True)
+                except OSError as cleanup_exc:
+                    logger.warning(
+                        "Failed to remove %s after item-create failure: %s", dest, cleanup_exc
+                    )
+            raise
+
+        logger.info("Linked PDF %s to item %s (%s)", dest, parent_key, source)
+        return {
+            "status": "attached",
+            "attachment_key": attach_key,
+            "parent_key": parent_key,
+            "filename": dest.name,
+            "source": source,
+            "size_bytes": len(pdf_bytes),
+            "link_mode": "linked_file",
+            "path": str(dest),
+            "storage": "local",
         }
 
     def _download_free_pdf(self, doi: str) -> tuple[bytes | None, str, str]:

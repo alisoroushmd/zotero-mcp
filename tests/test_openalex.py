@@ -416,3 +416,30 @@ def test_parse_retry_after_rejects_hostile_values():
     assert _parse_retry_after("inf", 9.0) == 9.0
     assert _parse_retry_after("-inf", 9.0) == 9.0
     assert _parse_retry_after("0", 9.0) == 0.0  # zero is valid (sleep 0 is fine)
+
+
+def test_placeholder_email_omitted_from_user_agent():
+    """The default placeholder polite email never reaches OpenAlex (ZOT-39).
+
+    The old header sent `mailto:zotero-mcp@example.com` unconditionally — a
+    fake identity in the polite pool. Placeholder domains are now filtered by
+    the shared web_client helper, and the UA carries the real package name.
+    """
+    client = OpenAlexClient(api_key="k", email="zotero-mcp@example.com")
+    try:
+        ua = client._client.headers["User-Agent"]
+        assert "mailto" not in ua
+        assert ua.startswith("zotero-mcp-plus/")
+    finally:
+        client.close()
+
+
+def test_real_email_included_in_user_agent():
+    """A real polite email is still sent, with the package/version product."""
+    client = OpenAlexClient(api_key="k", email="ali@sinai.edu")
+    try:
+        ua = client._client.headers["User-Agent"]
+        assert "mailto:ali@sinai.edu" in ua
+        assert ua.startswith("zotero-mcp-plus/")
+    finally:
+        client.close()

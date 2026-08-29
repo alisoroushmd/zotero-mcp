@@ -532,3 +532,43 @@ def test_insert_citations_table_cells(tmp_path):
     doc = Document(result_path)
     cell_xml = doc.tables[0].cell(0, 0).paragraphs[0]._element.xml
     assert "ADDIN ZOTERO_ITEM" in cell_xml
+
+
+# -- atomic in-place save (ZOT-43) --
+
+
+def test_insert_citations_in_place_leaves_no_temp_files(tmp_path):
+    """The atomic overwrite cleans up its temp file on success."""
+    doc_path = tmp_path / "inplace.docx"
+    _create_existing_doc(doc_path, [("Some text [@ABC].", None)])
+
+    result_path, count = insert_citations(str(doc_path), SAMPLE_ITEM_DATA, "12345")
+    assert count == 1
+    assert Path(result_path) == doc_path.resolve()
+    leftovers = [p for p in tmp_path.iterdir() if p.name != "inplace.docx"]
+    assert leftovers == []
+    # And the overwritten file is a valid .docx
+    assert "ADDIN ZOTERO_ITEM" in Document(result_path).paragraphs[0]._element.xml
+
+
+def test_save_docx_atomic_failure_preserves_original(tmp_path):
+    """A save that dies mid-write must not touch or truncate the original (ZOT-43)."""
+    from unittest.mock import MagicMock
+
+    import pytest
+
+    from zotero_mcp.citation_writer import _save_docx_atomic
+
+    doc_path = tmp_path / "original.docx"
+    _create_existing_doc(doc_path, [("Original content.", None)])
+    original_bytes = doc_path.read_bytes()
+
+    broken_doc = MagicMock()
+    broken_doc.save.side_effect = OSError("disk full")
+
+    with pytest.raises(OSError, match="disk full"):
+        _save_docx_atomic(broken_doc, doc_path.resolve())
+
+    assert doc_path.read_bytes() == original_bytes
+    leftovers = [p for p in tmp_path.iterdir() if p.name != "original.docx"]
+    assert leftovers == []

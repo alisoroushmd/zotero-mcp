@@ -1,6 +1,9 @@
 """Tests for SemanticScholarClient — paper recommendations via S2 API."""
 
+from unittest.mock import patch
+
 import httpx
+import pytest
 import respx
 
 from zotero_mcp.semantic_scholar_client import SemanticScholarClient
@@ -48,12 +51,56 @@ def test_get_recommendations_handles_empty():
 
 
 @respx.mock
-def test_get_recommendations_handles_error():
-    """get_recommendations returns empty list on API error."""
+def test_get_recommendations_raises_on_error():
+    """get_recommendations raises on API error instead of swallowing it (ZOT-38).
+
+    A 500 used to be logged and returned as [], indistinguishable from "no
+    recommendations"; it must now propagate so _handle_tool_errors can report it.
+    """
     respx.post(url__regex=r".*/recommendations/v1/papers/.*").mock(return_value=httpx.Response(500))
     client = SemanticScholarClient()
-    results = client.get_recommendations(["10.1/seed"])
+    with pytest.raises(httpx.HTTPStatusError):
+        client.get_recommendations(["10.1/seed"])
+
+
+@respx.mock
+def test_get_recommendations_retries_once_on_429():
+    """A 429 is retried once after sleeping, then the retry result is used."""
+    route = respx.post(url__regex=r".*/recommendations/v1/papers/.*").mock(
+        side_effect=[
+            httpx.Response(429, headers={"Retry-After": "1"}),
+            httpx.Response(200, json={"recommendedPapers": []}),
+        ]
+    )
+    client = SemanticScholarClient()
+    with patch("time.sleep") as mock_sleep:
+        results = client.get_recommendations(["10.1/seed"])
     assert results == []
+    assert route.call_count == 2
+    mock_sleep.assert_called_once_with(1.0)
+
+
+@respx.mock
+def test_retry_after_http_date_falls_back():
+    """An HTTP-date Retry-After doesn't crash; the 5s fallback is used (ZOT-24/38)."""
+    respx.post(url__regex=r".*/recommendations/v1/papers/.*").mock(
+        side_effect=[
+            httpx.Response(429, headers={"Retry-After": "Wed, 21 Oct 2026 07:28:00 GMT"}),
+            httpx.Response(200, json={"recommendedPapers": []}),
+        ]
+    )
+    client = SemanticScholarClient()
+    with patch("time.sleep") as mock_sleep:
+        results = client.get_recommendations(["10.1/seed"])
+    assert results == []
+    mock_sleep.assert_called_once_with(5.0)
+
+
+def test_close_is_idempotent():
+    """close() can be called repeatedly (atexit cleanup, ZOT-38)."""
+    client = SemanticScholarClient()
+    client.close()
+    client.close()
 
 
 @respx.mock

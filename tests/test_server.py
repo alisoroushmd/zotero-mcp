@@ -8,7 +8,7 @@ import pytest
 
 
 def test_server_has_all_tools():
-    """Server exposes all 36 tools."""
+    """Server exposes all 39 tools."""
     from zotero_mcp.server import mcp
 
     tools = asyncio.run(mcp.list_tools())
@@ -31,6 +31,9 @@ def test_server_has_all_tools():
         "update_item",
         "trash_items",
         "empty_trash",
+        "inspect_trash",
+        "plan_attachment_migration",
+        "migrate_attachments",
         "manage_tags",
         "attach_pdf",
         "insert_citations",
@@ -55,7 +58,7 @@ def test_server_has_all_tools():
     extra = actual - expected
     assert not missing, f"Missing tools: {missing}"
     assert not extra, f"Extra tools: {extra}"
-    assert len(tools) == 36
+    assert len(tools) == 39
 
 
 def test_server_has_prompts():
@@ -327,6 +330,123 @@ def test_manage_tags_invalid_action():
     with patch.object(srv, "_get_web"):
         result = _json.loads(srv.manage_tags(action="delete"))
         assert result["error"] == "invalid_input"
+
+
+def test_manage_tags_annotated_destructive():
+    """manage_tags carries destructiveHint — remove/rename alter the whole library (ZOT-37)."""
+    from zotero_mcp.server import mcp
+
+    tools = {t.name: t for t in asyncio.run(mcp.list_tools())}
+    annotations = tools["manage_tags"].annotations
+    assert annotations.destructiveHint is True
+    assert annotations.readOnlyHint is False
+
+
+# -- batch key cap (ZOT-42) --
+
+
+def test_check_retractions_caps_batch_at_50():
+    """check_retractions processes at most _MAX_BATCH_KEYS keys and reports the cut."""
+    import json as _json
+
+    import zotero_mcp.server as srv
+
+    keys = [f"KEY{i:04d}A" for i in range(60)]
+    with (
+        patch.object(srv, "_get_web") as mock_web,
+        patch.object(srv, "_get_openalex"),
+    ):
+        # No DOI → warning path; neither CrossRef nor OpenAlex is hit.
+        mock_web.return_value.get_item.return_value = {"title": "T"}
+        result = _json.loads(srv.check_retractions(keys))
+    assert result["checked"] == srv._MAX_BATCH_KEYS
+    assert result["truncated"] is True
+    assert result["submitted"] == 60
+    assert result["processed"] == srv._MAX_BATCH_KEYS
+    assert mock_web.return_value.get_item.call_count == srv._MAX_BATCH_KEYS
+
+
+def test_check_published_versions_caps_batch_at_50():
+    """check_published_versions applies the same _MAX_BATCH_KEYS cap."""
+    import json as _json
+
+    import zotero_mcp.server as srv
+
+    keys = [f"KEY{i:04d}B" for i in range(55)]
+    with (
+        patch.object(srv, "_get_web") as mock_web,
+        patch.object(srv, "_get_openalex"),
+    ):
+        mock_web.return_value.get_item.return_value = {"title": "T"}
+        result = _json.loads(srv.check_published_versions(keys))
+    assert result["checked"] == srv._MAX_BATCH_KEYS
+    assert result["truncated"] is True
+    assert result["submitted"] == 55
+
+
+def test_check_retractions_small_batch_not_flagged():
+    """A batch under the cap carries no truncation fields."""
+    import json as _json
+
+    import zotero_mcp.server as srv
+
+    with (
+        patch.object(srv, "_get_web") as mock_web,
+        patch.object(srv, "_get_openalex"),
+    ):
+        mock_web.return_value.get_item.return_value = {"title": "T"}
+        result = _json.loads(srv.check_retractions(["ABCD1234"]))
+    assert "truncated" not in result
+    assert result["checked"] == 1
+
+
+# -- Semantic Scholar singleton (ZOT-38) --
+
+
+def test_get_s2_returns_singleton():
+    """_get_s2 initializes once and reuses the pooled client afterwards."""
+    import zotero_mcp.server as srv
+
+    with (
+        patch.object(srv, "_s2", None),
+        patch("zotero_mcp.semantic_scholar_client.SemanticScholarClient") as mock_cls,
+    ):
+        mock_cls.return_value = MagicMock()
+        first = srv._get_s2()
+        second = srv._get_s2()
+        assert first is second
+        mock_cls.assert_called_once()
+
+
+def test_find_related_papers_uses_singleton():
+    """find_related_papers goes through _get_s2, not a per-call client."""
+    import zotero_mcp.server as srv
+
+    s2 = MagicMock()
+    s2.get_recommendations.return_value = []
+    with (
+        patch.object(srv, "_get_web") as mock_web,
+        patch.object(srv, "_get_s2", return_value=s2) as mock_get_s2,
+    ):
+        mock_web.return_value.get_item.return_value = {"DOI": "10.1/x", "title": "T"}
+        srv.find_related_papers("ABCD1234")
+        srv.find_related_papers("ABCD1234")
+    assert mock_get_s2.call_count == 2
+    assert s2.get_recommendations.call_count == 2
+
+
+# -- trending limit clamp (ZOT-41) --
+
+
+def test_trending_uses_clamped_limit():
+    """query_knowledge_graph(trending) clamps limit like every sibling branch."""
+    import zotero_mcp.server as srv
+
+    kg = MagicMock()
+    kg.get_trending.return_value = []
+    with patch.object(srv, "_get_or_build_kg", return_value=kg):
+        srv.query_knowledge_graph(query_type="trending", limit=5000)
+    kg.get_trending.assert_called_once_with(top_n=200, years=3)
 
 
 # -- build_index type routing --

@@ -26,6 +26,7 @@ dependencies = [
 
 [project.scripts]
 zotero-mcp = "zotero_mcp.__main__:main"
+zotero-migrate-attachments = "zotero_mcp.attachment_migration:main"
 
 [project.optional-dependencies]
 dev = [
