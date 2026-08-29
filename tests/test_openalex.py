@@ -347,3 +347,99 @@ def test_reconstruct_abstract_returns_none_for_missing():
     assert OpenAlexClient.reconstruct_abstract({}) is None
     assert OpenAlexClient.reconstruct_abstract({"abstract_inverted_index": None}) is None
     assert OpenAlexClient.reconstruct_abstract({"abstract_inverted_index": {}}) is None
+
+
+def test_reconstruct_abstract_caps_length():
+    """A pathologically long abstract is capped (ZOT-30)."""
+    from zotero_mcp.openalex_client import _MAX_ABSTRACT_CHARS
+
+    # 20000 single-char words -> ~40000 chars, well over the cap.
+    inv = {str(i): [i] for i in range(20000)}
+    result = OpenAlexClient.reconstruct_abstract({"abstract_inverted_index": inv})
+    assert result is not None
+    assert len(result) <= _MAX_ABSTRACT_CHARS + 1  # +1 for the ellipsis
+
+
+# --- Retry / rate-limit behavior (ZOT-18, ZOT-24) ---
+
+
+@respx.mock
+def test_get_work_retries_on_429(monkeypatch):
+    """A 429 is retried after honoring Retry-After (ZOT-18)."""
+    monkeypatch.setattr("zotero_mcp.openalex_client.time.sleep", lambda *_: None)
+    route = respx.get(f"{OPENALEX_BASE}/works/doi:10.1/x").mock(
+        side_effect=[
+            httpx.Response(429, headers={"Retry-After": "1"}),
+            httpx.Response(200, json={"id": "https://openalex.org/W1", "title": "OK"}),
+        ]
+    )
+    client = OpenAlexClient()
+    result = client.get_work("10.1/x")
+    assert result is not None
+    assert result["title"] == "OK"
+    assert route.call_count == 2
+
+
+@respx.mock
+def test_get_work_retries_on_5xx(monkeypatch):
+    """A 503 is retried with backoff (ZOT-18)."""
+    monkeypatch.setattr("zotero_mcp.openalex_client.time.sleep", lambda *_: None)
+    route = respx.get(f"{OPENALEX_BASE}/works/doi:10.1/y").mock(
+        side_effect=[
+            httpx.Response(503),
+            httpx.Response(200, json={"id": "https://openalex.org/W2", "title": "Recovered"}),
+        ]
+    )
+    client = OpenAlexClient()
+    result = client.get_work("10.1/y")
+    assert result is not None
+    assert result["title"] == "Recovered"
+    assert route.call_count == 2
+
+
+def test_parse_retry_after_tolerates_http_date():
+    """Retry-After parsing falls back when given an HTTP-date, not seconds (ZOT-24)."""
+    from zotero_mcp.openalex_client import _parse_retry_after
+
+    assert _parse_retry_after("5", 99.0) == 5.0
+    assert _parse_retry_after("Wed, 21 Oct 2026 07:28:00 GMT", 99.0) == 99.0
+    assert _parse_retry_after(None, 99.0) == 99.0
+    assert _parse_retry_after("garbage", 7.0) == 7.0
+
+
+def test_parse_retry_after_rejects_hostile_values():
+    """Negative / nan / inf Retry-After fall back so time.sleep never crashes (ZOT-24 review)."""
+    from zotero_mcp.openalex_client import _parse_retry_after
+
+    assert _parse_retry_after("-5", 9.0) == 9.0
+    assert _parse_retry_after("nan", 9.0) == 9.0
+    assert _parse_retry_after("inf", 9.0) == 9.0
+    assert _parse_retry_after("-inf", 9.0) == 9.0
+    assert _parse_retry_after("0", 9.0) == 0.0  # zero is valid (sleep 0 is fine)
+
+
+def test_placeholder_email_omitted_from_user_agent():
+    """The default placeholder polite email never reaches OpenAlex (ZOT-39).
+
+    The old header sent `mailto:zotero-mcp@example.com` unconditionally — a
+    fake identity in the polite pool. Placeholder domains are now filtered by
+    the shared web_client helper, and the UA carries the real package name.
+    """
+    client = OpenAlexClient(api_key="k", email="zotero-mcp@example.com")
+    try:
+        ua = client._client.headers["User-Agent"]
+        assert "mailto" not in ua
+        assert ua.startswith("zotero-mcp-plus/")
+    finally:
+        client.close()
+
+
+def test_real_email_included_in_user_agent():
+    """A real polite email is still sent, with the package/version product."""
+    client = OpenAlexClient(api_key="k", email="ali@sinai.edu")
+    try:
+        ua = client._client.headers["User-Agent"]
+        assert "mailto:ali@sinai.edu" in ua
+        assert ua.startswith("zotero-mcp-plus/")
+    finally:
+        client.close()

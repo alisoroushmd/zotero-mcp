@@ -19,6 +19,44 @@ def tmp_db():
     os.unlink(path)
 
 
+def test_extract_text_raises_importerror_when_pypdf_missing():
+    """Missing pypdf raises a clear ImportError, not a silent None (ZOT-30)."""
+    import builtins
+
+    from zotero_mcp.text_extractor import extract_text_from_pdf
+
+    real_import = builtins.__import__
+
+    def _fake_import(name, *args, **kwargs):
+        if name == "pypdf":
+            raise ImportError("no pypdf")
+        return real_import(name, *args, **kwargs)
+
+    with patch("builtins.__import__", side_effect=_fake_import):
+        with pytest.raises(ImportError, match="fulltext"):
+            extract_text_from_pdf(b"%PDF-1.4")
+
+
+def test_pypdf_available_reflects_import():
+    """pypdf_available returns True/False matching importability (ZOT-30)."""
+    import builtins
+
+    from zotero_mcp.text_extractor import pypdf_available
+
+    # In the test env pypdf is installed, so it should be True.
+    assert pypdf_available() is True
+
+    real_import = builtins.__import__
+
+    def _fake_import(name, *args, **kwargs):
+        if name == "pypdf":
+            raise ImportError("no pypdf")
+        return real_import(name, *args, **kwargs)
+
+    with patch("builtins.__import__", side_effect=_fake_import):
+        assert pypdf_available() is False
+
+
 def test_extract_text_from_pdf_bytes():
     """extract_text_from_pdf extracts text from PDF bytes via pypdf."""
     mock_pypdf = MagicMock()

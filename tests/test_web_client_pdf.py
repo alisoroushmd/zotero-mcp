@@ -44,8 +44,17 @@ def test_download_attachment_raises_on_404():
 
 
 @respx.mock
-def test_attach_pdf_cleans_up_orphan_on_s3_failure():
-    """If S3 upload fails after attachment item is created, the orphan is deleted."""
+def test_attach_pdf_cleans_up_orphan_on_s3_failure(monkeypatch):
+    """If S3 upload fails after attachment item is created, the orphan is deleted.
+
+    Exercises the legacy ``imported`` mode explicitly: linked-file storage is
+    now the default and never uploads, so this upload path must be opted into.
+    """
+    monkeypatch.setenv("ZOTERO_ATTACHMENT_MODE", "imported")
+    from zotero_mcp.config import _reset_config
+
+    _reset_config()
+
     parent_key = "ABCD1234"
     attach_key = "ATTACH01"
     pdf_bytes = b"%PDF-1.4 fake pdf content for testing purposes padding"
@@ -95,6 +104,143 @@ def test_attach_pdf_cleans_up_orphan_on_s3_failure():
         assert attach_key in delete_route.calls[0].request.url.params.get("itemKey", "")
     finally:
         os.unlink(tmp_path)
+
+
+# -- Linked-file attachments (default mode: local storage, no cloud quota) --
+
+
+@pytest.fixture
+def linked_dir(tmp_path, monkeypatch):
+    """Point linked-file storage at a temp dir and reset the config singleton."""
+    from zotero_mcp.config import _reset_config
+
+    monkeypatch.setenv("ZOTERO_LINKED_ATTACHMENT_DIR", str(tmp_path))
+    monkeypatch.delenv("ZOTERO_ATTACHMENT_MODE", raising=False)
+    _reset_config()
+    yield tmp_path
+    _reset_config()
+
+
+@respx.mock
+def test_attach_pdf_defaults_to_linked_file_and_never_uploads(linked_dir):
+    """Default mode writes the PDF locally and performs NO file upload.
+
+    This is the regression test for the quota failure: the legacy path called
+    POST /items/{key}/file, which returns HTTP 413 once Zotero cloud storage
+    is full. The linked path must not call it at all.
+    """
+    parent_key = "ABCD1234"
+    attach_key = "ATTACH01"
+    pdf_bytes = b"%PDF-1.4 fake pdf content for testing purposes padding"
+
+    create_route = respx.post(f"{BASE}/items").mock(
+        return_value=httpx.Response(
+            200,
+            json={
+                "successful": {"0": {"key": attach_key, "data": {"key": attach_key, "version": 1}}}
+            },
+        )
+    )
+    # If this is ever called, the change has regressed to cloud uploads.
+    upload_auth = respx.post(f"{BASE}/items/{attach_key}/file").mock(
+        return_value=httpx.Response(413, text="File would exceed quota")
+    )
+
+    src = linked_dir / "source.pdf"
+    src.write_bytes(pdf_bytes)
+
+    result = _make_client().attach_pdf(parent_key, pdf_path=str(src))
+
+    assert not upload_auth.called, "linked_file mode must never request upload authorization"
+    assert result["status"] == "attached"
+    assert result["link_mode"] == "linked_file"
+    assert result["storage"] == "local"
+
+    body = create_route.calls[0].request.content.decode()
+    assert '"linked_file"' in body
+    assert '"imported_file"' not in body
+
+    written = linked_dir / "source.pdf"
+    assert written.read_bytes() == pdf_bytes
+    assert result["path"] == str(written)
+
+
+@respx.mock
+def test_attach_pdf_linked_survives_full_quota(linked_dir):
+    """A library at 100% quota still attaches successfully in linked mode."""
+    respx.post(f"{BASE}/items").mock(
+        return_value=httpx.Response(
+            200,
+            json={"successful": {"0": {"key": "ATT002", "data": {"key": "ATT002", "version": 1}}}},
+        )
+    )
+    # Any upload attempt would 413 — none should occur.
+    respx.post(f"{BASE}/items/ATT002/file").mock(
+        return_value=httpx.Response(413, text="File would exceed quota")
+    )
+    src = linked_dir / "quota.pdf"
+    src.write_bytes(b"%PDF-1.4 content under a full quota")
+
+    result = _make_client().attach_pdf("PARENT01", pdf_path=str(src))
+    assert result["status"] == "attached"
+
+
+@respx.mock
+def test_attach_pdf_linked_reuses_identical_file(linked_dir):
+    """Re-attaching byte-identical content reuses the file instead of duplicating."""
+    respx.post(f"{BASE}/items").mock(
+        return_value=httpx.Response(
+            200,
+            json={"successful": {"0": {"key": "ATT003", "data": {"key": "ATT003", "version": 1}}}},
+        )
+    )
+    pdf_bytes = b"%PDF-1.4 identical content"
+    src = linked_dir / "paper.pdf"
+    src.write_bytes(pdf_bytes)
+
+    first = _make_client().attach_pdf("PARENT01", pdf_path=str(src))
+    second = _make_client().attach_pdf("PARENT01", pdf_path=str(src))
+
+    assert first["path"] == second["path"]
+    assert sorted(p.name for p in linked_dir.glob("*.pdf")) == ["paper.pdf"]
+
+
+@respx.mock
+def test_attach_pdf_linked_does_not_overwrite_different_content(linked_dir):
+    """A name collision with different bytes gets a suffix, not an overwrite."""
+    respx.post(f"{BASE}/items").mock(
+        return_value=httpx.Response(
+            200,
+            json={"successful": {"0": {"key": "ATT004", "data": {"key": "ATT004", "version": 1}}}},
+        )
+    )
+    existing = linked_dir / "paper.pdf"
+    existing.write_bytes(b"%PDF-1.4 ORIGINAL do not clobber")
+
+    other = linked_dir / "incoming" / "paper.pdf"
+    other.parent.mkdir()
+    other.write_bytes(b"%PDF-1.4 DIFFERENT content entirely")
+
+    result = _make_client().attach_pdf("PARENT01", pdf_path=str(other))
+
+    assert existing.read_bytes() == b"%PDF-1.4 ORIGINAL do not clobber"
+    assert result["path"] == str(linked_dir / "paper-1.pdf")
+
+
+@respx.mock
+def test_attach_pdf_linked_removes_written_file_if_item_create_fails(linked_dir):
+    """A failed item creation must not leave an orphaned file on disk."""
+    respx.post(f"{BASE}/items").mock(side_effect=httpx.ConnectError("API unreachable"))
+
+    src = linked_dir / "incoming" / "orphan.pdf"
+    src.parent.mkdir()
+    src.write_bytes(b"%PDF-1.4 should be cleaned up")
+
+    with pytest.raises(Exception):
+        _make_client().attach_pdf("PARENT01", pdf_path=str(src))
+
+    assert not (linked_dir / "orphan.pdf").exists()
+    assert src.exists(), "the caller's own source file must never be deleted"
 
 
 # -- Magic byte validation --

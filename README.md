@@ -43,7 +43,7 @@ Free OpenAlex key at [openalex.org/users/me](https://openalex.org/users/me).
 
 ## Operating modes
 
-**All 36 tools work with just API credentials** — Zotero desktop does not need to be running. Two diagnostic tools (`check_ssl_health`, `audit_local_keys`) require no credentials at all.
+**All 39 tools work with just API credentials** — Zotero desktop does not need to be running. Two diagnostic tools (`check_ssl_health`, `audit_local_keys`) require no credentials at all.
 
 | Mode | What it provides | Requirements |
 | --- | --- | --- |
@@ -82,7 +82,10 @@ Call `server_status` to check which modes are available.
 | `update_item`                 | Patch metadata fields                                                |
 | `attach_pdf`                  | Attach a local or auto-downloaded PDF                                |
 | `trash_items`                 | Move items to trash (reversible)                                     |
-| `empty_trash`                 | Permanently delete all trashed items                                 |
+| `inspect_trash`               | List trash contents — call before `empty_trash`                      |
+| `empty_trash`                 | Permanently delete all trashed items (global, irreversible)          |
+| `plan_attachment_migration`   | Dry-run plan for converting cloud attachments to linked files        |
+| `migrate_attachments`         | Convert cloud attachments to linked files (dry run unless `apply=true`) |
 | `manage_tags`                 | List, remove, or rename tags library-wide (`action="list\|remove\|rename"`) |
 
 ### Citation tools
@@ -169,6 +172,68 @@ support this finding [@DEF456, @GHI789].
 
 After opening in Word with the Zotero plugin: click Refresh to populate the bibliography and switch citation styles.
 
+## Reclaiming Zotero cloud storage quota
+
+`attach_pdf` writes linked files by default, so it no longer consumes quota.
+Attachments created *before* that change are still imported (cloud-stored) and
+still count against it. `zotero-migrate-attachments` converts `imported_file`
+attachments in place by default: each file is copied or downloaded to local
+disk, hash-verified, replaced with a `linked_file` attachment on the same parent
+item, and the original is trashed.
+
+Always start with the dry run — it is the default, and writes nothing:
+
+```bash
+zotero-migrate-attachments
+```
+
+Read the plan, then convert a small batch first:
+
+```bash
+zotero-migrate-attachments --apply --modes imported_file --limit 5
+```
+
+Check that those five items look right in Zotero (the PDF should open, and the
+attachment icon shows a link), then run the rest:
+
+```bash
+zotero-migrate-attachments --apply
+```
+
+Trashing is reversible and the quota is not returned until the trash is
+emptied. The migration records its keys in
+`.zotero-attachment-migration-trash.json` under the destination directory
+before trashing anything. `DELETE /items/trash` is global, so review the trash,
+then use the separate purge-only invocation:
+
+```bash
+zotero-migrate-attachments --apply --empty-trash
+```
+
+That loads the keys persisted by the earlier invocation and refuses to run if
+the trash holds anything the migration did not put there. If `--dest` was used
+for migration, pass the same `--dest` here. The command never infers ownership
+from whatever happens to be in the trash.
+
+`imported_url` snapshots are excluded by default because one Zotero snapshot
+can contain an HTML file plus companion resources. To opt in, use
+`--modes imported_url`; even then, a snapshot is migrated only when it is
+already downloaded locally and its storage directory contains exactly one
+regular file. Cloud-only or multi-resource snapshots are skipped rather than
+flattened and damaged.
+
+Useful flags: `--modes imported_file` (the default), `--modes imported_url`
+(explicit validated-snapshot opt-in), `--dest DIR` (default
+`<ZOTERO_DATA_DIR>/linked-attachments`), `--no-trash` (create the links now,
+trash later), `--include-local-only` (also convert attachments Zotero holds no
+cloud file for — these free no quota), and `--limit N`.
+
+The same operations are exposed as MCP tools: `plan_attachment_migration`,
+`migrate_attachments`, `inspect_trash`.
+
+**Back up the linked-attachment directory.** Linked files do not sync; after
+migrating, those bytes exist only on this machine.
+
 ## Architecture
 
 ```text
@@ -220,6 +285,15 @@ pip install -e ".[graph,fulltext]"
 
 Then configure your MCP client to run `python -m zotero_mcp`.
 
+**Developing against a live install (uvx + local source):**
+
+If your MCP client runs the server via `uvx --from 'zotero-mcp-plus @ file:///path/to/zotero-mcp'` (or any `file://` reference to this checkout), be aware that **uvx builds a wheel once and caches it**. Editing the source afterwards silently does nothing — the running server keeps using the cached wheel until either:
+
+- the `version` in `pyproject.toml` is bumped (a new version → a new cache entry), or
+- the cache is invalidated explicitly: `uvx --reinstall --from '…' zotero-mcp` for one run, or `uv cache clean zotero-mcp-plus` to purge it.
+
+Either way, the MCP client must then be fully restarted (not just reconnected) so it launches a fresh server process. If a fix you just made doesn't seem to take effect, this cache is almost always why. For rapid iteration, prefer Option B (`pip install -e`) — editable installs pick up source edits on every server start with no cache in the way.
+
 ### 4. Set up OpenAlex API key (required for analysis and knowledge graph tools)
 
 `OPENALEX_API_KEY` is required for: `check_retractions`, `get_citation_graph`, `check_published_versions`, `build_index(type='graph')`, `query_knowledge_graph`, `query_authors`, and `export_knowledge_graph`. OpenAlex requires a free API key as of Feb 2026:
@@ -270,8 +344,11 @@ Adds pypdf for extracting text from PDFs. Used by `build_index(type='fulltext')`
 | `OPENALEX_API_KEY`         | For analysis/graph tools | Required for `check_retractions`, `get_citation_graph`, `check_published_versions`, and all knowledge-graph tools — free at [openalex.org/users/me](https://openalex.org/users/me) |
 | `ZOTERO_MCP_EMAIL`         | No       | Your email address. Sent in User-Agent headers to CrossRef/OpenAlex polite pools and required for Unpaywall PDF lookup in `attach_pdf`. Without it, Unpaywall PDF fetches are skipped. |
 | `SEMANTIC_SCHOLAR_API_KEY` | No       | Improves rate limits for `find_related_papers` — free at [semanticscholar.org](https://www.semanticscholar.org/product/api) |
+| `NCBI_API_KEY`             | No       | Raises the PubMed/eutils rate limit from 3 to 10 req/s — helps bulk identifier resolution and graph builds. Free at [ncbi.nlm.nih.gov/account](https://www.ncbi.nlm.nih.gov/account/settings/). |
 | `ZOTERO_DATA_DIR`          | No       | Override path to Zotero desktop data directory (default: `~/Zotero`). Used by `audit_local_keys` and the local PDF path resolver in `get_pdf_content`. |
-| `ZOTERO_MCP_GRAPH_DB`      | No       | Override path for the knowledge-graph SQLite database (default: `~/.local/share/zotero-mcp/graph.sqlite` or `$XDG_DATA_HOME/zotero-mcp/graph.sqlite`). |
+| `ZOTERO_LINKED_ATTACHMENT_DIR` | No   | Where `attach_pdf` writes PDFs for linked-file attachments (default: `<ZOTERO_DATA_DIR>/linked-attachments`). |
+| `ZOTERO_ATTACHMENT_MODE`   | No       | `linked` (default) stores PDFs on local disk as `linked_file` attachments and consumes **no** Zotero cloud storage quota. `imported` uploads into Zotero storage instead — syncs across devices, but counts against the quota and fails with HTTP 413 once it is full. Linked-file attachments are not valid in group libraries; use `imported` there. |
+| `ZOTERO_MCP_GRAPH_DB`      | No       | Override path for the knowledge-graph SQLite database (default: OS-native per-user data dir — `~/Library/Application Support/zotero-mcp/` on macOS, `%LOCALAPPDATA%\zotero-mcp\` on Windows, `~/.local/share/zotero-mcp/` elsewhere; an existing legacy `~/.local/share` DB is reused). |
 | `XDG_DATA_HOME`            | No       | Standard XDG override for the default graph DB location. |
 | `PARENT_WATCHDOG_DISABLE`  | No       | Set to `1` to disable the orphan-process watchdog that kills the server when the parent process (Claude.app, uvx, etc.) exits. |
 

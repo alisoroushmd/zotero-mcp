@@ -11,6 +11,24 @@ import logging
 
 logger = logging.getLogger(__name__)
 
+PYPDF_INSTALL_HINT = (
+    "Full-text extraction requires pypdf. Install with: pip install 'zotero-mcp-plus[fulltext]'"
+)
+
+
+def pypdf_available() -> bool:
+    """Return True if the optional pypdf dependency is importable (ZOT-30).
+
+    Lets the calling tool tell the user to install the ``[fulltext]`` extra
+    once, up front, instead of reporting every PDF as an opaque failure.
+    """
+    try:
+        import pypdf  # noqa: F401
+
+        return True
+    except ImportError:
+        return False
+
 
 def extract_text_from_pdf(source: str | bytes) -> str | None:
     """Extract text content from a PDF file path or raw bytes.
@@ -23,12 +41,10 @@ def extract_text_from_pdf(source: str | bytes) -> str | None:
     """
     try:
         from pypdf import PdfReader
-    except ImportError:
-        logger.error(
-            "pypdf is required for full-text extraction. "
-            "Install with: pip install 'zotero-mcp[fulltext]'"
-        )
-        return None
+    except ImportError as exc:
+        # Raise (rather than return None) so the caller can distinguish "pypdf
+        # not installed" from "PDF had no extractable text" (ZOT-30).
+        raise ImportError(PYPDF_INSTALL_HINT) from exc
 
     try:
         if isinstance(source, bytes):

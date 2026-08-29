@@ -115,11 +115,20 @@ _HTML_TEMPLATE = """\
     event.stopPropagation();
     const panel = document.getElementById("info-panel");
     document.getElementById("info-title").textContent = d.label;
-    let html = "";
+    const body = document.getElementById("info-body");
+    body.textContent = "";
     for (const [k, v] of Object.entries(d.meta || {})) {
-      html += '<div class="field"><span class="field-label">' + k + ':</span> ' + v + '</div>';
+      const field = document.createElement("div");
+      field.className = "field";
+      const label = document.createElement("span");
+      label.className = "field-label";
+      label.textContent = k + ":";
+      field.appendChild(label);
+      // textContent (not innerHTML) — paper titles/authors come from external
+      // APIs and may contain HTML; building text nodes neutralizes injection.
+      field.appendChild(document.createTextNode(" " + v));
+      body.appendChild(field);
     }
-    document.getElementById("info-body").innerHTML = html;
     panel.style.display = "block";
   });
 
@@ -134,8 +143,12 @@ _HTML_TEMPLATE = """\
   groups.forEach(g => {
     const entry = document.createElement("div");
     entry.className = "entry";
-    entry.innerHTML = '<span class="swatch" style="background:' + colorScale(g) + '"></span>'
-      + (labels[g] || "Group " + g);
+    const swatch = document.createElement("span");
+    swatch.className = "swatch";
+    swatch.style.background = colorScale(g);
+    entry.appendChild(swatch);
+    // textContent — cluster labels are derived from paper topics (external data).
+    entry.appendChild(document.createTextNode(labels[g] || "Group " + g));
     legendDiv.appendChild(entry);
   });
 
@@ -389,7 +402,33 @@ def render_full_view(kg: KnowledgeGraph, max_papers: int = 200) -> tuple[str, di
     return _render_html(data), stats
 
 
+def _json_for_script(data: dict) -> str:
+    """Serialize ``data`` to JSON safe to embed inside an HTML ``<script>`` tag.
+
+    ``json.dumps`` escapes quotes and backslashes but NOT ``<``, ``>``, ``&``,
+    or the JS line separators U+2028 / U+2029. Without escaping these, a paper
+    title or author name (sourced from external APIs) containing ``</script>``
+    would terminate the script element and inject arbitrary markup/JS into the
+    exported HTML the user opens. Replacing them with their ``\\uXXXX`` escapes
+    keeps the JSON value-identical while making script breakout impossible.
+
+    Args:
+        data: The graph payload (nodes, edges, group_labels).
+
+    Returns:
+        A JSON string with HTML-script-sensitive characters unicode-escaped.
+    """
+    return (
+        json.dumps(data, ensure_ascii=False)
+        .replace("<", "\\u003c")
+        .replace(">", "\\u003e")
+        .replace("&", "\\u0026")
+        .replace("\u2028", "\\u2028")
+        .replace("\u2029", "\\u2029")
+    )
+
+
 def _render_html(data: dict) -> str:
-    """Inject graph data into the HTML template."""
-    json_str = json.dumps(data, ensure_ascii=False)
+    """Inject graph data into the HTML template (script-context-escaped)."""
+    json_str = _json_for_script(data)
     return _HTML_TEMPLATE.replace("__GRAPH_DATA_PLACEHOLDER__", json_str)

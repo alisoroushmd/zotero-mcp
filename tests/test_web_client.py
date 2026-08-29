@@ -790,15 +790,47 @@ def test_get_tags_passes_prefix_as_q():
 
 @respx.mock
 def test_remove_tag_sends_delete():
-    """remove_tag DELETEs the tag and returns status removed."""
+    """remove_tag DELETEs via /tags?tag=<name> (query param), not /tags/<name>.
+
+    The Zotero Web API only supports tag deletion through the query-parameter
+    form; DELETE on the /tags/<name> path segment returns 405 Method Not Allowed.
+    """
     respx.get(f"{BASE_TAG}/items").mock(
         return_value=httpx.Response(200, json=[], headers={"Last-Modified-Version": "5"})
     )
-    delete_route = respx.delete(f"{BASE_TAG}/tags/old-tag").mock(return_value=httpx.Response(204))
+    delete_route = respx.delete(f"{BASE_TAG}/tags").mock(return_value=httpx.Response(204))
     client = WebClient(api_key="k", user_id="12345")
     result = client.remove_tag("old-tag")
     assert result["status"] == "removed"
     assert delete_route.called
+    req = delete_route.calls[0].request
+    assert req.url.path == "/users/12345/tags"
+    assert req.url.params["tag"] == "old-tag"
+    assert req.headers["If-Unmodified-Since-Version"] == "5"
+
+
+@respx.mock
+def test_remove_tag_encodes_special_characters_in_query():
+    """Tags with spaces/emoji ride in the url-encoded query param (regression: #405).
+
+    Real-world trigger: the '❓ Multiple DOI' tag failed with HTTP 405 because
+    the tag was interpolated into the DELETE path instead of the query string.
+    """
+    respx.get(f"{BASE_TAG}/items").mock(
+        return_value=httpx.Response(200, json=[], headers={"Last-Modified-Version": "9"})
+    )
+    delete_route = respx.delete(f"{BASE_TAG}/tags").mock(return_value=httpx.Response(204))
+    client = WebClient(api_key="k", user_id="12345")
+    tag = "❓ Multiple DOI"
+    result = client.remove_tag(tag)
+    assert result["status"] == "removed"
+    req = delete_route.calls[0].request
+    assert req.url.path == "/users/12345/tags"
+    # httpx decodes the param back to the original value ...
+    assert req.url.params["tag"] == tag
+    # ... but the wire form must be percent-encoded (no raw spaces/emoji).
+    raw_query = req.url.query.decode()
+    assert " " not in raw_query and "❓" not in raw_query
 
 
 @respx.mock
@@ -961,3 +993,87 @@ def test_batch_organize_handles_412_retry():
     assert "ITEM2" in result["updated_keys"]
     assert result["updated_count"] == 1
     assert result["failed_count"] == 0
+
+
+# -- NCBI eutils API key injection (ZOT-28) --
+
+
+@respx.mock
+def test_pubmed_get_injects_ncbi_api_key(monkeypatch):
+    """When NCBI_API_KEY is set, _pubmed_get adds it to eutils query params."""
+    from zotero_mcp.config import _reset_config
+
+    monkeypatch.setenv("NCBI_API_KEY", "secret-ncbi-key")
+    _reset_config()
+    try:
+        route = respx.get(f"{PUBMED_BASE}/esearch.fcgi").mock(
+            return_value=httpx.Response(200, json={"esearchresult": {"idlist": ["999"]}})
+        )
+        client = WebClient(api_key="k", user_id="1")
+        client.resolve_pmid_to_pmcid("12345")
+        assert route.called
+        sent_url = str(route.calls.last.request.url)
+        assert "api_key=secret-ncbi-key" in sent_url
+    finally:
+        _reset_config()
+
+
+@respx.mock
+def test_pubmed_get_omits_key_when_unset(monkeypatch):
+    """Without NCBI_API_KEY, no api_key param is sent."""
+    from zotero_mcp.config import _reset_config
+
+    monkeypatch.delenv("NCBI_API_KEY", raising=False)
+    _reset_config()
+    try:
+        route = respx.get(f"{PUBMED_BASE}/esearch.fcgi").mock(
+            return_value=httpx.Response(200, json={"esearchresult": {"idlist": ["999"]}})
+        )
+        client = WebClient(api_key="k", user_id="1")
+        client.resolve_pmid_to_pmcid("12345")
+        assert route.called
+        assert "api_key=" not in str(route.calls.last.request.url)
+    finally:
+        _reset_config()
+
+
+# -- Retry-After hostile-value handling (ZOT-24 review) --
+
+
+def test_parse_retry_after_rejects_hostile_values():
+    """web_client _parse_retry_after rejects negative/nan/inf (ZOT-24 review)."""
+    from zotero_mcp.web_client import _parse_retry_after
+
+    assert _parse_retry_after("5", 9.0) == 5.0
+    assert _parse_retry_after("-5", 9.0) == 9.0
+    assert _parse_retry_after("nan", 9.0) == 9.0
+    assert _parse_retry_after("inf", 9.0) == 9.0
+    assert _parse_retry_after("Wed, 21 Oct 2026 07:28:00 GMT", 9.0) == 9.0
+    assert _parse_retry_after(None, 9.0) == 9.0
+
+
+# -- Stale dedup flag does not leak across pooled-client calls (ZOT-26 review) --
+
+
+@respx.mock
+def test_dedup_flag_does_not_leak_to_url_create():
+    """A prior transient dedup failure must not flag a later DOI-less URL create."""
+    client = WebClient(api_key="k", user_id="1")
+    # Poison the flag as if a previous create had a dedup-check failure.
+    client._dedup_check_failed = True
+
+    # Translation /web returns a webpage stub with NO DOI -> no dedup check runs.
+    respx.post("https://translate.zotero.org/web").mock(
+        return_value=httpx.Response(
+            200, json=[{"itemType": "webpage", "title": "Some Page", "url": "https://x.test"}]
+        )
+    )
+    respx.post(f"{WEB_BASE}/users/1/items").mock(
+        return_value=httpx.Response(
+            200, json={"successful": {"0": {"key": "URLKEY", "data": {"key": "URLKEY"}}}}
+        )
+    )
+    result = client.create_item_from_url("https://x.test/page")
+    assert result["key"] == "URLKEY"
+    # The stale flag must have been reset at entry, so no false warning.
+    assert "dedup_check_failed" not in result

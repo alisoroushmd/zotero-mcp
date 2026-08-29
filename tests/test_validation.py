@@ -95,3 +95,60 @@ def test_validate_path_accepts_tmp():
     # Resolve both sides to handle macOS /var -> /private/var symlink
     resolved_tmp_root = str(pathlib.Path(tempfile.gettempdir()).resolve())
     assert result.startswith(resolved_tmp_root)
+
+
+# -- _parse_dict_param (ZOT-31) --
+
+
+def test_parse_dict_param_accepts_dict():
+    from zotero_mcp.server import _parse_dict_param
+
+    assert _parse_dict_param({"title": "X"}) == {"title": "X"}
+
+
+def test_parse_dict_param_parses_json_string():
+    from zotero_mcp.server import _parse_dict_param
+
+    assert _parse_dict_param('{"title": "X"}') == {"title": "X"}
+
+
+def test_parse_dict_param_none_is_empty():
+    from zotero_mcp.server import _parse_dict_param
+
+    assert _parse_dict_param(None) == {}
+
+
+def test_parse_dict_param_rejects_non_object_json():
+    from zotero_mcp.server import _parse_dict_param
+
+    with pytest.raises(ValueError, match="JSON object"):
+        _parse_dict_param("[1, 2, 3]")
+
+
+def test_parse_dict_param_rejects_bad_json():
+    from zotero_mcp.server import _parse_dict_param
+
+    with pytest.raises(ValueError, match="invalid JSON"):
+        _parse_dict_param("{not json}")
+
+
+def test_cap_list_passes_small_lists():
+    from zotero_mcp.server import _cap_list
+
+    assert _cap_list([1, 2, 3], 10) == [1, 2, 3]
+
+
+def test_cap_list_wraps_large_lists():
+    from zotero_mcp.server import _cap_list
+
+    result = _cap_list(list(range(100)), 10)
+    assert result["truncated"] is True
+    assert result["count"] == 10
+    assert result["total"] == 100
+    assert result["items"] == list(range(10))
+
+
+def test_cap_list_passes_non_lists():
+    from zotero_mcp.server import _cap_list
+
+    assert _cap_list({"a": 1}, 10) == {"a": 1}

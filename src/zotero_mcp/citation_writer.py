@@ -8,7 +8,9 @@ from __future__ import annotations
 
 import hashlib
 import json
+import os
 import re
+import tempfile
 import uuid
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -501,6 +503,32 @@ def _rebuild_paragraph_with_citations(
             add_citation_field(paragraph, citation_json, display)
 
 
+def _save_docx_atomic(doc, save_to: Path) -> None:
+    """Save a Document via a sibling temp file + ``os.replace`` (ZOT-43).
+
+    ``insert_citations`` overwrites its own source document when no
+    output_path is given. A direct ``doc.save`` that dies mid-write (disk
+    full, crash, Ctrl-C) leaves a truncated, unopenable .docx — and the
+    user's original is already gone. Writing to a temp file in the same
+    directory and renaming over the target makes the overwrite
+    all-or-nothing; the original survives any failure.
+    """
+    fd, tmp = tempfile.mkstemp(suffix=".docx", prefix=".zotero_mcp_", dir=str(save_to.parent))
+    os.close(fd)
+    try:
+        doc.save(tmp)
+        if save_to.exists():
+            # mkstemp creates 0600 files; keep the original's permissions.
+            os.chmod(tmp, save_to.stat().st_mode & 0o7777)
+        os.replace(tmp, save_to)
+    except BaseException:
+        try:
+            os.unlink(tmp)
+        except OSError:
+            pass
+        raise
+
+
 def insert_citations(
     document_path: str,
     item_data: dict[str, dict],
@@ -544,7 +572,7 @@ def insert_citations(
                         all_text_parts.append(text)
 
     if not all_text_parts:
-        doc.save(str(save_to))
+        _save_docx_atomic(doc, save_to)
         return str(save_to), 0
 
     # Build global numbering from concatenated text
@@ -585,5 +613,5 @@ def insert_citations(
         bib_para = doc.add_paragraph()
         add_bibliography_field(bib_para)
 
-    doc.save(str(save_to))
+    _save_docx_atomic(doc, save_to)
     return str(save_to), citation_count

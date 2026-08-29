@@ -7,6 +7,7 @@ recommendations and single-paper lookup.
 from __future__ import annotations
 
 import logging
+import math
 import time
 
 import httpx
@@ -15,6 +16,25 @@ logger = logging.getLogger(__name__)
 
 S2_BASE = "https://api.semanticscholar.org"
 TIMEOUT = httpx.Timeout(15.0, connect=5.0)
+
+
+def _parse_retry_after(value: str | None, fallback: float) -> float:
+    """Parse a Retry-After header to seconds, tolerating HTTP-date values (ZOT-24).
+
+    Same contract as the web_client/openalex_client copies: only a finite,
+    non-negative numeric form is honored; a date or junk falls back. Matters
+    more now that errors propagate (ZOT-38) — an ``int()`` crash here would be
+    misclassified as invalid input by ``_handle_tool_errors``.
+    """
+    if not value:
+        return fallback
+    try:
+        parsed = float(value)
+    except (ValueError, TypeError):
+        return fallback
+    if not math.isfinite(parsed) or parsed < 0:
+        return fallback
+    return parsed
 
 
 class SemanticScholarClient:
@@ -34,6 +54,13 @@ class SemanticScholarClient:
             timeout=TIMEOUT,
         )
 
+    def close(self) -> None:
+        """Close the pooled HTTP client (ZOT-38).
+
+        Idempotent; called from server.py's ``_cleanup_clients`` atexit handler.
+        """
+        self._client.close()
+
     def get_recommendations(self, seed_dois: list[str], limit: int = 10) -> list[dict]:
         """Get paper recommendations based on seed papers.
 
@@ -46,10 +73,26 @@ class SemanticScholarClient:
 
         Returns:
             List of recommended paper dicts with title, doi, year, authors.
+
+        Raises:
+            httpx.HTTPError: On API or transport failure (ZOT-38). Failures
+                used to be swallowed into an empty list, indistinguishable
+                from "no recommendations"; they now propagate so the server's
+                ``_handle_tool_errors`` can surface a structured error.
         """
         paper_ids = [{"doi": doi} for doi in seed_dois[:50]]
 
-        try:
+        resp = self._client.post(
+            "/recommendations/v1/papers/",
+            json={"positivePaperIds": paper_ids, "negativePaperIds": []},
+            params={
+                "limit": min(limit, 50),
+                "fields": "title,year,authors,externalIds",
+            },
+        )
+        if resp.status_code == 429:
+            retry_after = _parse_retry_after(resp.headers.get("Retry-After"), 5.0)
+            time.sleep(min(retry_after, 10))
             resp = self._client.post(
                 "/recommendations/v1/papers/",
                 json={"positivePaperIds": paper_ids, "negativePaperIds": []},
@@ -58,23 +101,9 @@ class SemanticScholarClient:
                     "fields": "title,year,authors,externalIds",
                 },
             )
-            if resp.status_code == 429:
-                retry_after = int(resp.headers.get("Retry-After", "5"))
-                time.sleep(min(retry_after, 10))
-                resp = self._client.post(
-                    "/recommendations/v1/papers/",
-                    json={"positivePaperIds": paper_ids, "negativePaperIds": []},
-                    params={
-                        "limit": min(limit, 50),
-                        "fields": "title,year,authors,externalIds",
-                    },
-                )
-            resp.raise_for_status()
-            papers = resp.json().get("recommendedPapers", [])
-            return [self._format_paper(p) for p in papers]
-        except Exception as exc:
-            logger.warning("Semantic Scholar recommendations failed: %s", exc)
-            return []
+        resp.raise_for_status()
+        papers = resp.json().get("recommendedPapers", [])
+        return [self._format_paper(p) for p in papers]
 
     def search_similar(self, doi: str, limit: int = 10) -> list[dict]:
         """Find papers similar to a given DOI."""

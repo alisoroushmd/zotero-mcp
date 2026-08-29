@@ -98,3 +98,56 @@ def test_update_item_retries_on_429():
         result = client.update_item(item_key, {"title": "New Title"})
     assert result["version"] == 6
     assert call_count == 2
+
+
+@respx.mock
+def test_get_item_retries_on_429():
+    """Read GETs go through _retry_request too (ZOT-40)."""
+    item_key = "ABCD1234"
+
+    route = respx.get(f"{BASE}/items/{item_key}").mock(
+        side_effect=[
+            httpx.Response(429, headers={"Retry-After": "0"}),
+            httpx.Response(200, json={"data": {"key": item_key, "title": "Test"}}),
+        ]
+    )
+
+    client = make_client()
+    with patch("time.sleep"):
+        result = client.get_item(item_key)
+    assert result["title"] == "Test"
+    assert route.call_count == 2
+
+
+@respx.mock
+def test_backoff_header_delays_next_read():
+    """A Zotero `Backoff` header makes the NEXT read wait out the window (ZOT-40)."""
+    respx.get(f"{BASE}/collections").mock(
+        return_value=httpx.Response(200, json=[], headers={"Backoff": "5"})
+    )
+
+    client = make_client()
+    client.get_collections()  # 200 + Backoff: 5 — records the window
+    assert client._backoff_until > 0.0
+
+    with patch("time.sleep") as mock_sleep:
+        client.get_collections()  # must sleep out the remaining window first
+    assert mock_sleep.call_count >= 1
+    slept = mock_sleep.call_args_list[0][0][0]
+    assert 0.0 < slept <= 5.0
+
+
+@respx.mock
+def test_backoff_junk_header_ignored():
+    """A non-numeric Backoff value is ignored, not crashed on (ZOT-24/40)."""
+    respx.get(f"{BASE}/collections").mock(
+        return_value=httpx.Response(200, json=[], headers={"Backoff": "soon"})
+    )
+
+    client = make_client()
+    client.get_collections()
+    assert client._backoff_until == 0.0
+
+    with patch("time.sleep") as mock_sleep:
+        client.get_collections()
+    mock_sleep.assert_not_called()

@@ -5,14 +5,17 @@ from __future__ import annotations
 import hashlib
 import ipaddress
 import logging
+import math
 import re
 import time
 from pathlib import Path
 from typing import TYPE_CHECKING
-from urllib.parse import quote, urlencode, urlparse
+from urllib.parse import urlencode, urlparse
 
 import defusedxml.ElementTree as ElementTree
 import httpx
+
+from zotero_mcp import __version__
 
 if TYPE_CHECKING:
     from zotero_mcp.local_client import LocalClient
@@ -96,19 +99,37 @@ def _is_usable_polite_email(email: str) -> bool:
     return not any(low.endswith(d) for d in placeholder_domains)
 
 
-def _polite_user_agent() -> str:
+# Real package name + version instead of a hardcoded "zotero-mcp/1.0" (ZOT-39):
+# "zotero-mcp" is a different project on PyPI, and a frozen version string
+# misattributes traffic in polite-pool logs.
+_UA_PRODUCT = f"zotero-mcp-plus/{__version__}"
+
+
+def _polite_user_agent(email: str | None = None) -> str:
     """Return a User-Agent string for polite-pool APIs.
 
-    Includes mailto: only when the configured email is a real address.
-    Falls back to a generic string so CrossRef/OpenAlex still accept the request.
+    Includes mailto: only when the email is a real address (placeholder
+    domains are omitted). Falls back to a generic string so CrossRef/OpenAlex
+    still accept the request.
+
+    Args:
+        email: Optional explicit email; when None the configured polite
+            email is used (ZOT-39 — lets OpenAlexClient route its
+            constructor override through the same placeholder filtering).
     """
-    email = _get_polite_email()
+    if email is None:
+        email = _get_polite_email()
     if _is_usable_polite_email(email):
-        return f"zotero-mcp/1.0 (mailto:{email})"
-    return "zotero-mcp/1.0"
+        return f"{_UA_PRODUCT} (mailto:{email})"
+    return _UA_PRODUCT
 
 
 SEARCH_TIMEOUT = httpx.Timeout(45.0, connect=5.0)  # searches can be slow on large libraries
+
+# Cap any single sleep driven by a server header (Retry-After via
+# _retry_request uses its own 30s cap; this one bounds Zotero `Backoff`
+# waits, ZOT-40) so a hostile/buggy header can't stall a tool call.
+_MAX_BACKOFF_SLEEP = 30.0
 
 
 # medRxiv/bioRxiv DOI prefixes (medRxiv migrated from 10.1101 to 10.64898)
@@ -158,6 +179,26 @@ def _is_valid_pdf(content: bytes) -> bool:
     return len(content) >= 5 and content[:5] == b"%PDF-"
 
 
+def _parse_retry_after(value: str | None, fallback: float) -> float:
+    """Parse a Retry-After header to seconds, tolerating HTTP-date values (ZOT-24).
+
+    RFC 7231 allows Retry-After to be either delta-seconds or an HTTP-date. We
+    only honor a finite, non-negative numeric form; a date, junk, or a hostile
+    value (negative / nan / inf) falls back to ``fallback`` — otherwise
+    ``time.sleep(-5)`` / ``time.sleep(nan)`` would crash the retry loop, the
+    opposite of hardening it (ZOT-24 review).
+    """
+    if not value:
+        return fallback
+    try:
+        parsed = float(value)
+    except (ValueError, TypeError):
+        return fallback
+    if not math.isfinite(parsed) or parsed < 0:
+        return fallback
+    return parsed
+
+
 def _retry_request(
     fn,
     max_attempts: int = 3,
@@ -180,7 +221,9 @@ def _retry_request(
     for attempt in range(1, max_attempts):
         if resp.status_code != 429:
             return resp
-        retry_after = float(resp.headers.get("Retry-After", base_delay * (2 ** (attempt - 1))))
+        retry_after = _parse_retry_after(
+            resp.headers.get("Retry-After"), base_delay * (2 ** (attempt - 1))
+        )
         delay = min(retry_after, 30.0)
         logger.warning(
             "Rate limited (429), retrying in %.1fs (attempt %d/%d)",
@@ -236,8 +279,62 @@ class WebClient:
             base_url="https://eutils.ncbi.nlm.nih.gov/entrez/eutils",
             timeout=TIMEOUT,
         )
+        from zotero_mcp.config import get_config
+
+        self._ncbi_api_key = get_config().ncbi_api_key
+        # Set by the dedup helpers when a duplicate check fails transiently (ZOT-26).
+        self._dedup_check_failed = False
+        # monotonic deadline from Zotero's `Backoff` header (ZOT-40); reads
+        # sleep out any remaining window before hitting the API again.
+        self._backoff_until = 0.0
+
+    def close(self) -> None:
+        """Close all pooled HTTP clients (ZOT-23).
+
+        Idempotent: ``httpx.Client.close()`` is safe to call more than once.
+        Called from an ``atexit`` handler in server.py for clean shutdown.
+        """
+        for client in (self._web_client, self._translate_client, self._pubmed_client):
+            try:
+                client.close()
+            except Exception:  # pragma: no cover — best-effort cleanup
+                pass
+
+    def __enter__(self) -> WebClient:
+        return self
+
+    def __exit__(self, *_) -> None:
+        self.close()
 
     # -- Web API read methods (primary read path) --
+    # All read GETs go through _read_get (ZOT-40): a Zotero 429 is retried with
+    # Retry-After honored via _retry_request, and the separate Zotero `Backoff`
+    # header (sent on 2xx when the server is overloaded) is tracked so the next
+    # read waits out the window. Write paths do not consult the backoff state.
+
+    def _read_get(
+        self,
+        path: str,
+        *,
+        params: dict | None = None,
+        timeout: httpx.Timeout | object = httpx.USE_CLIENT_DEFAULT,
+    ) -> httpx.Response:
+        """GET a Zotero Web API path with 429 retry and Backoff honor (ZOT-40).
+
+        Sleeps out any backoff window a previous response requested, issues the
+        GET through ``_retry_request``, then records a new window if this
+        response carries a ``Backoff`` header. The state is a single float;
+        concurrent readers racing on it at worst sleep slightly long or short,
+        so it is deliberately lock-free.
+        """
+        wait = self._backoff_until - time.monotonic()
+        if wait > 0:
+            time.sleep(min(wait, _MAX_BACKOFF_SLEEP))
+        resp = _retry_request(lambda: self._web_client.get(path, params=params, timeout=timeout))
+        backoff = _parse_retry_after(resp.headers.get("Backoff"), 0.0)
+        if backoff > 0:
+            self._backoff_until = time.monotonic() + min(backoff, _MAX_BACKOFF_SLEEP)
+        return resp
 
     def search_items(
         self,
@@ -268,11 +365,7 @@ class WebClient:
             params["tag"] = tag
         if start:
             params["start"] = start
-        resp = self._web_client.get(
-            "/items/top",
-            params=params,
-            timeout=SEARCH_TIMEOUT,
-        )
+        resp = self._read_get("/items/top", params=params, timeout=SEARCH_TIMEOUT)
         resp.raise_for_status()
         return [_format_summary(item) for item in resp.json()]
 
@@ -281,7 +374,7 @@ class WebClient:
         params = {}
         if fmt == "bibtex":
             params["format"] = "bibtex"
-        resp = self._web_client.get(f"/items/{item_key}", params=params)
+        resp = self._read_get(f"/items/{item_key}", params=params)
         resp.raise_for_status()
         if fmt == "bibtex":
             return resp.text
@@ -290,7 +383,7 @@ class WebClient:
 
     def get_collections(self) -> list[dict]:
         """List all collections via Web API."""
-        resp = self._web_client.get("/collections")
+        resp = self._read_get("/collections")
         resp.raise_for_status()
         return [
             {
@@ -311,10 +404,7 @@ class WebClient:
         params: dict = {"limit": limit}
         if start:
             params["start"] = start
-        resp = self._web_client.get(
-            f"/collections/{collection_key}/items/top",
-            params=params,
-        )
+        resp = self._read_get(f"/collections/{collection_key}/items/top", params=params)
         resp.raise_for_status()
         return [_format_summary(item) for item in resp.json()]
 
@@ -323,7 +413,7 @@ class WebClient:
         params = {}
         if item_type:
             params["itemType"] = item_type
-        resp = self._web_client.get(f"/items/{parent_key}/children", params=params or None)
+        resp = self._read_get(f"/items/{parent_key}/children", params=params or None)
         resp.raise_for_status()
         return [item.get("data", item) for item in resp.json()]
 
@@ -352,9 +442,22 @@ class WebClient:
         Raises:
             httpx.HTTPStatusError: If the download fails (404, 403, etc.).
         """
-        resp = self._web_client.get(f"/items/{attachment_key}/file")
+        resp = self._read_get(f"/items/{attachment_key}/file")
         resp.raise_for_status()
         return resp.content
+
+    def _pubmed_get(self, path: str, params: dict) -> httpx.Response:
+        """GET an NCBI eutils endpoint with the API key and 429 retry (ZOT-28).
+
+        NCBI throttles anonymous callers to 3 req/s; an ``NCBI_API_KEY`` raises
+        that to 10 and is injected here when configured. Routed through
+        ``_retry_request`` so a 429 during bulk resolution is retried instead of
+        producing sporadic failures.
+        """
+        merged = dict(params)
+        if self._ncbi_api_key:
+            merged["api_key"] = self._ncbi_api_key
+        return _retry_request(lambda: self._pubmed_client.get(path, params=merged))
 
     def resolve_pmid_to_pmcid(self, pmid: str) -> str | None:
         """Convert a PubMed ID to a PubMed Central ID.
@@ -366,7 +469,7 @@ class WebClient:
             PMCID string (e.g. "PMC9046468"), or None if not in PMC.
         """
         try:
-            resp = self._pubmed_client.get(
+            resp = self._pubmed_get(
                 "/esearch.fcgi",
                 params={"db": "pmc", "term": f"{pmid}[pmid]", "retmode": "json"},
             )
@@ -481,7 +584,14 @@ class WebClient:
         return result
 
     def _check_duplicate_doi(self, doi: str) -> dict | None:
-        """Check if a DOI already exists in the library. Returns item summary or None."""
+        """Check if a DOI already exists in the library. Returns item summary or None.
+
+        On a transient check failure (timeout/429/network), sets
+        ``self._dedup_check_failed`` so the caller can warn the user that the
+        no-duplicate guarantee did not hold (ZOT-26), instead of silently
+        creating a duplicate.
+        """
+        self._dedup_check_failed = False
         if not doi:
             return None
         # Try local first (faster), fall back to web search
@@ -495,6 +605,7 @@ class WebClient:
                     return item
         except Exception as exc:
             logger.warning("Duplicate DOI check failed for %s: %s", doi, exc)
+            self._dedup_check_failed = True
         return None
 
     def _check_duplicate_title(self, title: str, threshold: float = 0.90) -> dict | None:
@@ -519,6 +630,7 @@ class WebClient:
             t = _re.sub(r"\s+", " ", t)
             return t
 
+        self._dedup_check_failed = False
         normalized = _normalize(title)
         if not normalized:
             return None
@@ -532,7 +644,9 @@ class WebClient:
                 results = self._local.search_items(search_query, limit=20)
             else:
                 results = self.search_items(search_query, limit=20)
-        except Exception:
+        except Exception as exc:
+            logger.warning("Duplicate title check failed for %r: %s", title[:60], exc)
+            self._dedup_check_failed = True
             return None
 
         for item in results:
@@ -731,13 +845,33 @@ class WebClient:
 
         key = self._extract_created_key(resp.json())
         logger.info("Created item %s from identifier %s", key, identifier)
-        return {
-            "key": key,
-            "title": metadata.get("title", ""),
-            "DOI": metadata.get("DOI", ""),
-            "date": metadata.get("date", ""),
-            "note": "Item created on Zotero web. Sync Zotero desktop to see it locally.",
-        }
+        return self._with_dedup_warning(
+            {
+                "key": key,
+                "title": metadata.get("title", ""),
+                "DOI": metadata.get("DOI", ""),
+                "date": metadata.get("date", ""),
+                "note": "Item created on Zotero web. Sync Zotero desktop to see it locally.",
+            }
+        )
+
+    def _with_dedup_warning(self, result: dict) -> dict:
+        """Annotate a creation result if the duplicate check failed (ZOT-26).
+
+        When the pre-create dedup search errored transiently, the "no duplicate"
+        conclusion is not trustworthy. Surfacing this lets the caller/user know
+        the item may already exist rather than assuming a clean create.
+        """
+        if self._dedup_check_failed:
+            result = {
+                **result,
+                "dedup_check_failed": True,
+                "dedup_warning": (
+                    "Could not verify the item is not a duplicate (the duplicate "
+                    "check failed transiently). It may already exist in the library."
+                ),
+            }
+        return result
 
     def _resolve_identifier(self, identifier: str) -> dict:
         """Resolve PMID/DOI/URL to Zotero item metadata.
@@ -800,7 +934,7 @@ class WebClient:
         elif identifier.startswith("10.") or "doi.org" in identifier:
             doi = identifier.replace("https://doi.org/", "").replace("http://doi.org/", "")
             try:
-                search_resp = self._pubmed_client.get(
+                search_resp = self._pubmed_get(
                     "/esearch.fcgi",
                     params={"db": "pubmed", "term": f"{doi}[doi]", "retmode": "json"},
                 )
@@ -815,7 +949,7 @@ class WebClient:
             return None
 
         try:
-            resp = self._pubmed_client.get(
+            resp = self._pubmed_get(
                 "/efetch.fcgi",
                 params={"db": "pubmed", "id": pmid, "rettype": "xml", "retmode": "xml"},
             )
@@ -1101,6 +1235,10 @@ class WebClient:
         from datetime import date
 
         _validate_url(url)
+        # Reset so a prior call's transient dedup failure can't leak into this
+        # result on the DOI-less webpage-stub path that runs no dedup check
+        # (the pooled client is process-wide) (ZOT-26 review).
+        self._dedup_check_failed = False
 
         metadata = None
 
@@ -1167,12 +1305,14 @@ class WebClient:
 
         key = self._extract_created_key(resp.json())
         logger.info("Created item %s from URL %s", key, url)
-        return {
-            "key": key,
-            "title": metadata.get("title", ""),
-            "item_type": metadata.get("itemType", "webpage"),
-            "note": "Item created on Zotero web. Sync Zotero desktop to see it locally.",
-        }
+        return self._with_dedup_warning(
+            {
+                "key": key,
+                "title": metadata.get("title", ""),
+                "item_type": metadata.get("itemType", "webpage"),
+                "note": "Item created on Zotero web. Sync Zotero desktop to see it locally.",
+            }
+        )
 
     @staticmethod
     def _extract_doi_from_url(url: str) -> str:
@@ -1248,6 +1388,7 @@ class WebClient:
         Returns:
             Dict with "key" and "title".
         """
+        self._dedup_check_failed = False  # avoid stale flag leak (ZOT-26 review)
         metadata: dict = {
             "itemType": item_type,
             "title": title,
@@ -1301,12 +1442,14 @@ class WebClient:
         resp.raise_for_status()
 
         key = self._extract_created_key(resp.json())
-        return {
-            "key": key,
-            "title": title,
-            "item_type": item_type,
-            "note": "Item created on Zotero web. Sync Zotero desktop to see it locally.",
-        }
+        return self._with_dedup_warning(
+            {
+                "key": key,
+                "title": title,
+                "item_type": item_type,
+                "note": "Item created on Zotero web. Sync Zotero desktop to see it locally.",
+            }
+        )
 
     def create_note(
         self,
@@ -1429,7 +1572,7 @@ class WebClient:
                     else:
                         results["skipped"].append(key)
                 elif resp.status_code == 429:
-                    retry_after = int(resp.headers.get("Retry-After", "5"))
+                    retry_after = _parse_retry_after(resp.headers.get("Retry-After"), 5.0)
                     time.sleep(min(retry_after, 10))
                     resp = self._web_client.patch(
                         f"/items/{key}",
@@ -1538,6 +1681,30 @@ class WebClient:
         logger.info("Updated item %s to version %d", item_key, new_version)
         return {"key": item_key, "version": new_version}
 
+    def _library_version(self) -> str:
+        """Fetch the current library version for If-Unmodified-Since-Version (ZOT-25).
+
+        Routed through ``_retry_request`` so a 429 on the version probe is
+        retried rather than silently yielding version ``"0"`` (which would make
+        the subsequent destructive DELETE always 412, or worse act on a stale
+        assumption). Raises if the header is missing instead of defaulting.
+
+        Returns:
+            The library version string from ``Last-Modified-Version``.
+
+        Raises:
+            RuntimeError: if the version header is absent from the response.
+        """
+        resp = self._read_get("/items", params={"limit": 0})
+        resp.raise_for_status()
+        version = resp.headers.get("Last-Modified-Version")
+        if version is None:
+            raise RuntimeError(
+                "Could not determine the current Zotero library version "
+                "(no Last-Modified-Version header). Aborting destructive operation."
+            )
+        return version
+
     def trash_items(self, item_keys: list[str]) -> dict:
         """Move items to Zotero trash (reversible).
 
@@ -1553,9 +1720,7 @@ class WebClient:
         trashed: list[str] = []
         failed: list[str] = []
 
-        # Get current library version
-        resp = self._web_client.get("/items", params={"limit": 0})
-        version = resp.headers.get("Last-Modified-Version", "0")
+        version = self._library_version()
 
         # Chunk into batches of 50
         for i in range(0, len(item_keys), 50):
@@ -1584,9 +1749,7 @@ class WebClient:
         Returns:
             Dict with status.
         """
-        # Get current library version
-        resp = self._web_client.get("/items", params={"limit": 0})
-        version = resp.headers.get("Last-Modified-Version", "0")
+        version = self._library_version()
 
         resp = self._web_client.delete(
             "/items/trash",
@@ -1621,7 +1784,7 @@ class WebClient:
                 "itemType": "-attachment",
                 "format": "json",
             }
-            resp = self._web_client.get(
+            resp = self._read_get(
                 "/items/top",
                 params=params,
                 timeout=SEARCH_TIMEOUT,
@@ -1660,7 +1823,7 @@ class WebClient:
         start = 0
         while True:
             params["start"] = start
-            resp = self._web_client.get("/tags", params=params)
+            resp = self._read_get("/tags", params=params)
             resp.raise_for_status()
             page = resp.json()
             if not page:
@@ -1680,12 +1843,14 @@ class WebClient:
         Returns:
             Dict with "tag" and "status".
         """
-        # Get current library version for the If-Unmodified-Since-Version header
-        resp = self._web_client.get("/items", params={"limit": 0})
-        version = resp.headers.get("Last-Modified-Version", "0")
+        version = self._library_version()
 
+        # Zotero deletes tags via DELETE /tags?tag=<url-encoded name> (query
+        # param). The /tags/<name> path form is not a valid endpoint and returns
+        # 405 Method Not Allowed. httpx percent-encodes the param value.
         resp = self._web_client.delete(
-            f"/tags/{quote(tag, safe='')}",
+            "/tags",
+            params={"tag": tag},
             headers={"If-Unmodified-Since-Version": str(version)},
         )
         resp.raise_for_status()
@@ -1711,9 +1876,7 @@ class WebClient:
         items: list[dict] = []
         start = 0
         while True:
-            resp = self._web_client.get(
-                "/items", params={"tag": old_tag, "limit": 100, "start": start}
-            )
+            resp = self._read_get("/items", params={"tag": old_tag, "limit": 100, "start": start})
             resp.raise_for_status()
             page = resp.json()
             if not page:
@@ -1822,6 +1985,11 @@ class WebClient:
                 ),
             }
 
+        from zotero_mcp.config import get_config
+
+        if get_config().uses_linked_attachments:
+            return self._attach_linked_file(parent_key, pdf_bytes, filename, source)
+
         # Step 1: Create attachment item
         attachment_data = [
             {
@@ -1904,7 +2072,7 @@ class WebClient:
         except Exception:
             # Clean up orphaned attachment item so it doesn't pollute the library
             try:
-                ver_resp = self._web_client.get("/items", params={"limit": 0})
+                ver_resp = self._read_get("/items", params={"limit": 0})
                 version = ver_resp.headers.get("Last-Modified-Version", "0")
                 self._web_client.delete(
                     "/items",
@@ -1928,6 +2096,103 @@ class WebClient:
             "filename": filename,
             "source": source,
             "size_bytes": file_size,
+        }
+
+    @staticmethod
+    def _resolve_link_destination(base: Path, filename: str, pdf_bytes: bytes) -> tuple[Path, bool]:
+        """Pick a stable on-disk path for a linked-file PDF.
+
+        Returns ``(destination, already_present)``. If a file with the same
+        name already holds byte-identical content, it is reused rather than
+        rewritten, so re-attaching the same PDF is idempotent. If the name is
+        taken by *different* content, a numeric suffix is added instead of
+        silently overwriting someone else's file.
+        """
+        safe_name = Path(filename).name or "attachment.pdf"
+        candidate = base / safe_name
+        if not candidate.exists():
+            return candidate, False
+        try:
+            if candidate.read_bytes() == pdf_bytes:
+                return candidate, True
+        except OSError:
+            pass
+
+        stem, suffix = candidate.stem, candidate.suffix
+        for counter in range(1, 1000):
+            alt = base / f"{stem}-{counter}{suffix}"
+            if not alt.exists():
+                return alt, False
+            try:
+                if alt.read_bytes() == pdf_bytes:
+                    return alt, True
+            except OSError:
+                continue
+        # Pathological: 1000 same-named distinct PDFs. Fall back to a digest.
+        digest = hashlib.sha256(pdf_bytes).hexdigest()[:12]
+        return base / f"{stem}-{digest}{suffix}", False
+
+    def _attach_linked_file(
+        self,
+        parent_key: str,
+        pdf_bytes: bytes,
+        filename: str,
+        source: str,
+    ) -> dict:
+        """Write the PDF to local disk and create a linked_file attachment.
+
+        This is the default path. Nothing is uploaded, so the Zotero cloud
+        storage quota is never touched and HTTP 413 cannot occur. The
+        tradeoff is that linked files do not sync to other devices — the
+        item metadata syncs, the bytes stay on this machine.
+        """
+        from zotero_mcp.config import get_config
+
+        base = Path(get_config().effective_linked_attachment_dir).expanduser()
+        base.mkdir(parents=True, exist_ok=True)
+
+        dest, already_present = self._resolve_link_destination(base, filename, pdf_bytes)
+        wrote_file = False
+        if not already_present:
+            dest.write_bytes(pdf_bytes)
+            wrote_file = True
+
+        attachment_data = [
+            {
+                "itemType": "attachment",
+                "parentItem": parent_key,
+                "linkMode": "linked_file",
+                "title": dest.name,
+                "contentType": "application/pdf",
+                "path": str(dest),
+            }
+        ]
+        try:
+            resp = self._web_client.post("/items", json=attachment_data)
+            resp.raise_for_status()
+            attach_key = self._extract_created_key(resp.json())
+        except Exception:
+            # Only remove what this call created; never delete a pre-existing file.
+            if wrote_file:
+                try:
+                    dest.unlink(missing_ok=True)
+                except OSError as cleanup_exc:
+                    logger.warning(
+                        "Failed to remove %s after item-create failure: %s", dest, cleanup_exc
+                    )
+            raise
+
+        logger.info("Linked PDF %s to item %s (%s)", dest, parent_key, source)
+        return {
+            "status": "attached",
+            "attachment_key": attach_key,
+            "parent_key": parent_key,
+            "filename": dest.name,
+            "source": source,
+            "size_bytes": len(pdf_bytes),
+            "link_mode": "linked_file",
+            "path": str(dest),
+            "storage": "local",
         }
 
     def _download_free_pdf(self, doi: str) -> tuple[bytes | None, str, str]:
@@ -1988,7 +2253,7 @@ class WebClient:
         # 2. Try PubMed Central
         if not _is_preprint_doi(doi):  # Skip bioRxiv/medRxiv DOIs for PMC
             try:
-                id_resp = self._pubmed_client.get(
+                id_resp = self._pubmed_get(
                     "/esearch.fcgi",
                     params={"db": "pmc", "term": f"{doi}[doi]", "retmode": "json"},
                 )

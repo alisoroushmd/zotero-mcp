@@ -37,9 +37,10 @@ logger = logging.getLogger(__name__)
 mcp = FastMCP(
     "zotero",
     instructions=(
-        "Zotero MCP server. All tools work with just API credentials "
-        "(ZOTERO_API_KEY + ZOTERO_USER_ID). If Zotero desktop is also "
-        "running, reads are faster via the local API. "
+        "Zotero MCP server. Most tools work with just API credentials "
+        "(ZOTERO_API_KEY + ZOTERO_USER_ID). The knowledge-graph, citation-graph, "
+        "and retraction tools additionally need OPENALEX_API_KEY (free). If "
+        "Zotero desktop is also running, reads are faster via the local API. "
         "Call server_status to check available modes. "
         "Use the prompts (literature_audit, build_and_explore, add_and_verify, "
         "extract_entities) for guided multi-step workflows."
@@ -95,7 +96,13 @@ _MAX_PDF_TEXT_CHARS = 50_000  # cap inline extracted PDF text in responses (ZOT-
 _web: WebClient | None = None
 _openalex = None  # OpenAlexClient singleton — typed as Any to avoid eager import
 _openalex_lock = threading.Lock()
+_s2 = None  # SemanticScholarClient singleton — was created per call, leaking a pooled httpx.Client each time (ZOT-38)
+_s2_lock = threading.Lock()
 _init_lock = threading.Lock()
+# Cap fan-out batch tools (check_retractions / check_published_versions): each key
+# costs a Zotero read + CrossRef + OpenAlex round-trips, so an unbounded batch can
+# run for minutes and hammer external APIs (ZOT-42).
+_MAX_BATCH_KEYS = 50
 
 # Temp file tracking for cleanup at exit.
 _temp_files: list[str] = []
@@ -119,7 +126,23 @@ def _cleanup_temp_files() -> None:
         _temp_files.clear()
 
 
+def _cleanup_clients() -> None:
+    """Close pooled HTTP clients at process exit (ZOT-23).
+
+    The WebClient/LocalClient/OpenAlex singletons hold persistent httpx.Client
+    pools. Closing them on shutdown releases sockets cleanly and silences
+    ResourceWarning, which matters for a distributable package and for tests.
+    """
+    for obj in (_web, _local, _openalex, _s2):
+        if obj is not None and hasattr(obj, "close"):
+            try:
+                obj.close()
+            except Exception:  # pragma: no cover — best-effort cleanup
+                pass
+
+
 atexit.register(_cleanup_temp_files)
+atexit.register(_cleanup_clients)
 
 _ZOTERO_KEY_RE = re.compile(r"^[A-Za-z0-9]+$")
 
@@ -180,6 +203,21 @@ def _validate_key(value: str, name: str = "key") -> None:
 def _clamp_limit(value: str | int, lo: int = 1, hi: int = 100) -> int:
     """Clamp a limit parameter to a safe range."""
     return max(lo, min(hi, int(value)))
+
+
+def _cap_list(result, limit: int):
+    """Cap a list result, wrapping in a {items, count, truncated} envelope (ZOT-30).
+
+    Knowledge-graph analytics (clusters, timeline, topic_evolution) can return
+    one row per node on a large library. Capping at the tool layer keeps a
+    single query from overflowing the caller's context window. Non-list results
+    pass through unchanged.
+    """
+    if not isinstance(result, list):
+        return result
+    if len(result) <= limit:
+        return result
+    return {"items": result[:limit], "count": limit, "total": len(result), "truncated": True}
 
 
 def _md_scalar(v) -> str:
@@ -332,6 +370,47 @@ def _get_openalex():
     return _openalex
 
 
+def _get_s2():
+    """Lazy-initialize the SemanticScholarClient singleton (thread-safe, ZOT-38).
+
+    Mirrors ``_get_openalex()``: one pooled ``httpx.Client`` shared across calls
+    and closed via ``_cleanup_clients`` at exit, instead of a fresh unclosed
+    client per ``find_related_papers`` call.
+    """
+    global _s2
+    if _s2 is not None:
+        return _s2
+    with _s2_lock:
+        if _s2 is None:
+            from zotero_mcp.semantic_scholar_client import SemanticScholarClient
+
+            _s2 = SemanticScholarClient(api_key=get_config().semantic_scholar_api_key)
+    return _s2
+
+
+def _truncate_batch_keys(keys: list) -> tuple[list, dict]:
+    """Cap a batch tool's key list at ``_MAX_BATCH_KEYS`` (ZOT-42).
+
+    Returns the (possibly truncated) key list plus extra payload fields
+    describing the truncation, for the caller to merge into its JSON result.
+    An oversized batch is truncated (first N processed) rather than rejected
+    so partial progress is never thrown away.
+    """
+    submitted = len(keys)
+    if submitted <= _MAX_BATCH_KEYS:
+        return keys, {}
+    return keys[:_MAX_BATCH_KEYS], {
+        "truncated": True,
+        "submitted": submitted,
+        "processed": _MAX_BATCH_KEYS,
+        "note": (
+            f"item_keys is capped at {_MAX_BATCH_KEYS} per call; the remaining "
+            f"{submitted - _MAX_BATCH_KEYS} key(s) were not checked. "
+            "Resubmit them in a follow-up call."
+        ),
+    }
+
+
 def _parse_list_param(value: str | list | None) -> list | None:
     """Parse a parameter that may be a JSON string, list, or None."""
     if value is None:
@@ -343,6 +422,28 @@ def _parse_list_param(value: str | list | None) -> list | None:
         return parsed if isinstance(parsed, list) else [value]
     except (json.JSONDecodeError, TypeError):
         return [value]  # Treat bare string as single-item list
+
+
+def _parse_dict_param(value: str | dict | None, name: str = "fields") -> dict:
+    """Parse a parameter that may arrive as a JSON string instead of a dict.
+
+    The dict analogue of ``_parse_list_param`` (ZOT-31): some MCP clients send
+    object-typed arguments as a JSON-encoded string. Without this, ``fields``
+    arriving as a string would raise ``AttributeError`` on ``.keys()``.
+    """
+    if value is None:
+        return {}
+    if isinstance(value, dict):
+        return value
+    if isinstance(value, str):
+        try:
+            parsed = json.loads(value)
+        except (json.JSONDecodeError, TypeError) as exc:
+            raise ValueError(f"{name} must be a JSON object, got invalid JSON: {value!r}") from exc
+        if not isinstance(parsed, dict):
+            raise ValueError(f"{name} must be a JSON object, got {type(parsed).__name__}")
+        return parsed
+    raise ValueError(f"{name} must be a dict or JSON object string, got {type(value).__name__}")
 
 
 def _error_response(code: str, message: str, **extra) -> dict:
@@ -360,11 +461,21 @@ def _error_response(code: str, message: str, **extra) -> dict:
 
 
 def _handle_tool_errors(fn):
-    """Decorator that converts common exceptions to structured JSON error responses.
+    """Decorator that converts exceptions to structured JSON error responses.
 
-    Catches ValueError (bad input), RuntimeError (unavailable/config), and
-    httpx.HTTPStatusError (API errors), and returns a JSON-encoded error dict
-    instead of raising so the LLM receives a readable error message.
+    No tool wrapped by this decorator should ever raise to the MCP layer, where
+    the error would surface to the user as an opaque protocol failure. The catch
+    order is most-specific first:
+
+    - ``ValueError`` (incl. ``json.JSONDecodeError``) -> ``invalid_input``
+    - ``httpx.HTTPStatusError`` -> ``api_error`` (status code + truncated body so
+      the caller can act on Zotero's explanation, e.g. "item version mismatch")
+    - ``httpx.TimeoutException`` -> ``timeout``
+    - any other ``httpx.HTTPError`` (connect/read/DNS/protocol) -> ``network_error``
+    - ``RuntimeError`` -> ``unavailable`` (config / mode-unavailable)
+    - ``KeyError``/``IndexError``/``TypeError``/``AttributeError`` ->
+      ``internal_error`` (an unexpected API response shape, not the user's fault)
+    - any remaining ``Exception`` -> ``internal_error`` catch-all
     """
 
     @functools.wraps(fn)
@@ -374,10 +485,17 @@ def _handle_tool_errors(fn):
         except ValueError as exc:
             return json.dumps(_error_response("invalid_input", str(exc)))
         except httpx.HTTPStatusError as exc:
+            # Include a truncated response body — Zotero 4xx/409/412 responses
+            # often carry the actual reason (invalid field, version mismatch).
+            try:
+                body = exc.response.text[:200]
+            except Exception:  # pragma: no cover — body unreadable
+                body = ""
             return json.dumps(
                 _error_response(
                     "api_error",
-                    f"Zotero API returned {exc.response.status_code}",
+                    f"Zotero API returned {exc.response.status_code}"
+                    + (f": {body}" if body else ""),
                     status_code=exc.response.status_code,
                 )
             )
@@ -388,8 +506,34 @@ def _handle_tool_errors(fn):
                     "Zotero API timed out. Try again or reduce the operation size.",
                 )
             )
+        except httpx.HTTPError as exc:
+            # Connect errors, read errors, DNS failures, protocol errors — every
+            # transport-layer failure that is not a status or timeout error.
+            return json.dumps(
+                _error_response(
+                    "network_error",
+                    f"Network error contacting an external service "
+                    f"({exc.__class__.__name__}). Check your connection and retry.",
+                )
+            )
         except RuntimeError as exc:
             return json.dumps(_error_response("unavailable", str(exc)))
+        except (KeyError, IndexError, TypeError, AttributeError) as exc:
+            logger.exception("Unexpected data-shape error in %s", fn.__name__)
+            return json.dumps(
+                _error_response(
+                    "internal_error",
+                    f"Unexpected response shape ({exc.__class__.__name__}: {exc}).",
+                )
+            )
+        except Exception as exc:  # noqa: BLE001 — final safety net; never raise to MCP
+            logger.exception("Unhandled error in %s", fn.__name__)
+            return json.dumps(
+                _error_response(
+                    "internal_error",
+                    f"Unexpected error ({exc.__class__.__name__}: {exc}).",
+                )
+            )
 
     return _wrapper
 
@@ -416,11 +560,25 @@ def server_status() -> str:
 
 
 def _read_local_or_web(local_method: str, *args, **kwargs):
-    """Try local API first (faster), fall back to web API for reads."""
+    """Try local API first (faster), fall back to web API for reads.
+
+    The local Zotero desktop API is an optional fast path; the Web API is the
+    primary source of truth. Any local failure must fall through to the web —
+    not only "desktop not running" (``RuntimeError``) but also a transiently
+    unhealthy desktop (mid-sync 500, locked DB, read timeout), which surfaces as
+    an ``httpx.HTTPError``. Catching only ``RuntimeError`` here (the original
+    bug, ZOT-15) defeated the cloud-primary design whenever desktop was up but
+    momentarily failing.
+    """
     try:
         local = _get_local()
         return getattr(local, local_method)(*args, **kwargs)
-    except RuntimeError:
+    except (RuntimeError, httpx.HTTPError) as local_exc:
+        logger.debug(
+            "Local API read (%s) failed (%s); falling back to Web API",
+            local_method,
+            local_exc.__class__.__name__,
+        )
         try:
             return getattr(_get_web(), local_method)(*args, **kwargs)
         except httpx.TimeoutException as exc:
@@ -513,18 +671,24 @@ def get_collections(response_format: Literal["json", "markdown"] = "json") -> st
 )
 @_handle_tool_errors
 def get_notes(parent_key: str) -> str:
-    """Get all notes attached to a parent item."""
+    """Get all notes attached to a parent item.
+
+    Returns ``{items, count}`` for shape consistency with the other
+    list-returning read tools (ZOT-31).
+    """
     _validate_key(parent_key, "parent_key")
     results = _read_local_or_web("get_notes", parent_key.strip())
-    return json.dumps(results, ensure_ascii=False)
+    return json.dumps({"items": results, "count": len(results)}, ensure_ascii=False)
 
 
 @mcp.tool(
     description=(
         "List file attachments (PDFs, etc.) on a Zotero item with availability status. "
-        "Use this to check whether a paper has a PDF before trying to read it. "
-        "Returns availability: stored_remote_available, stored_local_available, "
-        "linked_local_available, or metadata_only."
+        "Use this to check whether a paper HAS a PDF before fetching it; to actually "
+        "read the content, use get_pdf_content. "
+        "Returns {items, count} where each item's availability is one of: "
+        "stored_remote_available, stored_local_available, linked_local_available, "
+        "or metadata_only."
     ),
     annotations=_RR,
 )
@@ -552,16 +716,20 @@ def get_item_attachments(parent_key: str) -> str:
                 "availability": link_mode_map.get(link_mode, "metadata_only"),
             }
         )
-    return json.dumps(results, ensure_ascii=False)
+    return json.dumps({"items": results, "count": len(results)}, ensure_ascii=False)
 
 
 @mcp.tool(
     description=(
         "Get the full text of a paper in the library. Routes to the best available source: "
         "PubMed Central, local PDF, web PDF download, or free open-access PDF. "
-        "Use this when the user wants to read a paper's content. "
+        "Use this when the user wants to read a paper's content; to only CHECK whether a "
+        "PDF exists without fetching it, use get_item_attachments first. "
         "Set extract_text=true to extract and return the text inline; "
-        "otherwise returns a file path or PMCID for the caller to read."
+        "otherwise returns a file path or PMCID for the caller to read. "
+        "The response always includes a content_source field (one of: pmc, local_pdf, "
+        "web_pdf, free_pdf_<source>, extracted_text, not_found) that determines which "
+        "other fields are present."
     ),
     annotations=_RR,
 )
@@ -598,7 +766,18 @@ def get_pdf_content(item_key: str, extract_text: bool = False) -> str:
         """If extract_text is requested, extract text from PDF source and add to result."""
         if not extract_text:
             return result_dict
-        from zotero_mcp.text_extractor import extract_text_from_pdf
+        from zotero_mcp.text_extractor import extract_text_from_pdf, pypdf_available
+
+        # Without the [fulltext] extra, keep the path-based result usable (the
+        # caller can read the PDF natively) instead of raising (ZOT-30 review).
+        if not pypdf_available():
+            result_dict["text_extraction"] = "unavailable"
+            result_dict["text_extraction_note"] = (
+                "Inline text extraction requires the [fulltext] extra "
+                "(pip install 'zotero-mcp-plus[fulltext]'). The PDF path/PMCID "
+                "above is still usable for native reading."
+            )
+            return result_dict
 
         text = extract_text_from_pdf(source)
         if text:
@@ -783,6 +962,7 @@ def check_retractions(item_keys: str | list[str]) -> str:
         raise ValueError("item_keys must not be empty")
     for k in keys:
         _validate_key(k, "item_key")
+    keys, truncation = _truncate_batch_keys(keys)  # ZOT-42
 
     web = _get_web()
     openalex = _get_openalex()
@@ -848,6 +1028,7 @@ def check_retractions(item_keys: str | list[str]) -> str:
             "checked": len(results),
             "retracted_count": retracted_count,
             "corrected_count": corrected_count,
+            **truncation,
         },
         ensure_ascii=False,
     )
@@ -929,8 +1110,11 @@ def get_citation_graph(
         result["cited_by_count"] = len(cited_by)
 
     if direction in ("references", "both"):
-        references = openalex.get_references(doi)
+        # Cap references to limit_int (ZOT-19): an unbounded list both bloats
+        # the response and fans out one Zotero duplicate-check call per ref.
+        references = openalex.get_references(doi, limit=limit_int)
         result["references"] = _add_library_flags(references)
+        result["references_count"] = len(references)
 
     return json.dumps(result, ensure_ascii=False)
 
@@ -970,7 +1154,10 @@ def get_collection_items(
         "Add a paper to Zotero from any identifier: DOI, PMID, or URL (PubMed, "
         "bioRxiv, arXiv, publisher pages). Resolves metadata automatically and "
         "checks for duplicates. Use this when the user wants to save a paper to "
-        "their library. Optional title is only used for bare URLs that can't be scraped."
+        "their library. Optional title is only used for bare URLs that can't be scraped. "
+        "If you only have structured fields (title/authors/etc.) and no DOI/PMID/URL "
+        "to resolve, use create_item_manual instead. The result includes "
+        "dedup_check_failed=true if the duplicate check could not be completed."
     ),
 )
 @_handle_tool_errors
@@ -1226,9 +1413,12 @@ _ALLOWED_UPDATE_FIELDS = {
     ),
 )
 @_handle_tool_errors
-def update_item(item_key: str, fields: dict) -> str:
+def update_item(item_key: str, fields: dict | str) -> str:
     """Update item fields. Uses optimistic locking with version check."""
     _validate_key(item_key, "item_key")
+    fields = _parse_dict_param(fields, "fields")  # tolerate JSON-string input (ZOT-31)
+    if not fields:
+        raise ValueError("fields must not be empty")
     disallowed = set(fields.keys()) - _ALLOWED_UPDATE_FIELDS
     if disallowed:
         raise ValueError(
@@ -1262,7 +1452,9 @@ def trash_items(item_keys: str | list[str]) -> str:
 @mcp.tool(
     description=(
         "Permanently delete ALL items in the Zotero trash. THIS IS IRREVERSIBLE. "
-        "Always confirm with the user before calling this tool."
+        "This is a GLOBAL operation — it destroys everything in the trash, not just "
+        "items you recently trashed. Call inspect_trash first to see what is in there, "
+        "and always confirm with the user before calling this tool."
     ),
     annotations=_DR,
 )
@@ -1274,13 +1466,194 @@ def empty_trash() -> str:
 
 
 @mcp.tool(
-    annotations=_WR,
+    description=(
+        "List everything currently in the Zotero trash, with item type and title. "
+        "Use this BEFORE empty_trash so the user can see exactly what would be "
+        "permanently destroyed — empty_trash is global and irreversible."
+    ),
+    annotations=_RR,
+)
+@_handle_tool_errors
+def inspect_trash() -> str:
+    """List trash contents so the user can review before an irreversible purge."""
+    from zotero_mcp.attachment_migration import list_trash
+
+    items = list_trash(_get_web())
+    return json.dumps({"items": items, "count": len(items)}, ensure_ascii=False)
+
+
+def _parse_migration_modes(modes: str) -> tuple[str, ...]:
+    """Parse and validate the comma-separated link-mode selector."""
+    from zotero_mcp.attachment_migration import MIGRATABLE_MODES
+
+    selected = tuple(m.strip() for m in (modes or "").split(",") if m.strip())
+    if not selected:
+        raise ValueError(f"modes must name at least one of: {', '.join(MIGRATABLE_MODES)}")
+    unknown = [m for m in selected if m not in MIGRATABLE_MODES]
+    if unknown:
+        raise ValueError(
+            f"Unknown link mode(s): {', '.join(unknown)}. "
+            f"Valid modes: {', '.join(MIGRATABLE_MODES)}"
+        )
+    return selected
+
+
+def _plan_to_dict(plan, include_moves: bool = True) -> dict:
+    """Render a MigrationPlan as a JSON-safe dict."""
+    skip_reasons: dict[str, int] = {}
+    for s in plan.skipped:
+        skip_reasons[s.reason] = skip_reasons.get(s.reason, 0) + 1
+    payload = {
+        "dest_dir": plan.dest_dir,
+        "modes": list(plan.modes),
+        "library_attachments": plan.total_attachments,
+        "to_migrate": len(plan.moves),
+        "copy_from_disk": plan.copy_count,
+        "download_from_cloud": plan.download_count,
+        "frees_quota": plan.quota_freeing_count,
+        "known_bytes": plan.known_bytes,
+        "skipped": len(plan.skipped),
+        "skip_reasons": skip_reasons,
+    }
+    if include_moves:
+        payload["moves"] = [
+            {
+                "key": m.record.key,
+                "parent_key": m.record.parent_key,
+                "link_mode": m.record.link_mode,
+                "filename": m.record.filename,
+                "action": m.action,
+                "dest_path": m.dest_path,
+                "size_bytes": m.record.local_size,
+            }
+            for m in plan.moves
+        ]
+    return payload
+
+
+@mcp.tool(
+    description=(
+        "Plan a migration of Zotero imported (cloud-stored) attachments to linked files, "
+        "which keeps every PDF on local disk but frees Zotero cloud storage quota. "
+        "READ-ONLY: inventories the library, reports which attachments would be converted, "
+        "which must be downloaded from the cloud first, and which are skipped and why. "
+        "Nothing is written, downloaded, or trashed. Run this before migrate_attachments."
+    ),
+    annotations=_RR,
+)
+@_handle_tool_errors
+def plan_attachment_migration(
+    modes: str = "imported_file",
+    dest_dir: str = "",
+    include_local_only: bool = False,
+    limit: int = 0,
+    response_format: Literal["json", "markdown"] = "markdown",
+) -> str:
+    """Dry-run inventory and plan for the imported -> linked attachment migration.
+
+    Args:
+        modes: Comma-separated link modes to convert. The safe default is
+            "imported_file". "imported_url" requires explicit opt-in and is
+            skipped unless its local snapshot is validated as one file.
+        dest_dir: Where linked files would be written. Defaults to the
+            configured linked-attachment directory.
+        include_local_only: Also plan attachments Zotero holds no cloud file
+            for. Those free no quota, so they are excluded by default.
+        limit: Cap the number of planned moves (0 = no cap).
+        response_format: "markdown" renders the human report; "json" returns
+            structured counts plus the move list.
+    """
+    from zotero_mcp.attachment_migration import build_plan, inventory, render_plan
+
+    selected = _parse_migration_modes(modes)
+    plan = build_plan(
+        inventory(_get_web()),
+        dest_dir=_validate_path(dest_dir) if dest_dir else None,
+        modes=selected,
+        quota_only=not include_local_only,
+        limit=limit or None,
+    )
+    if response_format == "markdown":
+        return render_plan(plan)
+    return json.dumps(_plan_to_dict(plan), ensure_ascii=False)
+
+
+@mcp.tool(
+    description=(
+        "Convert Zotero imported (cloud-stored) attachments into linked files: copy or "
+        "download each file to local disk, hash-verify it, create a linked_file "
+        "attachment, then move the original to the trash. Frees cloud storage quota "
+        "while keeping every file locally. DEFAULTS TO A DRY RUN — pass apply=true to "
+        "make changes, and only after showing the user plan_attachment_migration output. "
+        "Never empties the trash; use inspect_trash then empty_trash for that, so the "
+        "user can review what would be permanently destroyed."
+    ),
+    annotations=_DR,
+)
+@_handle_tool_errors
+def migrate_attachments(
+    apply: bool = False,
+    modes: str = "imported_file",
+    dest_dir: str = "",
+    include_local_only: bool = False,
+    limit: int = 0,
+    trash_originals: bool = True,
+) -> str:
+    """Run the imported -> linked_file attachment migration.
+
+    Args:
+        apply: Must be True to change anything. False (default) reports the plan.
+        modes: Comma-separated link modes to convert. imported_url requires
+            explicit opt-in and local single-file validation.
+        dest_dir: Destination for linked files. Defaults to the configured
+            linked-attachment directory.
+        include_local_only: Also convert attachments that hold no cloud storage.
+        limit: Cap the number of attachments migrated (0 = no cap).
+        trash_originals: Move each successfully replaced original to the trash.
+            Originals whose replacement failed are always left alone.
+    """
+    from zotero_mcp.attachment_migration import run_migration
+
+    selected = _parse_migration_modes(modes)
+    plan, result, _ = run_migration(
+        _get_web(),
+        dry_run=not apply,
+        modes=selected,
+        dest_dir=_validate_path(dest_dir) if dest_dir else None,
+        quota_only=not include_local_only,
+        limit=limit or None,
+        trash=trash_originals,
+        empty_trash=False,
+    )
+    payload = {
+        **result.summary(),
+        "plan": _plan_to_dict(plan, include_moves=False),
+        "failures": [
+            {"key": o.key, "filename": o.filename, "error": o.error} for o in result.failed
+        ][:25],
+        "trashed_keys": result.trashed,
+    }
+    if apply and result.trashed:
+        payload["next_step"] = (
+            "Quota is not reclaimed until the trash is emptied. Call inspect_trash, "
+            "show the user what is in there, then call empty_trash only if they confirm."
+        )
+    return json.dumps(payload, ensure_ascii=False)
+
+
+@mcp.tool(
+    # _DR not _WR (ZOT-37): 'remove' deletes a tag from every item in the library
+    # and 'rename' rewrites it library-wide — destructive like update_item, so
+    # clients should gate confirmation the same way.
+    annotations=_DR,
     description=(
         "Manage tags in your Zotero library. Use this when the user asks about tags, "
         "wants to list/filter tags, remove a tag from all items, or rename a tag. "
         "Actions: 'list' (browse tags, optional prefix filter), "
-        "'remove' (delete a tag from every item — requires tag), "
-        "'rename' (change a tag name library-wide — requires tag and new_tag)."
+        "'remove' (DESTRUCTIVE: deletes the tag from every item in the library, "
+        "not reversible — requires tag), "
+        "'rename' (rewrites the tag on every item library-wide — requires tag and "
+        "new_tag). Confirm with the user before 'remove' or 'rename'."
     ),
 )
 @_handle_tool_errors
@@ -1342,6 +1715,7 @@ def check_published_versions(item_keys: str | list[str]) -> str:
         raise ValueError("item_keys must not be empty")
     for k in keys:
         _validate_key(k, "item_key")
+    keys, truncation = _truncate_batch_keys(keys)  # ZOT-42
 
     web = _get_web()
     openalex = _get_openalex()
@@ -1406,6 +1780,7 @@ def check_published_versions(item_keys: str | list[str]) -> str:
             "results": results,
             "checked": len(results),
             "published_count": published_count,
+            **truncation,
         },
         ensure_ascii=False,
     )
@@ -1482,7 +1857,8 @@ def _fetch_item_metadata(item_keys: list[str]) -> tuple[dict[str, dict], list[st
     description=(
         "Insert live Zotero citation field codes into an existing Word document. "
         "Finds [@ITEM_KEY] markers in the .docx and replaces them with Zotero "
-        "field codes. Use this to add citations to a document the user already has. "
+        "field codes. Use this to add citations to a document the user already has; "
+        "to create a NEW .docx from markdown instead, use write_cited_document. "
         "Preserves existing formatting, styles, images, and layout."
     ),
 )
@@ -1631,7 +2007,7 @@ def _get_or_build_kg() -> KnowledgeGraph:
         with GraphStore() as store:
             if store.get_last_sync() is None:
                 raise RuntimeError(
-                    "Knowledge graph not yet built. Run build_knowledge_graph first."
+                    "Knowledge graph not yet built. Run build_index(type='graph') first."
                 )
             kg = KnowledgeGraph()
             kg.build_from_store(store)
@@ -1649,6 +2025,26 @@ def _invalidate_kg_cache() -> None:
 def _extract_openalex_id(url: str) -> str:
     """Extract OpenAlex ID from URL like 'https://openalex.org/W123'."""
     return url.split("/")[-1] if "/" in url else url
+
+
+def _norm_doi(doi: str) -> str:
+    """Canonicalize a DOI for use as a graph key (ZOT-22).
+
+    Strips any ``https://doi.org/`` prefix and lowercases. DOIs are
+    case-insensitive, but Zotero stores them verbatim (often with uppercase,
+    e.g. ``10.1016/J.GIE...``) while OpenAlex normalizes to lowercase. Without
+    a single normalization chokepoint, ``key_by_doi`` lookups miss for
+    uppercase DOIs, so those papers were stored with an empty ``zotero_key`` —
+    breaking every "is this in my library" back-link. Normalizing both sides
+    here also prevents duplicate paper rows for the same DOI in different cases
+    (the ``papers.doi`` PRIMARY KEY is case-sensitive).
+    """
+    doi = (doi or "").strip()
+    for prefix in ("https://doi.org/", "http://doi.org/"):
+        if doi.lower().startswith(prefix):
+            doi = doi[len(prefix) :]
+            break
+    return doi.lower()
 
 
 def _index_works(works, key_by_doi, store, openalex):
@@ -1669,63 +2065,77 @@ def _index_works(works, key_by_doi, store, openalex):
     all_ref_ids: set[str] = set()
     work_refs: dict[str, list[str]] = {}
 
-    for work in works:
-        doi = (work.get("doi") or "").replace("https://doi.org/", "")
-        if not doi:
-            continue
-        authorships = work.get("authorships", [])
-        authors = "; ".join(a.get("author", {}).get("display_name", "") for a in authorships[:3])
-        pub_date = (work.get("publication_date") or "")[:7]  # YYYY-MM
-        abstract = OpenAlexClient.reconstruct_abstract(work)
-        store.upsert_paper(
-            doi=doi,
-            zotero_key=key_by_doi.get(doi, ""),
-            title=work.get("title", ""),
-            year=work.get("publication_year", 0),
-            authors=authors,
-            openalex_id=work.get("id", ""),
-            publication_date=pub_date,
-            abstract=abstract,
-        )
-        papers_added += 1
-
-        for topic in OpenAlexClient.extract_topics(work):
-            store.upsert_topic(doi=doi, **topic)
-            topics_indexed += 1
-
-        for auth in OpenAlexClient.extract_authorships(work):
-            store.upsert_author(
-                openalex_author_id=auth["openalex_author_id"],
-                display_name=auth["display_name"],
-                orcid=auth.get("orcid", ""),
-                institution=auth.get("institution", ""),
+    # Batch the per-work upserts into a single transaction (ZOT-20): one commit
+    # instead of one fsync per paper/topic/author over the whole library. The
+    # network call (resolve_ids_to_dois) happens AFTER this block, outside any
+    # open transaction, so it never blocks readers.
+    with store.batch():
+        for work in works:
+            doi = _norm_doi(work.get("doi") or "")
+            if not doi:
+                continue
+            authorships = work.get("authorships", [])
+            authors = "; ".join(
+                a.get("author", {}).get("display_name", "") for a in authorships[:3]
             )
-            store.upsert_paper_author(
+            pub_date = (work.get("publication_date") or "")[:7]  # YYYY-MM
+            abstract = OpenAlexClient.reconstruct_abstract(work)
+            store.upsert_paper(
                 doi=doi,
-                openalex_author_id=auth["openalex_author_id"],
-                position=auth.get("position", 0),
+                zotero_key=key_by_doi.get(doi, ""),
+                title=work.get("title", ""),
+                year=work.get("publication_year", 0),
+                authors=authors,
+                openalex_id=work.get("id", ""),
+                publication_date=pub_date,
+                abstract=abstract,
             )
-            authors_indexed += 1
+            papers_added += 1
 
-        ref_ids = [_extract_openalex_id(url) for url in work.get("referenced_works", [])]
-        if ref_ids:
-            work_refs[doi] = ref_ids
-            all_ref_ids.update(ref_ids)
+            for topic in OpenAlexClient.extract_topics(work):
+                store.upsert_topic(doi=doi, **topic)
+                topics_indexed += 1
 
-    # Resolve OpenAlex IDs to DOIs
+            for auth in OpenAlexClient.extract_authorships(work):
+                store.upsert_author(
+                    openalex_author_id=auth["openalex_author_id"],
+                    display_name=auth["display_name"],
+                    orcid=auth.get("orcid", ""),
+                    institution=auth.get("institution", ""),
+                )
+                store.upsert_paper_author(
+                    doi=doi,
+                    openalex_author_id=auth["openalex_author_id"],
+                    position=auth.get("position", 0),
+                )
+                authors_indexed += 1
+
+            ref_ids = [_extract_openalex_id(url) for url in work.get("referenced_works", [])]
+            if ref_ids:
+                work_refs[doi] = ref_ids
+                all_ref_ids.update(ref_ids)
+
+    # Resolve OpenAlex IDs to DOIs (network call — outside any transaction)
     known_oa_ids = {_extract_openalex_id(w.get("id", "")) for w in works if w.get("id")}
     unknown_ids = list(all_ref_ids - known_oa_ids)
 
     id_to_doi: dict[str, str] = {}
     for w in works:
         oa_id = _extract_openalex_id(w.get("id", ""))
-        d = (w.get("doi") or "").replace("https://doi.org/", "")
+        d = _norm_doi(w.get("doi") or "")
         if oa_id and d:
             id_to_doi[oa_id] = d
 
+    # Resolve unknown reference IDs to DOIs via the network BEFORE opening the
+    # second transaction, so no write transaction is held across a network call.
+    resolved: dict[str, str] = {}
     if unknown_ids:
-        resolved = openalex.resolve_ids_to_dois(unknown_ids)
+        resolved = {oa: _norm_doi(d) for oa, d in openalex.resolve_ids_to_dois(unknown_ids).items()}
         id_to_doi.update(resolved)
+
+    citations_added = 0
+    # Second batch: resolved-reference paper stubs + citation edges (one commit).
+    with store.batch():
         for oa_id, ref_doi in resolved.items():
             store.upsert_paper(
                 doi=ref_doi,
@@ -1736,13 +2146,12 @@ def _index_works(works, key_by_doi, store, openalex):
                 openalex_id=f"https://openalex.org/{oa_id}",
             )
 
-    citations_added = 0
-    for citing_doi, ref_ids in work_refs.items():
-        for ref_id in ref_ids:
-            cited_doi = id_to_doi.get(ref_id)
-            if cited_doi:
-                store.upsert_citation(citing_doi=citing_doi, cited_doi=cited_doi)
-                citations_added += 1
+        for citing_doi, ref_ids in work_refs.items():
+            for ref_id in ref_ids:
+                cited_doi = id_to_doi.get(ref_id)
+                if cited_doi:
+                    store.upsert_citation(citing_doi=citing_doi, cited_doi=cited_doi)
+                    citations_added += 1
 
     return {
         "papers_indexed": papers_added,
@@ -1772,7 +2181,7 @@ def _build_knowledge_graph(full_rebuild: bool = False) -> dict:
 
         if is_incremental:
             existing_dois = store.get_doi_set()
-            items = [item for item in items if item["DOI"] not in existing_dois]
+            items = [item for item in items if _norm_doi(item["DOI"]) not in existing_dois]
             if not items:
                 kg = _get_or_build_kg()
                 stats = kg.get_stats()
@@ -1781,8 +2190,11 @@ def _build_knowledge_graph(full_rebuild: bool = False) -> dict:
                 stats["mode"] = "sync"
                 return stats
 
+        # bulk_get_works queries OpenAlex by DOI (it normalizes case server-side),
+        # but key_by_doi must be keyed by the normalized DOI so _index_works'
+        # lookup (also normalized) matches and the zotero_key is populated (ZOT-22).
         doi_list = [item["DOI"] for item in items]
-        key_by_doi = {item["DOI"]: item["key"] for item in items}
+        key_by_doi = {_norm_doi(item["DOI"]): item["key"] for item in items}
 
         works = openalex.bulk_get_works(doi_list)
         counts = _index_works(works, key_by_doi, store, openalex)
@@ -1812,7 +2224,16 @@ def _build_fulltext_index(full_rebuild: bool = False, limit: int = 0) -> dict:
     from concurrent.futures import ThreadPoolExecutor, as_completed
 
     from zotero_mcp.graph_store import GraphStore
-    from zotero_mcp.text_extractor import extract_text_from_pdf, index_paper_text
+    from zotero_mcp.text_extractor import (
+        PYPDF_INSTALL_HINT,
+        extract_text_from_pdf,
+        index_paper_text,
+        pypdf_available,
+    )
+
+    # Fail fast with one actionable message instead of N opaque per-PDF failures.
+    if not pypdf_available():
+        return {"error": "missing_dependency", "message": PYPDF_INSTALL_HINT}
 
     web = _get_web()
     store = GraphStore()
@@ -1825,7 +2246,7 @@ def _build_fulltext_index(full_rebuild: bool = False, limit: int = 0) -> dict:
         total = len(items)
 
         if not full_rebuild:
-            items = [it for it in items if it["DOI"] not in already_indexed]
+            items = [it for it in items if _norm_doi(it["DOI"]) not in already_indexed]
         skipped = total - len(items)
 
         if limit > 0:
@@ -1837,7 +2258,7 @@ def _build_fulltext_index(full_rebuild: bool = False, limit: int = 0) -> dict:
         def _extract_one(item: dict) -> dict:
             """Extract text for a single item. No sqlite writes (not thread-safe)."""
             item_key = item["key"]
-            item_doi = item["DOI"]
+            item_doi = _norm_doi(item["DOI"])  # match the papers table key (ZOT-22)
 
             try:
                 children = _read_local_or_web("get_children", item_key, item_type="attachment")
@@ -1957,7 +2378,7 @@ def build_index(
         "'trending' (papers with accelerating citation rates — optional limit, years window). "
         "Requires build_index(type='graph') to be run first."
     ),
-    annotations={"readOnlyHint": True},
+    annotations=_RL,
 )
 @_handle_tool_errors
 def query_knowledge_graph(
@@ -1987,40 +2408,53 @@ def query_knowledge_graph(
     """Query the knowledge graph (uses cached graph)."""
     kg = _get_or_build_kg()
 
+    # On a large library these can enumerate many rows; cap to `limit` so a
+    # single query can't blow the caller's context window (ZOT-30).
+    lim = _clamp_limit(limit, lo=1, hi=200)
+
     if query_type == "influential":
-        result = kg.get_influential_papers(top_n=limit)
+        result = kg.get_influential_papers(top_n=lim)
     elif query_type == "clusters":
-        result = kg.get_clusters()
+        result = _cap_list(kg.get_clusters(), lim)
     elif query_type == "bridges":
-        result = kg.get_bridge_papers(top_n=limit)
+        result = kg.get_bridge_papers(top_n=lim)
     elif query_type == "path":
         if not doi_a or not doi_b:
             raise ValueError("path query requires doi_a and doi_b")
-        result = kg.get_path(doi_a, doi_b)
+        # Graph nodes are normalized DOIs (ZOT-22); normalize lookups to match.
+        result = kg.get_path(_norm_doi(doi_a), _norm_doi(doi_b))
     elif query_type == "neighborhood":
         if not doi:
             raise ValueError("neighborhood query requires doi")
-        result = kg.get_neighborhood(doi, depth=depth)
+        result = kg.get_neighborhood(_norm_doi(doi), depth=depth)
     elif query_type == "stats":
         result = kg.get_stats()
     elif query_type == "timeline":
-        result = kg.get_timeline(
-            topic=topic or None,
-            start_year=start_year or None,
-            end_year=end_year or None,
+        result = _cap_list(
+            kg.get_timeline(
+                topic=topic or None,
+                start_year=start_year or None,
+                end_year=end_year or None,
+            ),
+            lim,
         )
     elif query_type == "topic_evolution":
-        result = kg.get_topic_evolution(
-            start_year=start_year or None,
-            end_year=end_year or None,
-            limit=limit,
+        result = _cap_list(
+            kg.get_topic_evolution(
+                start_year=start_year or None,
+                end_year=end_year or None,
+                limit=lim,
+            ),
+            lim,
         )
     elif query_type == "citation_velocity":
         if not doi:
             raise ValueError("citation_velocity query requires doi")
-        result = kg.get_citation_velocity(doi)
+        result = kg.get_citation_velocity(_norm_doi(doi))
     elif query_type == "trending":
-        result = kg.get_trending(top_n=limit, years=years)
+        # Use the clamped `lim` like every sibling branch (ZOT-41) — raw `limit`
+        # bypassed the context-window cap.
+        result = kg.get_trending(top_n=lim, years=years)
     else:
         raise ValueError(
             f"Unknown query_type: {query_type!r}. "
@@ -2047,8 +2481,6 @@ def find_related_papers(
     limit: str | int = 10,
 ) -> str:
     """Get paper recommendations from Semantic Scholar."""
-    from zotero_mcp.semantic_scholar_client import SemanticScholarClient
-
     keys = _parse_list_param(item_keys) or []
     if not keys:
         raise ValueError("item_keys must not be empty")
@@ -2073,7 +2505,9 @@ def find_related_papers(
             }
         )
 
-    s2 = SemanticScholarClient(api_key=get_config().semantic_scholar_api_key)
+    # Singleton client (ZOT-38); S2 failures now propagate to _handle_tool_errors
+    # as structured errors instead of being swallowed into an empty list.
+    s2 = _get_s2()
     recommendations = s2.get_recommendations(dois, limit=limit_int)
 
     # Flag which recommendations are already in library
@@ -2148,17 +2582,18 @@ def search_fulltext(query: str, limit: str | int = 20) -> str:
         "'clusters' (author community groupings). "
         "Requires build_index(type='graph') to be run first."
     ),
-    annotations={"readOnlyHint": True},
+    annotations=_RL,
 )
 @_handle_tool_errors
 def query_authors(
-    query_type: str,
+    query_type: Literal["prolific", "influential", "coauthors_of", "network", "clusters"],
     author_name: str = "",
     limit: int = 10,
     depth: int = 1,
 ) -> str:
     """Query the author co-citation network."""
     kg = _get_or_build_kg()
+    limit = _clamp_limit(limit, lo=1, hi=200)
 
     if query_type == "prolific":
         result = kg.get_prolific_authors(top_n=limit)
@@ -2175,7 +2610,7 @@ def query_authors(
         author_id = kg._resolve_author(author_name)
         result = kg.get_author_network(author_id, depth=depth)
     elif query_type == "clusters":
-        result = kg.get_author_clusters()
+        result = _cap_list(kg.get_author_clusters(), limit)
     else:
         raise ValueError(
             f"Unknown query_type: {query_type!r}. "
@@ -2199,7 +2634,7 @@ def query_authors(
 )
 @_handle_tool_errors
 def export_knowledge_graph(
-    view: str = "citations",
+    view: Literal["citations", "authors", "full"] = "citations",
     path: str = "",
 ) -> str:
     """Export knowledge graph as interactive HTML.
@@ -2323,7 +2758,9 @@ def store_entities(results: str | list) -> str:
 
     with GraphStore() as store:
         for item in results:
-            doi = item.get("doi", "").strip()
+            # Normalize so entity links join the papers table, whose doi key is
+            # normalized (ZOT-22); a raw uppercase DOI would orphan the link.
+            doi = _norm_doi(item.get("doi", ""))
             if not doi:
                 continue
             entities = item.get("entities", [])
@@ -2377,7 +2814,7 @@ def store_entities(results: str | list) -> str:
 )
 @_handle_tool_errors
 def search_entities(
-    query_type: str,
+    query_type: Literal["by_name", "by_type", "co_occurrence", "shared_entities", "paper_entities"],
     entity_name: str = "",
     entity_type: str = "",
     doi: str = "",
@@ -2457,7 +2894,8 @@ def search_entities(
         elif query_type == "shared_entities":
             if not doi_a or not doi_b:
                 raise ValueError("shared_entities query requires doi_a and doi_b")
-            shared = store.get_shared_entities(doi_a, doi_b)
+            # Entity links are keyed by normalized DOI (ZOT-22); normalize lookups.
+            shared = store.get_shared_entities(_norm_doi(doi_a), _norm_doi(doi_b))
             return json.dumps(
                 {"query": "shared_entities", "doi_a": doi_a, "doi_b": doi_b, "shared": shared},
                 ensure_ascii=False,
@@ -2466,7 +2904,7 @@ def search_entities(
         elif query_type == "paper_entities":
             if not doi:
                 raise ValueError("paper_entities query requires doi")
-            entities = store.get_entities_for_doi(doi)
+            entities = store.get_entities_for_doi(_norm_doi(doi))
             return json.dumps(
                 {"query": "paper_entities", "doi": doi, "entities": entities},
                 ensure_ascii=False,
