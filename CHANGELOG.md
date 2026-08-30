@@ -6,6 +6,8 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/).
 
 ## [Unreleased]
 
+## [0.10.0] - 2026-08-30
+
 ### Added
 
 - **Attachment migration: convert existing `imported_*` attachments to
@@ -60,6 +62,12 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/).
   the linked-attachment directory accordingly.
 
 ### Changed
+
+- **Full-text indexing now bounds memory and transaction growth.** PDF extraction keeps at most twice the worker count in flight and commits successful text in 100-record SQLite batches, preventing unbounded futures and per-record commits on large libraries. (`knowledge_graph.py`, `tests/test_knowledge_graph.py`)
+
+- **Entity persistence is batched into one transaction.** `store_entities` writes entities and paper links together, while creation status and identifier lookup no longer require a preliminary existence query. (`graph_store.py`, `tests/test_entities.py`, `tests/test_graph_store.py`)
+
+- **Knowledge-graph materialization now has an explicit resource ceiling.** NetworkX builds refuse persisted input above a configurable 100,000-record limit and rebuild author state from one paper-author snapshot without changing public MCP response shapes or positional `Config` compatibility. (`config.py`, `graph_store.py`, `knowledge_graph.py`, `server.py`, `README.md`, `tests/test_config.py`, `tests/test_graph_store.py`, `tests/test_knowledge_graph.py`, `tests/test_server.py`)
 
 - **`attach_pdf` now stores PDFs locally by default instead of uploading them
   to Zotero cloud storage.** The previous implementation created every
