@@ -6,6 +6,20 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/).
 
 ## [Unreleased]
 
+## [0.10.1] - 2026-08-30
+
+### Fixed
+
+- **MCP Bundle packaging no longer follows a broken development-only
+  symlink.** `GEMINI.md` now resolves to the tracked `AGENTS.md`, and MCPB
+  excludes agent instructions, tests, CI files, and development artifacts from
+  the `.mcpb` archive. The manifest and release tooling now use the current
+  MCPB names instead of their deprecated DXT equivalents. CI packages the
+  bundle before release, and PyPI
+  publication now waits for a successful MCPB bundle build so a partial release
+  cannot recur. GitHub Actions were also upgraded to Node.js 24-compatible
+  releases.
+
 ## [0.10.0] - 2026-08-30
 
 ### Added

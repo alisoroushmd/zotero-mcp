@@ -8,8 +8,8 @@ jobs:
   test:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-python@v5
+      - uses: actions/checkout@v7
+      - uses: actions/setup-python@v7
         with:
           python-version: "3.12"
       - run: pip install -e ".[dev,graph,fulltext]"
@@ -20,8 +20,8 @@ jobs:
   release-gate:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-python@v5
+      - uses: actions/checkout@v7
+      - uses: actions/setup-python@v7
         with:
           python-version: "3.12"
       - name: Assert tag == pyproject == manifest version
@@ -44,45 +44,45 @@ jobs:
           /tmp/clean/bin/python -c "from zotero_mcp.server import mcp; print('server imports OK')"
 
   publish-pypi:
-    needs: [test, release-gate]
+    needs: [test, release-gate, build-mcpb]
     runs-on: ubuntu-latest
     environment: pypi
     permissions:
       id-token: write
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-python@v5
+      - uses: actions/checkout@v7
+      - uses: actions/setup-python@v7
         with:
           python-version: "3.12"
       - run: pip install build
       - run: python -m build
       - uses: pypa/gh-action-pypi-publish@release/v1
 
-  build-dxt:
+  build-mcpb:
     needs: [test, release-gate]
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-node@v4
+      - uses: actions/checkout@v7
+      - uses: actions/setup-node@v7
         with:
-          node-version: "20"
-      - run: npm install -g @anthropic-ai/dxt
-      - run: dxt pack
-      - uses: actions/upload-artifact@v4
+          node-version: "24"
+      - run: npm install -g @anthropic-ai/mcpb@2.1.2
+      - run: mcpb pack
+      - uses: actions/upload-artifact@v7
         with:
-          name: dxt-package
-          path: "*.dxt"
+          name: mcpb-package
+          path: "*.mcpb"
 
   github-release:
-    needs: [publish-pypi, build-dxt]
+    needs: [publish-pypi, build-mcpb]
     runs-on: ubuntu-latest
     permissions:
       contents: write
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/download-artifact@v4
+      - uses: actions/checkout@v7
+      - uses: actions/download-artifact@v8
         with:
-          name: dxt-package
+          name: mcpb-package
       - name: Extract changelog entry
         id: changelog
         run: |
@@ -91,7 +91,7 @@ jobs:
           echo "notes<<EOF" >> "$GITHUB_OUTPUT"
           echo "$notes" >> "$GITHUB_OUTPUT"
           echo "EOF" >> "$GITHUB_OUTPUT"
-      - uses: softprops/action-gh-release@v2
+      - uses: softprops/action-gh-release@v3
         with:
           body: ${{ steps.changelog.outputs.notes }}
-          files: "*.dxt"
+          files: "*.mcpb"
