@@ -15,3 +15,5 @@ venv/
 .env
 .env.*
 *.local
+*.dxt
+*.mcpb

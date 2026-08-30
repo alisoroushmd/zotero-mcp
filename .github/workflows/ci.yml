@@ -10,8 +10,8 @@ jobs:
   lint:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-python@v5
+      - uses: actions/checkout@v7
+      - uses: actions/setup-python@v7
         with:
           python-version: "3.12"
       - run: pip install ruff
@@ -19,7 +19,7 @@ jobs:
       - run: ruff format --check src/ tests/
       # Ensure the committed uv.lock stays consistent with pyproject (ZOT-27):
       # a stale lock gives a false impression of reproducibility.
-      - uses: astral-sh/setup-uv@v5
+      - uses: astral-sh/setup-uv@v10.0.1
       - run: uv lock --check
 
   test:
@@ -28,8 +28,8 @@ jobs:
       matrix:
         python-version: ["3.11", "3.12", "3.13"]
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-python@v5
+      - uses: actions/checkout@v7
+      - uses: actions/setup-python@v7
         with:
           python-version: ${{ matrix.python-version }}
       - run: pip install -e ".[dev,graph,fulltext]"
@@ -44,8 +44,8 @@ jobs:
   smoke-wheel:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-python@v5
+      - uses: actions/checkout@v7
+      - uses: actions/setup-python@v7
         with:
           python-version: "3.12"
       - run: pip install build
@@ -69,8 +69,8 @@ jobs:
   version-sync:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-python@v5
+      - uses: actions/checkout@v7
+      - uses: actions/setup-python@v7
         with:
           python-version: "3.12"
       - name: Assert pyproject and manifest versions match (ZOT-27)
@@ -82,3 +82,15 @@ jobs:
           assert pyproj == manifest, f"version drift: pyproject {pyproj} != manifest {manifest}"
           print(f"versions in sync: {pyproj}")
           PY
+
+  # Package the MCP Bundle on every PR so a broken symlink or an incomplete
+  # .mcpbignore cannot first surface after a release tag is pushed.
+  mcpb-package:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-node@v7
+        with:
+          node-version: "24"
+      - run: npm install -g @anthropic-ai/mcpb@2.1.2
+      - run: mcpb pack
