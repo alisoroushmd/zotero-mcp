@@ -349,6 +349,7 @@ Adds pypdf for extracting text from PDFs. Used by `build_index(type='fulltext')`
 | `ZOTERO_LINKED_ATTACHMENT_DIR` | No   | Where `attach_pdf` writes PDFs for linked-file attachments (default: `<ZOTERO_DATA_DIR>/linked-attachments`). |
 | `ZOTERO_ATTACHMENT_MODE`   | No       | `linked` (default) stores PDFs on local disk as `linked_file` attachments and consumes **no** Zotero cloud storage quota. `imported` uploads into Zotero storage instead — syncs across devices, but counts against the quota and fails with HTTP 413 once it is full. Linked-file attachments are not valid in group libraries; use `imported` there. |
 | `ZOTERO_MCP_GRAPH_DB`      | No       | Override path for the knowledge-graph SQLite database (default: OS-native per-user data dir — `~/Library/Application Support/zotero-mcp/` on macOS, `%LOCALAPPDATA%\zotero-mcp\` on Windows, `~/.local/share/zotero-mcp/` elsewhere; an existing legacy `~/.local/share` DB is reused). |
+| `ZOTERO_MCP_GRAPH_MATERIALIZATION_LIMIT` | No | Maximum combined persisted graph records loaded into NetworkX (papers, citations, topics, authors, and paper-author links). Defaults to `100000`; oversized graphs are refused before materialization to protect server memory. |
 | `XDG_DATA_HOME`            | No       | Standard XDG override for the default graph DB location. |
 | `PARENT_WATCHDOG_DISABLE`  | No       | Set to `1` to disable the orphan-process watchdog that kills the server when the parent process (Claude.app, uvx, etc.) exits. |
 
@@ -360,6 +361,7 @@ Adds pypdf for extracting text from PDFs. Used by `build_index(type='fulltext')`
 | `CERTIFICATE_VERIFY_FAILED` on any tool | Python SSL misconfiguration | Run `check_ssl_health` — it diagnoses the cert bundle and returns remediation steps |
 | `attach_pdf` never finds a free PDF | `ZOTERO_MCP_EMAIL` not set | Unpaywall requires a real email address. Set `ZOTERO_MCP_EMAIL` in your config. |
 | Analysis tools fail without obvious error | `OPENALEX_API_KEY` missing | `check_retractions`, `get_citation_graph`, and `check_published_versions` all require it |
+| Knowledge graph materialization is refused | The persisted graph exceeds the default 100,000-record in-memory safety ceiling | Reduce/rebuild the graph, or set `ZOTERO_MCP_GRAPH_MATERIALIZATION_LIMIT` higher only when the server has enough memory |
 | Reads are slow | Zotero desktop not running; reads go through Web API | Start Zotero and enable local API for faster reads (optional) |
 | Item not found after creation | Zotero sync lag | Items created via Web API appear locally after Zotero syncs (usually seconds) |
 | `Version conflict for item` | Item was modified between read and write | Retry the operation; the server uses optimistic locking |

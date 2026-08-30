@@ -222,6 +222,43 @@ class TestStoreEntities:
         assert result2["entities_created"] == 0
         assert result2["entities_reused"] == 1
 
+    def test_store_entities_uses_one_transaction_without_exists_query(self, tmp_db, monkeypatch):
+        """A multi-paper entity payload commits once and skips existence preflights."""
+        from zotero_mcp.server import store_entities
+
+        batch_entries = 0
+        original_batch = GraphStore.batch
+
+        def counted_batch(store):
+            nonlocal batch_entries
+            batch_entries += 1
+            return original_batch(store)
+
+        def forbidden_exists(*_args, **_kwargs):
+            raise AssertionError("store_entities must not preflight entity existence")
+
+        monkeypatch.setattr(GraphStore, "batch", counted_batch)
+        monkeypatch.setattr(GraphStore, "entity_exists", forbidden_exists)
+
+        payload = [
+            {
+                "doi": "10.1/a",
+                "entities": [
+                    {"name": "CDX2", "type": "biomarker"},
+                    {"name": "metformin", "type": "drug"},
+                ],
+            },
+            {
+                "doi": "10.1/b",
+                "entities": [{"name": "cdx2", "type": "biomarker"}],
+            },
+        ]
+
+        result = json.loads(store_entities(payload))
+
+        assert batch_entries == 1
+        assert result == {"stored": 2, "entities_created": 2, "entities_reused": 1}
+
     def test_store_entities_skips_empty(self, tmp_db):
         """Empty DOIs and empty entity names are skipped."""
         from zotero_mcp.server import store_entities

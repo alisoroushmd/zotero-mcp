@@ -43,6 +43,22 @@ class KnowledgeGraph:
 
     def build_from_store(self, store: GraphStore) -> dict:
         """Build the graph from persisted data."""
+        from zotero_mcp.config import get_config
+
+        counts = store.get_materialization_counts()
+        limit = get_config().graph_materialization_limit
+        if counts["total"] > limit:
+            detail = ", ".join(
+                f"{name}={count:,}" for name, count in counts.items() if name != "total"
+            )
+            raise RuntimeError(
+                "Knowledge graph materialization refused: "
+                f"{counts['total']:,} persisted records exceed the configured "
+                f"limit of {limit:,} ({detail}). Increase "
+                "ZOTERO_MCP_GRAPH_MATERIALIZATION_LIMIT only if this process has "
+                "enough memory, or reduce/rebuild the persisted graph."
+            )
+
         self._graph.clear()
         self._paper_data.clear()
         self._topic_data.clear()
@@ -72,12 +88,13 @@ class KnowledgeGraph:
             self._author_data[aid] = a
             self._coauthor_graph.add_node(aid)
 
-        for doi, author_id, _position in store.get_all_paper_authors():
+        paper_author_links = store.get_all_paper_authors()
+        for doi, author_id, _position in paper_author_links:
             self._author_papers.setdefault(author_id, set()).add(doi)
 
         # Build co-authorship edges (for each paper, connect all co-author pairs)
         papers_to_authors: dict[str, list[str]] = defaultdict(list)
-        for doi, author_id, _ in store.get_all_paper_authors():
+        for doi, author_id, _ in paper_author_links:
             papers_to_authors[doi].append(author_id)
 
         for _doi, author_ids in papers_to_authors.items():

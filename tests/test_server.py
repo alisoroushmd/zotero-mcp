@@ -2,9 +2,109 @@
 
 import asyncio
 import time
+from concurrent.futures import Future
 from unittest.mock import MagicMock, patch
 
 import pytest
+
+
+def test_bounded_futures_never_exceeds_twice_worker_count(monkeypatch):
+    """PDF extraction submission keeps no more than 2 * workers in flight."""
+    import zotero_mcp.server as srv
+
+    class RecordingExecutor:
+        def __init__(self):
+            self.active = 0
+            self.max_active = 0
+
+        def submit(self, function, item):
+            future = Future()
+            future.item = item
+            self.active += 1
+            self.max_active = max(self.max_active, self.active)
+            return future
+
+    executor = RecordingExecutor()
+
+    def complete_one(pending, return_when):
+        assert return_when is srv.FIRST_COMPLETED
+        assert len(pending) <= 2 * srv._FULLTEXT_MAX_WORKERS
+        future = next(iter(pending))
+        future.set_result(future.item)
+        executor.active -= 1
+        return {future}, pending - {future}
+
+    monkeypatch.setattr(srv, "wait", complete_one)
+
+    results = [
+        future.result()
+        for future in srv._bounded_futures(
+            executor,
+            lambda item: item,
+            range(50),
+            max_in_flight=2 * srv._FULLTEXT_MAX_WORKERS,
+        )
+    ]
+
+    assert sorted(results) == list(range(50))
+    assert executor.max_active == 2 * srv._FULLTEXT_MAX_WORKERS
+
+
+def test_fulltext_build_commits_in_batches_of_100(monkeypatch):
+    """205 successful PDF extractions use three SQLite transactions."""
+    import zotero_mcp.server as srv
+
+    class BatchContext:
+        def __init__(self, store):
+            self.store = store
+
+        def __enter__(self):
+            self.store.batch_entries += 1
+            return self.store
+
+        def __exit__(self, *_args):
+            return None
+
+    class FakeStore:
+        def __init__(self):
+            self.batch_entries = 0
+            self.writes = []
+
+        def get_indexed_dois(self):
+            return set()
+
+        def batch(self):
+            return BatchContext(self)
+
+        def upsert_fulltext(self, doi, content, page_count, char_count):
+            self.writes.append((doi, content, page_count, char_count))
+
+        def close(self):
+            return None
+
+    items = [{"key": f"K{i}", "DOI": f"10.1/{i}"} for i in range(205)]
+    store = FakeStore()
+    web = MagicMock()
+    web.get_all_items_with_dois.return_value = items
+    local = MagicMock()
+    local.get_attachment_path.return_value = "/tmp/fake.pdf"
+
+    monkeypatch.setattr("zotero_mcp.graph_store.GraphStore", lambda: store)
+    monkeypatch.setattr("zotero_mcp.text_extractor.pypdf_available", lambda: True)
+    monkeypatch.setattr("zotero_mcp.text_extractor.extract_text_from_pdf", lambda _source: "text")
+    monkeypatch.setattr(srv, "_get_web", lambda: web)
+    monkeypatch.setattr(srv, "_get_local", lambda: local)
+    monkeypatch.setattr(
+        srv,
+        "_read_local_or_web",
+        lambda *_args, **_kwargs: [{"key": "ATT", "contentType": "application/pdf"}],
+    )
+
+    result = srv._build_fulltext_index()
+
+    assert result == {"indexed": 205, "skipped": 0, "failed": 0, "total": 205}
+    assert store.batch_entries == 3
+    assert len(store.writes) == 205
 
 
 def test_server_has_all_tools():
@@ -637,8 +737,7 @@ def test_store_entities_accepts_valid_type():
     with patch.object(srv, "_invalidate_kg_cache"):
         with patch("zotero_mcp.graph_store.GraphStore") as mock_gs_cls:
             mock_store = MagicMock()
-            mock_store.entity_exists.return_value = False
-            mock_store.upsert_entity.return_value = 1
+            mock_store.upsert_entity_with_status.return_value = (1, True)
             mock_gs_cls.return_value.__enter__ = MagicMock(return_value=mock_store)
             mock_gs_cls.return_value.__exit__ = MagicMock(return_value=False)
 

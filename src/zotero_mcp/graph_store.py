@@ -400,6 +400,25 @@ class GraphStore:
         ).fetchall()
         return [(r[0], r[1], r[2]) for r in rows]
 
+    def get_materialization_counts(self) -> dict[str, int]:
+        """Return counts for every table loaded into ``KnowledgeGraph``.
+
+        Returns:
+            Per-table counts plus their combined ``total``.
+        """
+        row = self._conn.execute(
+            """SELECT
+                   (SELECT COUNT(*) FROM papers) AS papers,
+                   (SELECT COUNT(*) FROM citations) AS citations,
+                   (SELECT COUNT(*) FROM paper_topics) AS topics,
+                   (SELECT COUNT(*) FROM authors) AS authors,
+                   (SELECT COUNT(*) FROM paper_authors) AS paper_authors"""
+        ).fetchone()
+        count_names = ("papers", "citations", "topics", "authors", "paper_authors")
+        counts = {key: int(row[key]) for key in count_names}
+        counts["total"] = sum(counts.values())
+        return counts
+
     def upsert_fulltext(
         self,
         doi: str,
@@ -494,17 +513,37 @@ class GraphStore:
         Returns:
             The entity_id (existing or newly created).
         """
+        entity_id, _created = self.upsert_entity_with_status(name, entity_type)
+        return entity_id
+
+    def upsert_entity_with_status(self, name: str, entity_type: str) -> tuple[int, bool]:
+        """Insert or find an entity and report whether it was newly created.
+
+        The insert and identifier lookup run in the same transaction. This
+        avoids the preliminary existence query that callers previously needed
+        and keeps creation accounting race-safe.
+
+        Args:
+            name: Entity name (e.g. "CDX2", "metformin").
+            entity_type: Entity category (e.g. "biomarker", "drug").
+
+        Returns:
+            Tuple of ``(entity_id, created)``.
+        """
         normalized = name.strip().lower()
-        self._conn.execute(
+        cursor = self._conn.execute(
             "INSERT OR IGNORE INTO entities (name, entity_type) VALUES (?, ?)",
             (normalized, entity_type),
         )
-        self._commit()
+        created = cursor.rowcount == 1
         row = self._conn.execute(
             "SELECT entity_id FROM entities WHERE name = ? AND entity_type = ?",
             (normalized, entity_type),
         ).fetchone()
-        return row[0]
+        if row is None:  # defensive: the insert/select pair should make this impossible
+            raise RuntimeError(f"Could not resolve entity ID for {normalized!r}/{entity_type!r}")
+        self._commit()
+        return int(row[0]), created
 
     def upsert_paper_entity(
         self, doi: str, entity_id: int, confidence: float | None = None
