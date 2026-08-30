@@ -11,8 +11,9 @@ import re
 import tempfile
 import threading
 import time
+from concurrent.futures import FIRST_COMPLETED, wait
 from datetime import UTC
-from typing import TYPE_CHECKING, Annotated, Literal
+from typing import TYPE_CHECKING, Annotated, Literal, TypeVar
 
 import httpx
 from fastmcp import FastMCP
@@ -24,6 +25,9 @@ from zotero_mcp.local_client import LocalClient
 from zotero_mcp.web_client import WebClient, _is_preprint_doi
 
 if TYPE_CHECKING:
+    from collections.abc import Callable, Iterable, Iterator
+    from concurrent.futures import Executor, Future
+
     from zotero_mcp.knowledge_graph import KnowledgeGraph
 
 logger = logging.getLogger(__name__)
@@ -103,6 +107,12 @@ _init_lock = threading.Lock()
 # costs a Zotero read + CrossRef + OpenAlex round-trips, so an unbounded batch can
 # run for minutes and hammer external APIs (ZOT-42).
 _MAX_BATCH_KEYS = 50
+_FULLTEXT_MAX_WORKERS = 4
+_FULLTEXT_MAX_IN_FLIGHT = 2 * _FULLTEXT_MAX_WORKERS
+_FULLTEXT_WRITE_BATCH_SIZE = 100
+
+_T = TypeVar("_T")
+_R = TypeVar("_R")
 
 # Temp file tracking for cleanup at exit.
 _temp_files: list[str] = []
@@ -2022,6 +2032,51 @@ def _invalidate_kg_cache() -> None:
         _kg_cache = None
 
 
+def _bounded_futures(
+    executor: Executor,
+    function: Callable[[_T], _R],
+    items: Iterable[_T],
+    *,
+    max_in_flight: int,
+) -> Iterator[Future[_R]]:
+    """Yield completed futures while bounding submitted, unfinished work."""
+    if max_in_flight < 1:
+        raise ValueError("max_in_flight must be positive")
+
+    item_iter = iter(items)
+    pending: set[Future[_R]] = set()
+    for _ in range(max_in_flight):
+        try:
+            item = next(item_iter)
+        except StopIteration:
+            break
+        pending.add(executor.submit(function, item))
+
+    while pending:
+        completed, pending = wait(pending, return_when=FIRST_COMPLETED)
+        yield from completed
+        for _ in range(len(completed)):
+            try:
+                item = next(item_iter)
+            except StopIteration:
+                break
+            pending.add(executor.submit(function, item))
+
+
+def _write_fulltext_batch(store, results: list[dict], index_function: Callable) -> tuple[int, int]:
+    """Commit one extracted full-text batch atomically."""
+    if not results:
+        return 0, 0
+    try:
+        with store.batch():
+            for result in results:
+                index_function(store, result["doi"], result["text"])
+    except Exception:
+        logger.exception("Full-text index batch failed; rolled back %d records", len(results))
+        return 0, len(results)
+    return len(results), 0
+
+
 def _extract_openalex_id(url: str) -> str:
     """Extract OpenAlex ID from URL like 'https://openalex.org/W123'."""
     return url.split("/")[-1] if "/" in url else url
@@ -2221,7 +2276,7 @@ def _build_knowledge_graph(full_rebuild: bool = False) -> dict:
 
 def _build_fulltext_index(full_rebuild: bool = False, limit: int = 0) -> dict:
     """Build or update the full-text search index. Returns stats dict."""
-    from concurrent.futures import ThreadPoolExecutor, as_completed
+    from concurrent.futures import ThreadPoolExecutor
 
     from zotero_mcp.graph_store import GraphStore
     from zotero_mcp.text_extractor import (
@@ -2293,24 +2348,38 @@ def _build_fulltext_index(full_rebuild: bool = False, limit: int = 0) -> dict:
 
             return {"doi": item_doi, "status": "extracted", "text": text}
 
-        # Extract in parallel, write serially on the main thread (sqlite3 conn
-        # is not thread-safe).
-        with ThreadPoolExecutor(max_workers=4) as pool:
-            futures = {pool.submit(_extract_one, it): it for it in items}
-            for future in as_completed(futures):
+        # Extract in parallel, but keep at most 2 * max_workers futures in
+        # flight. Successful results are written serially on the main thread in
+        # transactions of 100 so neither PDF text nor SQLite commits grow with
+        # the full library size.
+        write_batch: list[dict] = []
+        with ThreadPoolExecutor(max_workers=_FULLTEXT_MAX_WORKERS) as pool:
+            for future in _bounded_futures(
+                pool,
+                _extract_one,
+                items,
+                max_in_flight=_FULLTEXT_MAX_IN_FLIGHT,
+            ):
                 try:
                     result = future.result()
                 except Exception:
                     failed += 1
                     continue
                 if result["status"] == "extracted":
-                    try:
-                        index_paper_text(store, result["doi"], result["text"])
-                        indexed += 1
-                    except Exception:
-                        failed += 1
+                    write_batch.append(result)
+                    if len(write_batch) == _FULLTEXT_WRITE_BATCH_SIZE:
+                        written, write_failed = _write_fulltext_batch(
+                            store, write_batch, index_paper_text
+                        )
+                        indexed += written
+                        failed += write_failed
+                        write_batch = []
                 else:
                     failed += 1
+
+        written, write_failed = _write_fulltext_batch(store, write_batch, index_paper_text)
+        indexed += written
+        failed += write_failed
     finally:
         store.close()
 
@@ -2740,9 +2809,8 @@ def store_entities(results: str | list) -> str:
         {"condition", "biomarker", "drug", "method", "gene", "organism", "outcome", "dataset"}
     )
 
-    # Validate every entity type BEFORE opening the store (ZOT-12). upsert_*
-    # commits per row with no enclosing transaction, so raising mid-loop would
-    # leave a partially-written batch. Fail up front instead, making retries safe.
+    # Validate every entity type BEFORE opening the store (ZOT-12). Fail up
+    # front so the single write transaction below can never partially persist.
     for item in results:
         for ent in item.get("entities", []) or []:
             ent_type = ent.get("type", "").strip().lower()
@@ -2757,36 +2825,35 @@ def store_entities(results: str | list) -> str:
     entities_reused = 0
 
     with GraphStore() as store:
-        for item in results:
-            # Normalize so entity links join the papers table, whose doi key is
-            # normalized (ZOT-22); a raw uppercase DOI would orphan the link.
-            doi = _norm_doi(item.get("doi", ""))
-            if not doi:
-                continue
-            entities = item.get("entities", [])
-            if not entities:
-                continue
-
-            entities_stored_for_paper = 0
-            for ent in entities:
-                ent_name = ent.get("name", "").strip()
-                ent_type = ent.get("type", "").strip().lower()
-                if not ent_name or not ent_type:
+        with store.batch():
+            for item in results:
+                # Normalize so entity links join the papers table, whose doi key is
+                # normalized (ZOT-22); a raw uppercase DOI would orphan the link.
+                doi = _norm_doi(item.get("doi", ""))
+                if not doi:
+                    continue
+                entities = item.get("entities", [])
+                if not entities:
                     continue
 
-                already_exists = store.entity_exists(ent_name, ent_type)
-                entity_id = store.upsert_entity(ent_name, ent_type)
+                entities_stored_for_paper = 0
+                for ent in entities:
+                    ent_name = ent.get("name", "").strip()
+                    ent_type = ent.get("type", "").strip().lower()
+                    if not ent_name or not ent_type:
+                        continue
 
-                if already_exists:
-                    entities_reused += 1
-                else:
-                    entities_created += 1
+                    entity_id, created = store.upsert_entity_with_status(ent_name, ent_type)
+                    if created:
+                        entities_created += 1
+                    else:
+                        entities_reused += 1
 
-                store.upsert_paper_entity(doi, entity_id)
-                entities_stored_for_paper += 1
+                    store.upsert_paper_entity(doi, entity_id)
+                    entities_stored_for_paper += 1
 
-            if entities_stored_for_paper > 0:
-                papers_stored += 1
+                if entities_stored_for_paper > 0:
+                    papers_stored += 1
 
     _invalidate_kg_cache()
     return json.dumps(

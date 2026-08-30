@@ -53,6 +53,11 @@ class Config:
     # Derived: XDG data directory for graph store default
     xdg_data_home: str = ""
 
+    # Maximum number of persisted records that may be loaded into the in-memory
+    # NetworkX graph. Kept after all pre-existing fields so legacy positional
+    # Config construction retains its prior argument ordering.
+    graph_materialization_limit: int = 100_000
+
     @property
     def has_web_api(self) -> bool:
         """True if Zotero Web API credentials are configured."""
@@ -135,6 +140,16 @@ class Config:
 
 def load_config() -> Config:
     """Load configuration from environment variables."""
+    raw_graph_limit = os.environ.get("ZOTERO_MCP_GRAPH_MATERIALIZATION_LIMIT", "100000")
+    try:
+        graph_materialization_limit = int(raw_graph_limit)
+    except ValueError as exc:
+        raise ValueError(
+            "ZOTERO_MCP_GRAPH_MATERIALIZATION_LIMIT must be a positive integer"
+        ) from exc
+    if graph_materialization_limit < 1:
+        raise ValueError("ZOTERO_MCP_GRAPH_MATERIALIZATION_LIMIT must be a positive integer")
+
     return Config(
         zotero_api_key=os.environ.get("ZOTERO_API_KEY", ""),
         zotero_user_id=os.environ.get("ZOTERO_USER_ID", ""),
@@ -143,6 +158,7 @@ def load_config() -> Config:
         ncbi_api_key=os.environ.get("NCBI_API_KEY", ""),
         polite_email=os.environ.get("ZOTERO_MCP_EMAIL", "zotero-mcp@example.com"),
         graph_db_path=os.environ.get("ZOTERO_MCP_GRAPH_DB", ""),
+        graph_materialization_limit=graph_materialization_limit,
         zotero_data_dir=os.environ.get("ZOTERO_DATA_DIR", ""),
         linked_attachment_dir=os.environ.get("ZOTERO_LINKED_ATTACHMENT_DIR", ""),
         attachment_mode=os.environ.get("ZOTERO_ATTACHMENT_MODE", "linked"),

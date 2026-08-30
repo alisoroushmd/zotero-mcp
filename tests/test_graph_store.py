@@ -322,6 +322,40 @@ def test_upsert_and_get_paper_author(tmp_db):
     assert ("10.1/a", "A200", 1) in links
 
 
+def test_materialization_counts_include_every_loaded_table(tmp_db):
+    """Materialization sizing includes all rows loaded by KnowledgeGraph."""
+    store = GraphStore(tmp_db)
+    store.upsert_paper("10.1/a", "A", "A", 2024, "Author", "W1")
+    store.upsert_paper("10.1/b", "B", "B", 2024, "Author", "W2")
+    store.upsert_citation("10.1/a", "10.1/b")
+    store.upsert_topic("10.1/a", "T1", "Topic", "Subfield", "Field", "Domain", 1.0)
+    store.upsert_author("A1", "Author", None, None)
+    store.upsert_paper_author("10.1/a", "A1", 0)
+
+    counts = store.get_materialization_counts()
+
+    assert counts == {
+        "papers": 2,
+        "citations": 1,
+        "topics": 1,
+        "authors": 1,
+        "paper_authors": 1,
+        "total": 6,
+    }
+
+
+def test_upsert_entity_with_status_reports_create_then_reuse(tmp_db):
+    """Entity upsert returns its ID and creation status without a preflight query."""
+    store = GraphStore(tmp_db)
+
+    first_id, first_created = store.upsert_entity_with_status(" CDX2 ", "biomarker")
+    second_id, second_created = store.upsert_entity_with_status("cdx2", "biomarker")
+
+    assert first_id == second_id
+    assert first_created is True
+    assert second_created is False
+
+
 def test_get_all_topics(tmp_db):
     """Can retrieve topics across multiple DOIs."""
     store = GraphStore(tmp_db)

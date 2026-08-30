@@ -2,6 +2,7 @@
 
 import os
 import tempfile
+from unittest.mock import patch
 
 import pytest
 
@@ -321,6 +322,41 @@ def test_build_from_store_loads_authors(populated_store_with_authors):
     assert kg._author_papers["A2"] == {"10.1/a", "10.1/c", "10.1/d"}
     # Carol has papers B, D, E
     assert kg._author_papers["A3"] == {"10.1/b", "10.1/d", "10.1/e"}
+
+
+def test_rebuild_fetches_links_once_and_is_equivalent(populated_store_with_authors):
+    """Repeated builds replace state exactly and read paper-author links once each."""
+    kg = KnowledgeGraph()
+    store = populated_store_with_authors
+
+    with patch.object(
+        store, "get_all_paper_authors", wraps=store.get_all_paper_authors
+    ) as get_links:
+        first_stats = kg.build_from_store(store)
+        first_author_papers = {key: set(value) for key, value in kg._author_papers.items()}
+        first_edges = set(kg._coauthor_graph.edges())
+
+        second_stats = kg.build_from_store(store)
+
+    assert get_links.call_count == 2
+    assert second_stats == first_stats
+    assert kg._author_papers == first_author_papers
+    assert set(kg._coauthor_graph.edges()) == first_edges
+
+
+def test_build_refuses_materialization_above_configured_ceiling(
+    populated_store_with_authors, monkeypatch
+):
+    """Graph build fails clearly before loading a store beyond its record ceiling."""
+    from zotero_mcp.config import _reset_config
+
+    monkeypatch.setenv("ZOTERO_MCP_GRAPH_MATERIALIZATION_LIMIT", "1")
+    _reset_config()
+    try:
+        with pytest.raises(RuntimeError, match="materialization refused.*limit of 1"):
+            KnowledgeGraph().build_from_store(populated_store_with_authors)
+    finally:
+        _reset_config()
 
 
 def test_get_prolific_authors(populated_store_with_authors):
