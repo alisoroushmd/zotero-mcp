@@ -1442,9 +1442,11 @@ def update_item(item_key: str, fields: dict | str) -> str:
 @mcp.tool(
     annotations=_DR,
     description=(
-        "Move Zotero items to trash (reversible). Use this when the user wants to "
-        "delete papers. Accepts one or more item keys. Items can be restored from "
-        "trash in Zotero. Confirm with user before trashing."
+        "Move Zotero items to trash (reversible). Sets each item's deleted flag "
+        "via the Web API, exactly like pressing Delete in Zotero desktop; nothing "
+        "is permanently removed. Accepts one or more item keys. Items can be "
+        "restored from the Trash in Zotero; only empty_trash is permanent. "
+        "Confirm with user before trashing."
     ),
 )
 @_handle_tool_errors

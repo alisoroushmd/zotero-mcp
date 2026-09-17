@@ -247,3 +247,81 @@ def test_find_duplicates_groups_by_title_similarity():
     title_groups = [g for g in result["duplicate_groups"] if g["match_type"] == "title_similarity"]
     assert len(title_groups) == 1
     assert len(title_groups[0]["items"]) == 2
+
+
+def _rec(key, title, item_type="journalArticle", doi=""):
+    return {
+        "key": key,
+        "title": title,
+        "DOI": doi,
+        "date": "2026",
+        "item_type": item_type,
+        "creators": "",
+        "collections": [],
+        "tags": [],
+        "version": 1,
+    }
+
+
+def test_find_duplicates_excludes_child_attachments_and_notes():
+    """Child attachments/notes must never form duplicate groups.
+
+    Regression for the 2026-08-30 hygiene audit: generic attachment titles
+    ("Snapshot", "arXiv.org Snapshot", "PubMed entry") are byte-identical, so
+    they trivially clear the 0.85 similarity threshold and produced 3 groups /
+    50 items that crowded out a real DOI duplicate.
+    """
+    client = _make_client()
+    items = [
+        _rec("A1", "Snapshot", "attachment"),
+        _rec("A2", "Snapshot", "attachment"),
+        _rec("A3", "arXiv.org Snapshot", "attachment"),
+        _rec("A4", "arXiv.org Snapshot", "attachment"),
+        _rec("N1", "PubMed entry", "note"),
+        _rec("N2", "PubMed entry", "note"),
+        _rec("J1", "A Unique Paper About Gastric Metaplasia", "journalArticle"),
+    ]
+    with mock.patch.object(client, "search_items", return_value=items):
+        result = client.find_duplicates(limit=100)
+
+    assert result["total_groups"] == 0, result["duplicate_groups"]
+    assert result["total_duplicate_items"] == 0
+
+
+def test_find_duplicates_still_reports_real_doi_dupes_amid_attachments():
+    """A real DOI duplicate must survive alongside attachment noise."""
+    client = _make_client()
+    items = [_rec(f"A{i}", "Snapshot", "attachment") for i in range(20)]
+    items += [
+        _rec("R1", "Use of LLMs to Determine the Surveillance Interval", doi="10.1/abc"),
+        _rec("R2", "Use of LLMs to Determine the Surveillance Interval", doi="10.1/abc"),
+    ]
+    with mock.patch.object(client, "search_items", return_value=items):
+        result = client.find_duplicates(limit=100)
+
+    doi_groups = [g for g in result["duplicate_groups"] if g["match_type"] == "doi"]
+    assert len(doi_groups) == 1
+    assert {i["key"] for i in doi_groups[0]["items"]} == {"R1", "R2"}
+
+
+def test_read_item_never_uses_local_version():
+    """_read_item must read via the Web API, not the local database.
+
+    The returned version is sent as If-Unmodified-Since-Version on the next
+    PATCH. The local DB keeps its own counter (0/1/2) unrelated to the cloud
+    version, so a local read made every read-modify-write fail with HTTP 412
+    whenever Zotero desktop was running.
+    """
+    client = _make_client()
+    local = mock.Mock()
+    local.get_item.return_value = {"key": "K1", "version": 2, "collections": []}
+    client._local = local
+
+    with mock.patch.object(
+        client, "get_item", return_value={"key": "K1", "version": 8880, "collections": []}
+    ) as web:
+        item = client._read_item("K1")
+
+    assert item["version"] == 8880, "must use the cloud version, not the local one"
+    local.get_item.assert_not_called()
+    web.assert_called_once_with("K1")

@@ -327,8 +327,23 @@ LOCAL_BASE = "http://localhost:23119/api"
 
 @respx.mock
 def test_add_to_collection():
-    """add_to_collection reads item locally, patches via web API."""
-    respx.get(f"{LOCAL_BASE}/users/0/items/ITEM1").mock(
+    """add_to_collection reads the item via the WEB API, then patches it.
+
+    The read must not come from the local database: its version counter is
+    unrelated to the cloud one, so a local read makes the PATCH 412. The local
+    route below is deliberately mocked with a wrong version and must go unused.
+    """
+    local_route = respx.get(f"{LOCAL_BASE}/users/0/items/ITEM1").mock(
+        return_value=httpx.Response(
+            200,
+            json={
+                "key": "ITEM1",
+                "version": 2,
+                "data": {"key": "ITEM1", "version": 2, "collections": ["COL1"]},
+            },
+        )
+    )
+    respx.get(f"{WEB_BASE}/users/12345/items/ITEM1").mock(
         return_value=httpx.Response(
             200,
             json={
@@ -351,12 +366,24 @@ def test_add_to_collection():
     result = client.add_to_collection("ITEM1", "COL2")
     assert "COL1" in result["collections"]
     assert "COL2" in result["collections"]
+    assert not local_route.called, "read-modify-write must not read the local DB"
+    assert respx.calls[-1].request.headers["If-Unmodified-Since-Version"] == "10"
 
 
 @respx.mock
 def test_update_item():
-    """update_item reads locally, patches via web API with version."""
-    respx.get(f"{LOCAL_BASE}/users/0/items/ITEM1").mock(
+    """update_item reads via the web API and patches with the cloud version."""
+    local_route = respx.get(f"{LOCAL_BASE}/users/0/items/ITEM1").mock(
+        return_value=httpx.Response(
+            200,
+            json={
+                "key": "ITEM1",
+                "version": 2,
+                "data": {"key": "ITEM1", "version": 2, "title": "Old Title"},
+            },
+        )
+    )
+    respx.get(f"{WEB_BASE}/users/12345/items/ITEM1").mock(
         return_value=httpx.Response(
             200,
             json={
@@ -378,6 +405,7 @@ def test_update_item():
     client = WebClient(api_key="test-key", user_id="12345", local_client=local)
     result = client.update_item("ITEM1", {"title": "New Title"})
     assert result["key"] == "ITEM1"
+    assert not local_route.called, "read-modify-write must not read the local DB"
 
     request = respx.calls[-1].request
     assert request.headers["If-Unmodified-Since-Version"] == "10"
@@ -386,7 +414,7 @@ def test_update_item():
 @respx.mock
 def test_update_item_version_conflict():
     """update_item raises clear error on 412 Precondition Failed."""
-    respx.get(f"{LOCAL_BASE}/users/0/items/ITEM1").mock(
+    respx.get(f"{WEB_BASE}/users/12345/items/ITEM1").mock(
         return_value=httpx.Response(
             200,
             json={

@@ -6,6 +6,71 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/).
 
 ## [Unreleased]
 
+### Fixed
+
+- **ZOT-46: `trash_items` permanently deleted items instead of trashing
+  them.** The MCP tool advertised "Move Zotero items to trash (reversible)",
+  but the client implemented it as `DELETE /items?itemKey=...`, which the
+  Zotero Web API defines as permanent deletion with no trash step. On
+  2026-09-16 a cleanup of 909 broken linked-PDF attachment records was
+  therefore irreversible (record and pre-deletion database copy kept outside
+  the repo). `trash_items` now performs what Zotero desktop does on Delete:
+  a batched `POST /items` (up to 50 objects per request, each carrying
+  `key`, `version` and `deleted: true`) under the existing
+  `If-Unmodified-Since-Version` handling, with one refresh-and-retry on 412.
+  Per-item versions are read first, so unknown keys are reported as failed
+  instead of written blind; already-trashed items count as trashed. The
+  result gains an `errors` map (key to API reason). `empty_trash` remains the
+  only permanent path. Regression tests assert that `trash_items` never
+  issues an HTTP `DELETE` and does issue `deleted: true` writes.
+  (`web_client.py`, `server.py`, `tests/test_trash.py`,
+  `tests/test_attachment_migration.py`)
+
+- **Pre-tool Zotero snapshot hook silently produced 0-byte backups.**
+  `scripts/zotero-snapshot.sh` (installed as `~/Zotero/_scripts/snapshot.sh`
+  and run by the Claude Code PreToolUse hook before `trash_items`,
+  `empty_trash`, `manage_tags` and `batch_organize`) relied on
+  `sqlite3 .backup`. Zotero desktop holds the database in exclusive locking
+  mode, so the Backup API failed with "database is locked" after already
+  creating the empty destination file; `PRAGMA integrity_check` on a 0-byte
+  file prints `ok`; and the script exited 1, which Claude Code treats as a
+  non-blocking hook error. Every snapshot since 2026-08-20 was empty and no
+  tool call was ever blocked. The script now falls back to copying the main
+  file plus WAL, replays the WAL on the private copy (the `immutable=1`
+  shortcut was rejected because it ignores un-checkpointed WAL content), and
+  verifies header, integrity, and a non-empty `items` table before
+  accepting the snapshot. Any failure removes the partial file and exits 2,
+  which blocks the tool call. (`scripts/zotero-snapshot.sh`)
+
+- **ZOT-44: every read-modify-write silently failed with HTTP 412 while
+  Zotero desktop was running.** `_read_item` is the read half of
+  read-modify-write, and its result's `version` is sent straight back as
+  `If-Unmodified-Since-Version` on the PATCH. It preferred the local Zotero
+  API "for speed", but the local database keeps its *own* version counter
+  that has nothing to do with the cloud library version — locally an item
+  reads as version 1 or 2 while the cloud has it at, say, 8880. Every PATCH
+  therefore hit `412 Item has been modified since specified version`, and the
+  412 retry path re-read through the same helper, so it failed identically
+  instead of recovering. `_read_item` now always reads via the Web API.
+
+  Impact: `add_to_collection`, `update_item` and `batch_organize` were
+  affected. `batch_organize` only reports a `failed_count`, so agent-driven
+  workflows that filed newly created items into collections recorded success
+  while writing nothing. This is the root cause of the 2026-08-30 hygiene
+  audit finding that 80 of 87 recently banked papers had an empty
+  `collections` field: the calls were made and rejected, not skipped.
+  (`web_client.py`)
+
+- **ZOT-45: `find_duplicates` reported child attachments and notes as
+  duplicates.** Attachment titles are generic and often byte-identical
+  ("Snapshot", "arXiv.org Snapshot", "PubMed entry"), so they trivially clear
+  the 0.85 title-similarity threshold. On 2026-08-30 a library-wide scan
+  returned 3 groups covering 50 attachment items — filling the result budget
+  while a genuine, still-live DOI duplicate went unreported. The migration of
+  attachments to `linked_file` made this much worse by creating many
+  identically titled snapshot attachments in one batch. Duplicate detection
+  now filters to bibliographic records before grouping. (`web_client.py`)
+
 ### Added
 
 - **Attachment migration: convert existing `imported_*` attachments to
