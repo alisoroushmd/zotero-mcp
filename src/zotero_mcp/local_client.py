@@ -134,6 +134,30 @@ class LocalClient:
         )
         return [_format_summary(item) for item in resp.json()]
 
+    def top_items_page(
+        self, collection_key: str | None, start: int, limit: int
+    ) -> tuple[list[dict], int | None]:
+        """One page of raw top-level, non-attachment items (for find_duplicates).
+
+        Mirrors ``WebClient._top_items_page``: ``/items/top`` excludes child
+        attachments and notes, and a single negated ``itemType`` excludes
+        standalone attachments. Compound negations such as
+        ``-attachment || -note`` are not honored reliably, so the caller
+        filters notes and annotations itself.
+
+        Returns:
+            (raw item list, ``Total-Results`` header value or None).
+        """
+        path = (
+            f"/users/0/collections/{collection_key}/items/top"
+            if collection_key
+            else "/users/0/items/top"
+        )
+        params = {"limit": limit, "start": start, "itemType": "-attachment", "format": "json"}
+        resp = self._get(path, params=params)
+        total = resp.headers.get("Total-Results", "")
+        return resp.json(), int(total) if total.isdigit() else None
+
     def get_children(self, parent_key: str, item_type: str | None = None) -> list[dict]:
         """Get child items for a parent item.
 

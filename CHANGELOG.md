@@ -8,6 +8,46 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/).
 
 ### Fixed
 
+- **`find_duplicates` missed real duplicates on any library over one page.**
+  The tool clamped `limit` to 100 and issued a single request, so
+  `limit=200` and `limit=3000` both scanned at most 100 raw rows; notes and
+  attachments spent that budget before being filtered out; DOIs were not
+  stripped of `https://doi.org/` prefixes; and title matching ran only on
+  items without a DOI, so the same paper under two DOIs was undetectable.
+  On 2026-10-01 a 1,474-item library returned 0 groups. The scan now pages
+  `/items/top?itemType=-attachment` until `limit` *parent* records (default
+  5,000, max 20,000), drops notes, annotations, trashed and child rows,
+  reads a `DOI:` line from Extra for types without a DOI field, and clusters
+  titles across all parent records using prefix/suffix blocking. A title
+  group whose items carry different DOIs is marked
+  `confidence: "possible_dual_publication"`; titles that differ in a number
+  (GLOBOCAN 2020 vs 2022) are never grouped. Results now report
+  `scanned_items`, `total_available`, `truncated` and `source`.
+  (`web_client.py`, `local_client.py`, `server.py`, `tests/test_duplicates.py`,
+  `tests/test_server.py`)
+
+- **Read-modify-write recovers from a stale item version instead of failing
+  with HTTP 412.** On 2026-09-19 a stale read (version 2015 against cloud
+  version 11549) made `add_to_collection` fail with 412, and the stale copy's
+  empty `collections` made the failure indistinguishable from success.
+  `add_to_collection`, `update_item`, `batch_organize` and `rename_tag` now
+  share `_patch_item_rmw`: version from a Web API read, and on 412 one
+  re-read, patch rebuild against the fresh state, and retry. A second 412
+  raises `ItemVersionConflictError` naming the item (tool error code
+  `version_conflict`). `batch_organize` returns `skipped_keys` and an
+  `errors` map with the reason for each failed key. `add_to_collection`
+  returns `status`, `version` and the Web-API-confirmed collections, and
+  `get_item(source="web")` reads the cloud record, bypassing Zotero
+  desktop's lagging local copy, for post-write verification.
+  (`web_client.py`, `server.py`, `tests/test_web_client.py`,
+  `tests/test_server.py`)
+
+- **`update_item` rejected valid schema fields.** `journalAbbreviation`,
+  `PMID`, `PMCID`, `seriesText`, `section` and `seriesNumber` (all defined
+  in Zotero global schema v44) are now allowed. `citationKey` stays blocked
+  because Better BibTeX pins keys through Extra. (`server.py`,
+  `tests/test_server.py`)
+
 - **ZOT-46: `trash_items` permanently deleted items instead of trashing
   them.** The MCP tool advertised "Move Zotero items to trash (reversible)",
   but the client implemented it as `DELETE /items?itemKey=...`, which the
@@ -71,6 +111,16 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/).
   identically titled snapshot attachments in one batch. Duplicate detection
   now filters to bibliographic records before grouping. (`web_client.py`)
 
+- **MCP Bundle packaging no longer follows a broken development-only
+  symlink.** `GEMINI.md` now resolves to the tracked `AGENTS.md`, and MCPB
+  excludes agent instructions, tests, CI files, and development artifacts from
+  the `.mcpb` archive. The manifest and release tooling now use the current
+  MCPB names instead of their deprecated DXT equivalents. CI packages the
+  bundle before release, and PyPI
+  publication now waits for a successful MCPB bundle build so a partial release
+  cannot recur. GitHub Actions were also upgraded to Node.js 24-compatible
+  releases.
+
 ### Added
 
 - **Attachment migration: convert existing `imported_*` attachments to
@@ -125,6 +175,12 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/).
   the linked-attachment directory accordingly.
 
 ### Changed
+
+- **Full-text indexing now bounds memory and transaction growth.** PDF extraction keeps at most twice the worker count in flight and commits successful text in 100-record SQLite batches, preventing unbounded futures and per-record commits on large libraries. (`knowledge_graph.py`, `tests/test_knowledge_graph.py`)
+
+- **Entity persistence is batched into one transaction.** `store_entities` writes entities and paper links together, while creation status and identifier lookup no longer require a preliminary existence query. (`graph_store.py`, `tests/test_entities.py`, `tests/test_graph_store.py`)
+
+- **Knowledge-graph materialization now has an explicit resource ceiling.** NetworkX builds refuse persisted input above a configurable 100,000-record limit and rebuild author state from one paper-author snapshot without changing public MCP response shapes or positional `Config` compatibility. (`config.py`, `graph_store.py`, `knowledge_graph.py`, `server.py`, `README.md`, `tests/test_config.py`, `tests/test_graph_store.py`, `tests/test_knowledge_graph.py`, `tests/test_server.py`)
 
 - **`attach_pdf` now stores PDFs locally by default instead of uploading them
   to Zotero cloud storage.** The previous implementation created every

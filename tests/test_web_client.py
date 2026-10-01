@@ -1023,6 +1023,145 @@ def test_batch_organize_handles_412_retry():
     assert result["failed_count"] == 0
 
 
+# -- Stale-version 412 recovery (2026-09-19 live evidence) --
+#
+# get_item served version 2015 while the cloud item was at 11549, so the
+# PATCH carried a stale If-Unmodified-Since-Version and the API returned 412.
+# Every read-modify-write must re-read from the Web API on 412 and retry once,
+# and a persistent 412 must name the item instead of vanishing into a count.
+
+
+def _item_json(key: str, version: int, collections=None, tags=None) -> dict:
+    data = {
+        "key": key,
+        "version": version,
+        "collections": list(collections or []),
+        "tags": list(tags or []),
+    }
+    return {"key": key, "version": version, "data": data}
+
+
+@respx.mock
+def test_add_to_collection_recovers_from_stale_version_412():
+    """Stale version -> 412 -> Web API re-read -> retry with fresh version -> success."""
+    import json as _json
+
+    get_route = respx.get(f"{WEB_BASE}/users/12345/items/IWQ94IDC").mock(
+        side_effect=[
+            httpx.Response(200, json=_item_json("IWQ94IDC", 2015, ["OLD1"])),
+            httpx.Response(200, json=_item_json("IWQ94IDC", 11549, ["OLD1", "NEW9"])),
+        ]
+    )
+    patch_route = respx.patch(f"{WEB_BASE}/users/12345/items/IWQ94IDC").mock(
+        side_effect=[
+            httpx.Response(412, text="Item has been modified since specified version"),
+            httpx.Response(204, headers={"Last-Modified-Version": "11550"}),
+        ]
+    )
+
+    client = WebClient(api_key="test-key", user_id="12345")
+    result = client.add_to_collection("IWQ94IDC", "COLGI")
+
+    assert get_route.call_count == 2
+    assert patch_route.call_count == 2
+    versions = [c.request.headers["If-Unmodified-Since-Version"] for c in patch_route.calls]
+    assert versions == ["2015", "11549"]
+    # The retry patch is rebuilt from the fresh state (keeps NEW9 added meanwhile).
+    retry_body = _json.loads(patch_route.calls[1].request.content)
+    assert retry_body == {"collections": ["OLD1", "NEW9", "COLGI"]}
+    assert result["status"] == "added"
+    assert result["version"] == 11550
+    assert result["collections"] == ["OLD1", "NEW9", "COLGI"]
+
+
+@respx.mock
+def test_add_to_collection_persistent_412_raises_error_naming_item():
+    """Two 412s in a row raise ItemVersionConflictError that names the item."""
+    from zotero_mcp.web_client import ItemVersionConflictError
+
+    respx.get(f"{WEB_BASE}/users/12345/items/K8US74GH").mock(
+        return_value=httpx.Response(200, json=_item_json("K8US74GH", 7))
+    )
+    patch_route = respx.patch(f"{WEB_BASE}/users/12345/items/K8US74GH").mock(
+        return_value=httpx.Response(412)
+    )
+
+    client = WebClient(api_key="test-key", user_id="12345")
+    with pytest.raises(ItemVersionConflictError, match="K8US74GH.*412"):
+        client.add_to_collection("K8US74GH", "COLGI")
+    assert patch_route.call_count == 2, "exactly one retry"
+
+
+@respx.mock
+def test_add_to_collection_already_member_writes_nothing():
+    """If the fresh Web API state already has the collection, no PATCH is sent."""
+    respx.get(f"{WEB_BASE}/users/12345/items/ITEM1").mock(
+        return_value=httpx.Response(200, json=_item_json("ITEM1", 30, ["COLGI"]))
+    )
+    patch_route = respx.patch(f"{WEB_BASE}/users/12345/items/ITEM1")
+
+    client = WebClient(api_key="test-key", user_id="12345")
+    result = client.add_to_collection("ITEM1", "COLGI")
+
+    assert not patch_route.called
+    assert result["status"] == "already_member"
+    assert result["collections"] == ["COLGI"]
+
+
+@respx.mock
+def test_update_item_recovers_from_412_with_refetched_version():
+    """update_item re-reads and re-applies the same fields once after a 412."""
+    respx.get(f"{WEB_BASE}/users/12345/items/ITEM1").mock(
+        side_effect=[
+            httpx.Response(200, json=_item_json("ITEM1", 2015)),
+            httpx.Response(200, json=_item_json("ITEM1", 11549)),
+        ]
+    )
+    patch_route = respx.patch(f"{WEB_BASE}/users/12345/items/ITEM1").mock(
+        side_effect=[
+            httpx.Response(412),
+            httpx.Response(204, headers={"Last-Modified-Version": "11550"}),
+        ]
+    )
+
+    client = WebClient(api_key="test-key", user_id="12345")
+    result = client.update_item("ITEM1", {"journalAbbreviation": "J Clin Gastroenterol"})
+
+    assert result == {"key": "ITEM1", "version": 11550, "attempts": 2}
+    assert patch_route.calls[1].request.headers["If-Unmodified-Since-Version"] == "11549"
+
+
+@respx.mock
+def test_batch_organize_reports_per_item_failures():
+    """Each failed key carries its own reason; successes and skips are listed too."""
+    respx.get(f"{WEB_BASE}/users/12345/items/OKITEM01").mock(
+        return_value=httpx.Response(200, json=_item_json("OKITEM01", 5))
+    )
+    respx.patch(f"{WEB_BASE}/users/12345/items/OKITEM01").mock(return_value=httpx.Response(204))
+    respx.get(f"{WEB_BASE}/users/12345/items/SKIPIT01").mock(
+        return_value=httpx.Response(200, json=_item_json("SKIPIT01", 5, ["COLX"]))
+    )
+    respx.get(f"{WEB_BASE}/users/12345/items/CONFLCT1").mock(
+        return_value=httpx.Response(200, json=_item_json("CONFLCT1", 5))
+    )
+    respx.patch(f"{WEB_BASE}/users/12345/items/CONFLCT1").mock(return_value=httpx.Response(412))
+    respx.get(f"{WEB_BASE}/users/12345/items/GONEITEM").mock(
+        return_value=httpx.Response(404, text="Item not found")
+    )
+
+    client = WebClient(api_key="test-key", user_id="12345")
+    result = client.batch_organize(
+        ["OKITEM01", "SKIPIT01", "CONFLCT1", "GONEITEM"], collection_key="COLX"
+    )
+
+    assert result["updated_keys"] == ["OKITEM01"]
+    assert result["skipped_keys"] == ["SKIPIT01"]
+    assert result["failed_keys"] == ["CONFLCT1", "GONEITEM"]
+    assert result["failed_count"] == 2
+    assert "Version conflict for item CONFLCT1" in result["errors"]["CONFLCT1"]
+    assert result["errors"]["GONEITEM"].startswith("HTTP 404")
+
+
 # -- NCBI eutils API key injection (ZOT-28) --
 
 

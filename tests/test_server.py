@@ -952,3 +952,99 @@ def test_get_pdf_content_extract_text_degrades_without_pypdf():
         # purely because pypdf is missing; it returns a structured result.
         result = _json.loads(srv.get_pdf_content("K", extract_text=True))
     assert result.get("error") != "internal_error"
+
+
+# -- update_item field allowlist --
+
+
+def test_update_item_accepts_schema_v44_fields():
+    """journalAbbreviation, PMID, PMCID, seriesText, section, seriesNumber reach the client.
+
+    All are defined in the Zotero global schema v44 (PMID/PMCID and
+    journalAbbreviation on journalArticle); they were rejected by the allowlist.
+    """
+    import json as _json
+
+    import zotero_mcp.server as srv
+
+    fields = {
+        "journalAbbreviation": "J Clin Gastroenterol",
+        "PMID": "37436841",
+        "PMCID": "PMC1234567",
+        "seriesText": "Series B",
+        "section": "Health",
+        "seriesNumber": "12",
+    }
+    with patch.object(srv, "_get_web") as mock_web:
+        mock_web.return_value.update_item.return_value = {"key": "ABCD2345", "version": 9}
+        result = _json.loads(srv.update_item("ABCD2345", fields))
+    assert result == {"key": "ABCD2345", "version": 9}
+    mock_web.return_value.update_item.assert_called_once_with("ABCD2345", fields)
+
+
+def test_update_item_still_rejects_citation_key_with_extra_hint():
+    """citationKey stays blocked: Better BibTeX pins keys via Extra."""
+    import json as _json
+
+    import zotero_mcp.server as srv
+
+    with patch.object(srv, "_get_web") as mock_web:
+        result = _json.loads(srv.update_item("ABCD2345", {"citationKey": "soroush2026"}))
+    assert result["error"] == "invalid_input"
+    assert "Citation Key:" in result["message"]
+    mock_web.return_value.update_item.assert_not_called()
+
+
+# -- stale-read bypass and version-conflict surfacing --
+
+
+def test_get_item_source_web_bypasses_local_desktop_copy():
+    """source='web' reads the cloud record even when desktop is available."""
+    import json as _json
+
+    import zotero_mcp.server as srv
+
+    mock_local = MagicMock()
+    mock_local.get_item.return_value = {"key": "ABCD2345", "version": 2015, "collections": []}
+    mock_web = MagicMock()
+    mock_web.get_item.return_value = {"key": "ABCD2345", "version": 11549, "collections": ["C"]}
+    with (
+        patch.object(srv, "_get_local", return_value=mock_local),
+        patch.object(srv, "_get_web", return_value=mock_web),
+    ):
+        fresh = _json.loads(srv.get_item("ABCD2345", source="web"))
+        default = _json.loads(srv.get_item("ABCD2345"))
+    assert fresh["version"] == 11549
+    assert default["version"] == 2015  # auto keeps the fast local path
+    mock_web.get_item.assert_called_once_with("ABCD2345", fmt="json")
+
+
+def test_version_conflict_maps_to_structured_error_naming_item():
+    """A persistent 412 surfaces as error=version_conflict with the item key."""
+    import json as _json
+
+    import zotero_mcp.server as srv
+    from zotero_mcp.web_client import ItemVersionConflictError
+
+    with patch.object(srv, "_get_web") as mock_web:
+        mock_web.return_value.add_to_collection.side_effect = ItemVersionConflictError(
+            "Version conflict for item ABCD2345: HTTP 412 twice"
+        )
+        result = _json.loads(srv.add_to_collection("ABCD2345", "COLL2345"))
+    assert result["error"] == "version_conflict"
+    assert result["status_code"] == 412
+    assert "ABCD2345" in result["message"]
+
+
+def test_find_duplicates_limit_is_a_scan_bound_not_page_size():
+    """limit=3000 reaches the client (the old 100 clamp capped scans at one page)."""
+    import json as _json
+
+    import zotero_mcp.server as srv
+
+    with patch.object(srv, "_get_web") as mock_web:
+        mock_web.return_value.find_duplicates.return_value = {"total_groups": 0}
+        _json.loads(srv.find_duplicates(limit=3000))
+        mock_web.return_value.find_duplicates.assert_called_once_with(None, 3000)
+        srv.find_duplicates(limit=10**9)
+        assert mock_web.return_value.find_duplicates.call_args.args[1] == srv._MAX_DEDUP_SCAN

@@ -18,6 +18,8 @@ import httpx
 from zotero_mcp import __version__
 
 if TYPE_CHECKING:
+    from collections.abc import Callable
+
     from zotero_mcp.local_client import LocalClient
 
 logger = logging.getLogger(__name__)
@@ -624,6 +626,184 @@ def _retry_request(
     return resp
 
 
+class ItemVersionConflictError(RuntimeError):
+    """A read-modify-write PATCH kept failing with HTTP 412 after a fresh re-read."""
+
+
+def _describe_write_error(exc: Exception) -> str:
+    """One-line, per-item reason for a failed write (bounded API body)."""
+    if isinstance(exc, httpx.HTTPStatusError):
+        body = (exc.response.text or "").strip().replace("\n", " ")[:200]
+        return f"HTTP {exc.response.status_code}: {body}".rstrip(": ")
+    return f"{exc.__class__.__name__}: {exc}"
+
+
+# -- Library-wide duplicate detection helpers (find_duplicates) --
+
+# Item types that are never bibliographic records. Child attachments/notes are
+# already excluded by /items/top, but standalone ones are top-level.
+_NON_BIBLIOGRAPHIC_TYPES = frozenset({"attachment", "note", "annotation"})
+_DEDUP_PAGE_SIZE = 100  # Zotero API max per page
+_DOI_PREFIX_RE = re.compile(r"^(?:https?://(?:dx\.)?doi\.org/|doi:\s*)", re.IGNORECASE)
+_EXTRA_DOI_RE = re.compile(r"^\s*DOI:\s*(\S+)\s*$", re.IGNORECASE | re.MULTILINE)
+_TITLE_STOPWORDS = frozenset(
+    {"a", "an", "and", "as", "at", "by", "for", "from", "in", "is", "of", "on", "the", "to", "with"}
+)
+# Titles shorter than this (in words) are too generic ("Editorial", "Reply to
+# letter") for similarity alone to mean "same work".
+_MIN_TITLE_WORDS = 3
+
+
+def _normalize_doi(doi: str) -> str:
+    """Canonicalize a DOI for equality tests: strip resolver prefixes, lowercase.
+
+    DOIs are case-insensitive; Zotero stores them verbatim, so ``10.1016/J.GIE...``
+    and ``https://doi.org/10.1016/j.gie...`` must compare equal.
+    """
+    return _DOI_PREFIX_RE.sub("", (doi or "").strip()).strip().lower()
+
+
+def _normalize_dedup_title(title: str) -> str:
+    """Lowercase, strip accents and punctuation, collapse whitespace."""
+    import unicodedata
+
+    t = unicodedata.normalize("NFKD", title or "")
+    t = "".join(ch for ch in t if not unicodedata.combining(ch)).lower()
+    t = re.sub(r"[^\w\s]", " ", t)
+    return re.sub(r"\s+", " ", t).strip()
+
+
+def _dedup_record(data: dict) -> dict:
+    """Project a raw Zotero item ``data`` dict to the fields dedup needs.
+
+    Item types without a DOI field (e.g. bookSection) keep it as a
+    ``DOI: ...`` line in Extra; that is read as a fallback.
+    """
+    doi = data.get("DOI") or ""
+    if not doi:
+        m = _EXTRA_DOI_RE.search(data.get("extra") or "")
+        doi = m.group(1) if m else ""
+    return {
+        "key": data.get("key", ""),
+        "title": data.get("title", ""),
+        "date": data.get("date", ""),
+        "item_type": data.get("itemType", ""),
+        "doi": _normalize_doi(doi),
+    }
+
+
+def _cluster_by_title(records: list[dict], threshold: float) -> list[dict]:
+    """Group records whose normalized titles are near-identical.
+
+    Runs over every parent record, DOI-bearing ones included, so the same
+    paper filed under two DOIs (dual publication, or preprint plus journal
+    version) is found. Pairs that share one DOI are skipped because the DOI
+    phase already reports them.
+
+    Candidate pairs come from blocking on the first and last three
+    non-stopword title tokens, so cost stays near-linear for a few thousand
+    items instead of O(n^2) SequenceMatcher calls. Within a block, a length
+    bound and ``quick_ratio`` prune before the full ratio. A pair whose
+    titles carry different numbers ("Global cancer statistics 2020" vs
+    "... 2022", "Part 1" vs "Part 2") is never grouped: those are distinct
+    works, however similar the wording.
+
+    Args:
+        records: Dicts from ``_dedup_record``.
+        threshold: Minimum SequenceMatcher ratio (0-1).
+
+    Returns:
+        Title-similarity group dicts, in first-seen order.
+    """
+    from difflib import SequenceMatcher
+
+    norms: list[str] = []
+    numbers: list[tuple[str, ...]] = []
+    blocks: dict[tuple, list[int]] = {}
+    for idx, rec in enumerate(records):
+        norm = _normalize_dedup_title(rec["title"])
+        norms.append(norm)
+        numbers.append(tuple(sorted(re.findall(r"\d+", norm))))
+        words = norm.split()
+        if len(words) < _MIN_TITLE_WORDS:
+            continue
+        tokens = [w for w in words if w not in _TITLE_STOPWORDS] or words
+        blocks.setdefault(("head", tuple(tokens[:3])), []).append(idx)
+        blocks.setdefault(("tail", tuple(tokens[-3:])), []).append(idx)
+
+    parent = list(range(len(records)))
+
+    def _find(i: int) -> int:
+        while parent[i] != i:
+            parent[i] = parent[parent[i]]
+            i = parent[i]
+        return i
+
+    edge_ratio: dict[tuple[int, int], float] = {}
+    seen: set[tuple[int, int]] = set()
+    for members in blocks.values():
+        if len(members) < 2:
+            continue
+        for pos, i in enumerate(members):
+            # One matcher per anchor: SequenceMatcher caches its analysis of
+            # seq2, so only seq1 is swapped per candidate.
+            sm = SequenceMatcher(None, autojunk=False)
+            sm.set_seq2(norms[i])
+            for j in members[pos + 1 :]:
+                pair = (i, j) if i < j else (j, i)
+                if pair in seen:
+                    continue
+                seen.add(pair)
+                if records[i]["doi"] and records[i]["doi"] == records[j]["doi"]:
+                    continue
+                if numbers[i] != numbers[j]:
+                    continue
+                a, b = norms[i], norms[j]
+                if 2 * min(len(a), len(b)) / (len(a) + len(b)) < threshold:
+                    continue
+                sm.set_seq1(b)
+                if sm.quick_ratio() < threshold:
+                    continue
+                ratio = sm.ratio()
+                if ratio >= threshold:
+                    edge_ratio[pair] = ratio
+                    parent[_find(i)] = _find(j)
+
+    clusters: dict[int, list[int]] = {_find(i): [] for i, _ in edge_ratio}
+    for idx in range(len(records)):
+        root = _find(idx)
+        if root in clusters:
+            clusters[root].append(idx)
+
+    groups: list[dict] = []
+    for members in sorted(clusters.values(), key=min):
+        member_set = set(members)
+        ratios = [r for (i, j), r in edge_ratio.items() if i in member_set and j in member_set]
+        dois = sorted({records[i]["doi"] for i in members if records[i]["doi"]})
+        groups.append(
+            {
+                "match_type": "title_similarity",
+                "similarity": round(min(ratios), 3),
+                # Two or more distinct DOIs behind one title is not proof of a
+                # duplicate record: it may be a dual publication (e.g. a joint
+                # society guideline in two journals) or a preprint plus its
+                # journal version. Flag it for review rather than merging.
+                "confidence": "possible_dual_publication" if len(dois) >= 2 else "likely_duplicate",
+                "dois": dois,
+                "items": [
+                    {
+                        "key": records[i]["key"],
+                        "title": records[i]["title"],
+                        "date": records[i]["date"],
+                        "doi": records[i]["doi"],
+                    }
+                    for i in members
+                ],
+            }
+        )
+    return groups
+
+
 class WebClient:
     """Primary client for Zotero Web API — handles reads and writes.
 
@@ -1041,138 +1221,154 @@ class WebClient:
 
         return None
 
+    def _top_items_page(
+        self, collection_key: str | None, start: int, limit: int
+    ) -> tuple[list[dict], int | None]:
+        """One page of top-level, non-attachment items via the Web API.
+
+        ``/items/top`` drops child attachments and notes server-side, and
+        ``itemType=-attachment`` drops standalone attachments (the API honors
+        only a single negated type, so notes are filtered by the caller).
+        Trashed items are excluded by default on these endpoints.
+
+        Returns:
+            (raw item list, ``Total-Results`` header value or None).
+        """
+        path = f"/collections/{collection_key}/items/top" if collection_key else "/items/top"
+        params = {"limit": limit, "start": start, "itemType": "-attachment", "format": "json"}
+        resp = self._read_get(path, params=params, timeout=SEARCH_TIMEOUT)
+        resp.raise_for_status()
+        total = resp.headers.get("Total-Results", "")
+        return resp.json(), int(total) if total.isdigit() else None
+
+    def _fetch_dedup_records(
+        self, collection_key: str | None, max_items: int
+    ) -> tuple[list[dict], dict]:
+        """Page through top-level items until ``max_items`` parent records.
+
+        ``max_items`` bounds *bibliographic* records, not raw API rows, so
+        attachments and notes can no longer consume the scan budget. Uses the
+        local desktop API when available (no rate limits) and restarts on the
+        Web API if any local page fails.
+
+        Returns:
+            (records from ``_dedup_record``, coverage dict with
+            ``scanned_items``, ``total_available``, ``truncated``, ``source``).
+        """
+        sources: list[tuple[str, Callable]] = []
+        if self._local is not None:
+            sources.append(("local", self._local.top_items_page))
+        sources.append(("web", self._top_items_page))
+
+        for name, fetch_page in sources:
+            records: list[dict] = []
+            total: int | None = None
+            truncated = False
+            start = 0
+            try:
+                while True:
+                    page, page_total = fetch_page(collection_key, start, _DEDUP_PAGE_SIZE)
+                    if page_total is not None:
+                        total = page_total
+                    for raw in page:
+                        data = raw.get("data", raw) if isinstance(raw, dict) else {}
+                        if (data.get("itemType") or "") in _NON_BIBLIOGRAPHIC_TYPES:
+                            continue
+                        if data.get("deleted") or data.get("parentItem"):
+                            continue
+                        if len(records) >= max_items:
+                            truncated = True
+                            break
+                        records.append(_dedup_record(data))
+                    start += len(page)
+                    if truncated or not page:
+                        break
+                    # Trust Total-Results when present (a server may cap pages
+                    # below the requested size); otherwise a short page ends it.
+                    if total is not None:
+                        if start >= total:
+                            break
+                    elif len(page) < _DEDUP_PAGE_SIZE:
+                        break
+            except (RuntimeError, httpx.HTTPError) as exc:
+                if name == "web":
+                    raise
+                logger.debug("find_duplicates: local scan failed (%s); using Web API", exc)
+                continue
+            return records, {
+                "scanned_items": len(records),
+                "total_available": total,
+                "truncated": truncated,
+                "source": name,
+            }
+        raise AssertionError("unreachable: the web source either returns or raises")
+
     def find_duplicates(
         self,
         collection_key: str | None = None,
-        limit: int = 100,
+        limit: int = 5000,
         title_threshold: float = 0.85,
     ) -> dict:
-        """Scan library for duplicate items.
+        """Scan the library (or one collection) for duplicate parent items.
 
-        Groups by exact DOI match, then clusters remaining items by
-        normalized title similarity.
+        Phase 1 groups records by normalized DOI (case-insensitive, resolver
+        prefixes stripped). Phase 2 clusters every parent record, DOI-bearing
+        ones included, by normalized title similarity. A title cluster whose
+        members carry two or more distinct DOIs is flagged
+        ``confidence: possible_dual_publication`` rather than reported as a
+        certain duplicate.
+
+        History (2026-10-01): the previous version fetched ``limit`` raw rows
+        in a single request (the API serves at most 100), let attachments
+        consume that budget before filtering them out, and ran title matching
+        only on DOI-less items. On a 1,474-item library with 1,636 attachments
+        it returned 0 groups while a known same-DOI pair was live.
 
         Args:
             collection_key: Optional collection to scope the scan.
-            limit: Max items to scan.
+            limit: Max parent (bibliographic) records to scan.
             title_threshold: Similarity ratio for title matching (0-1).
 
         Returns:
-            Dict with duplicate_groups, total_groups, total_duplicate_items.
+            Dict with duplicate_groups, total_groups, total_duplicate_items,
+            possible_dual_publication_groups, and scan coverage
+            (scanned_items, total_available, truncated, source).
         """
-        import re as _re
-        from difflib import SequenceMatcher
-
-        def _normalize(t: str) -> str:
-            t = t.lower().strip()
-            t = _re.sub(r"[^\w\s]", "", t)
-            t = _re.sub(r"\s+", " ", t)
-            return t
-
-        # Fetch items
-        if collection_key:
-            if self._local:
-                try:
-                    items = self._local.get_collection_items(collection_key, limit)
-                except RuntimeError:
-                    items = self.get_collection_items(collection_key, limit)
-            else:
-                items = self.get_collection_items(collection_key, limit)
-        else:
-            if self._local:
-                try:
-                    items = self._local.search_items("", limit)
-                except RuntimeError:
-                    items = self.search_items("", limit)
-            else:
-                items = self.search_items("", limit)
-
-        # Duplicate detection is about bibliographic records only. Child
-        # attachments and notes carry generic, near-identical titles
-        # ("Snapshot", "arXiv.org Snapshot", "PubMed entry") that trivially
-        # clear the similarity threshold, so they form huge bogus groups that
-        # consume the result budget and mask real DOI matches. Observed
-        # 2026-08-30: 3 groups / 50 attachment items returned while a known
-        # live DOI duplicate went unreported.
-        items = [
-            it
-            for it in items
-            if (it.get("item_type") or it.get("itemType") or "") not in ("attachment", "note")
-        ]
+        records, coverage = self._fetch_dedup_records(collection_key, limit)
 
         groups: list[dict] = []
 
-        # Phase 1: Group by exact DOI
+        # Phase 1: exact (normalized) DOI
         doi_map: dict[str, list[dict]] = {}
-        no_doi_items: list[dict] = []
-        for item in items:
-            doi = (item.get("DOI") or "").strip().lower()
-            if doi:
-                doi_map.setdefault(doi, []).append(item)
-            else:
-                no_doi_items.append(item)
-
+        for rec in records:
+            if rec["doi"]:
+                doi_map.setdefault(rec["doi"], []).append(rec)
         for doi, group_items in doi_map.items():
             if len(group_items) >= 2:
                 groups.append(
                     {
                         "match_type": "doi",
                         "doi": doi,
+                        "confidence": "duplicate",
                         "items": [
-                            {
-                                "key": i["key"],
-                                "title": i["title"],
-                                "date": i.get("date", ""),
-                            }
-                            for i in group_items
+                            {"key": r["key"], "title": r["title"], "date": r["date"]}
+                            for r in group_items
                         ],
                     }
                 )
 
-        # Phase 2: Cluster remaining items by title similarity
-        used: set[str] = set()
-        for i, item_a in enumerate(no_doi_items):
-            if item_a["key"] in used:
-                continue
-            norm_a = _normalize(item_a.get("title", ""))
-            if not norm_a:
-                continue
-            cluster = [item_a]
-            first_ratio = 0.0
-            for item_b in no_doi_items[i + 1 :]:
-                if item_b["key"] in used:
-                    continue
-                norm_b = _normalize(item_b.get("title", ""))
-                if not norm_b:
-                    continue
-                ratio = SequenceMatcher(None, norm_a, norm_b).ratio()
-                if ratio >= title_threshold:
-                    if not cluster[1:]:
-                        first_ratio = ratio
-                    cluster.append(item_b)
-                    used.add(item_b["key"])
-            if len(cluster) >= 2:
-                used.add(item_a["key"])
-                groups.append(
-                    {
-                        "match_type": "title_similarity",
-                        "similarity": round(first_ratio, 3),
-                        "items": [
-                            {
-                                "key": i["key"],
-                                "title": i["title"],
-                                "date": i.get("date", ""),
-                            }
-                            for i in cluster
-                        ],
-                    }
-                )
+        # Phase 2: title similarity across all parent records
+        title_groups = _cluster_by_title(records, title_threshold)
+        groups.extend(title_groups)
 
-        total_dup_items = sum(len(g["items"]) for g in groups)
         return {
             "duplicate_groups": groups,
             "total_groups": len(groups),
-            "total_duplicate_items": total_dup_items,
+            "total_duplicate_items": sum(len(g["items"]) for g in groups),
+            "possible_dual_publication_groups": sum(
+                1 for g in title_groups if g["confidence"] == "possible_dual_publication"
+            ),
+            **coverage,
         }
 
     def _extract_created_key(self, result: dict) -> str:
@@ -2000,8 +2196,10 @@ class WebClient:
     ) -> dict:
         """Add tags and/or collection to multiple items in one operation.
 
-        Reads each item locally, merges tags/collection, PATCHes via Web API.
-        Uses parallel fetching for performance.
+        Each item goes through ``_patch_item_rmw``: a Web API read (never
+        the local desktop copy, whose version can lag the cloud by thousands),
+        a merge of the new tags/collection, and a versioned PATCH that is
+        re-read and retried once on HTTP 412.
 
         Args:
             item_keys: List of Zotero item keys to organize.
@@ -2009,98 +2207,148 @@ class WebClient:
             collection_key: Optional collection to add all items to.
 
         Returns:
-            Dict with updated count, failed keys, and skipped keys.
+            Dict with counts, ``updated_keys``, ``skipped_keys`` (already in
+            the desired state), ``failed_keys``, and ``errors`` mapping each
+            failed key to the reason, so a caller can tell exactly which
+            writes did not land and why.
         """
-        from concurrent.futures import ThreadPoolExecutor, as_completed
+        from concurrent.futures import ThreadPoolExecutor
 
-        results: dict = {"updated": [], "failed": [], "skipped": []}
-
-        # Parallel read from local API
-        items: dict[str, dict] = {}
-        with ThreadPoolExecutor(max_workers=3) as pool:
-            futures = {pool.submit(self._read_item, key): key for key in item_keys}
-            for future in as_completed(futures):
-                key = futures[future]
-                try:
-                    items[key] = future.result()
-                except Exception:
-                    results["failed"].append(key)
-
-        # Apply tags and collection to each item
-        for key, item in items.items():
-            version = item.get("version", 0)
+        def _build(item: dict) -> dict:
             patch: dict = {}
-
             if tags:
                 existing_tags = item.get("tags", [])
                 existing_tag_names = {t.get("tag", "") for t in existing_tags}
                 new_tags = [{"tag": t} for t in tags if t not in existing_tag_names]
                 if new_tags:
                     patch["tags"] = existing_tags + new_tags
-
             if collection_key:
                 existing_collections = item.get("collections", [])
                 if collection_key not in existing_collections:
                     patch["collections"] = existing_collections + [collection_key]
+            return patch
 
-            if not patch:
-                results["skipped"].append(key)
-                continue
-
+        def _one(key: str) -> tuple[str, str, str]:
             try:
-                resp = self._web_client.patch(
-                    f"/items/{key}",
-                    headers={"If-Unmodified-Since-Version": str(version)},
-                    json=patch,
-                )
-                if resp.status_code == 412:
-                    # Version conflict — re-read and retry once
-                    item = self._read_item(key)
-                    version = item.get("version", 0)
-                    new_patch: dict = {}
-                    if tags:
-                        existing_tags = item.get("tags", [])
-                        existing_tag_names = {t.get("tag", "") for t in existing_tags}
-                        new_tags = [{"tag": t} for t in tags if t not in existing_tag_names]
-                        if new_tags:
-                            new_patch["tags"] = existing_tags + new_tags
-                    if collection_key:
-                        existing_collections = item.get("collections", [])
-                        if collection_key not in existing_collections:
-                            new_patch["collections"] = existing_collections + [collection_key]
-                    if new_patch:
-                        resp = self._web_client.patch(
-                            f"/items/{key}",
-                            headers={"If-Unmodified-Since-Version": str(version)},
-                            json=new_patch,
-                        )
-                        resp.raise_for_status()
-                        results["updated"].append(key)
-                    else:
-                        results["skipped"].append(key)
-                elif resp.status_code == 429:
-                    retry_after = _parse_retry_after(resp.headers.get("Retry-After"), 5.0)
-                    time.sleep(min(retry_after, 10))
-                    resp = self._web_client.patch(
-                        f"/items/{key}",
-                        headers={"If-Unmodified-Since-Version": str(version)},
-                        json=patch,
-                    )
-                    resp.raise_for_status()
-                    results["updated"].append(key)
+                outcome = self._patch_item_rmw(key, _build)
+            except Exception as exc:
+                logger.warning("batch_organize: %s failed: %s", key, exc)
+                return key, "failed", _describe_write_error(exc)
+            return key, outcome["status"], ""
+
+        updated: list[str] = []
+        skipped: list[str] = []
+        failed: list[str] = []
+        errors: dict[str, str] = {}
+        with ThreadPoolExecutor(max_workers=3) as pool:
+            # pool.map preserves input order in the reported key lists.
+            for key, status, error in pool.map(_one, item_keys):
+                if status == "updated":
+                    updated.append(key)
+                elif status == "unchanged":
+                    skipped.append(key)
                 else:
-                    resp.raise_for_status()
-                    results["updated"].append(key)
-            except Exception:
-                results["failed"].append(key)
+                    failed.append(key)
+                    errors[key] = error
 
         return {
-            "updated_count": len(results["updated"]),
-            "failed_count": len(results["failed"]),
-            "skipped_count": len(results["skipped"]),
-            "updated_keys": results["updated"],
-            "failed_keys": results["failed"],
+            "updated_count": len(updated),
+            "failed_count": len(failed),
+            "skipped_count": len(skipped),
+            "updated_keys": updated,
+            "skipped_keys": skipped,
+            "failed_keys": failed,
+            "errors": errors,
         }
+
+    def _patch_item_rmw(
+        self,
+        item_key: str,
+        build_patch: Callable[[dict], dict],
+        item: dict | None = None,
+    ) -> dict:
+        """Versioned read-modify-write of one item, with one retry on HTTP 412.
+
+        The version sent as ``If-Unmodified-Since-Version`` always comes from
+        a Web API read of the item (``_read_item``) or from a caller-supplied
+        ``item`` that itself came from the Web API. On 412 the item is re-read
+        from the Web API, the patch is rebuilt against the fresh state, and
+        the PATCH is retried once. If the fresh state already satisfies the
+        change, nothing is written.
+
+        History: the local desktop API (ZOT-44) and the ``get_item`` tool's
+        local-first read both return the desktop's last-synced version, seen
+        on 2026-09-19 as 2015 against a cloud version of 11549, which the API
+        rejects with 412.
+
+        Args:
+            item_key: Zotero item key.
+            build_patch: Maps the current item data to the PATCH body; an
+                empty dict means "already in the desired state".
+            item: Optional pre-read Web API item data for the first attempt.
+
+        Returns:
+            Dict with ``status`` ("updated" or "unchanged"), ``version`` (the
+            library version after the write, or the item version if
+            unchanged), ``item`` (data the patch was built from), ``patch``,
+            and ``attempts``.
+
+        Raises:
+            ItemVersionConflictError: if the retry also returns 412.
+            httpx.HTTPStatusError: on any other non-2xx response.
+        """
+        sent_versions: list[str] = []
+        for attempt in (1, 2):
+            if item is None or attempt == 2:
+                item = self._read_item(item_key)
+            raw_version = item.get("version")
+            if raw_version in (None, ""):
+                raise RuntimeError(
+                    f"Zotero Web API returned no version for item {item_key}; "
+                    "refusing to write without optimistic locking."
+                )
+            version = str(raw_version)
+            patch = build_patch(item)
+            if not patch:
+                return {
+                    "status": "unchanged",
+                    "version": int(version),
+                    "item": item,
+                    "patch": {},
+                    "attempts": attempt,
+                }
+            sent_versions.append(version)
+            resp = _retry_request(
+                lambda v=version, p=patch: self._web_client.patch(
+                    f"/items/{item_key}",
+                    headers={"If-Unmodified-Since-Version": v},
+                    json=p,
+                )
+            )
+            if resp.status_code == 412:
+                logger.warning(
+                    "PATCH %s returned 412 with version %s (attempt %d); re-reading from Web API",
+                    item_key,
+                    version,
+                    attempt,
+                )
+                continue
+            resp.raise_for_status()
+            new_version = resp.headers.get("Last-Modified-Version", "")
+            return {
+                "status": "updated",
+                "version": int(new_version) if new_version.isdigit() else int(version),
+                "item": item,
+                "patch": patch,
+                "attempts": attempt,
+            }
+        raise ItemVersionConflictError(
+            f"Version conflict for item {item_key}: the Zotero Web API returned "
+            f"HTTP 412 twice (sent versions {', '.join(sent_versions)}), even after "
+            "re-reading the item from the Web API. The item is being modified "
+            "concurrently (for example by a Zotero desktop sync). Nothing was "
+            "written; retry later."
+        )
 
     def create_collection(self, name: str, parent_key: str | None = None) -> dict:
         """Create a new collection (folder) in Zotero.
@@ -2127,66 +2375,63 @@ class WebClient:
     def add_to_collection(self, item_key: str, collection_key: str) -> dict:
         """Add an existing item to a collection.
 
-        Reads item from local API, appends collection, PATCHes via Web API.
+        Reads the item from the Web API, appends the collection, and PATCHes
+        with the cloud version; a 412 triggers one re-read and retry (see
+        ``_patch_item_rmw``).
 
         Args:
             item_key: Zotero item key.
             collection_key: Collection key to add the item to.
 
         Returns:
-            Dict with item_key and updated collections list.
+            Dict with item_key, the item's collections after the write (as
+            confirmed against the Web API, not the local desktop copy),
+            ``status`` ("added" or "already_member"), and ``version``.
+
+        Raises:
+            ItemVersionConflictError: if the PATCH 412s again after a re-read.
         """
-        item = self._read_item(item_key)
-        version = item.get("version", 0)
-        collections = list(set(item.get("collections", []) + [collection_key]))
 
-        resp = _retry_request(
-            lambda: self._web_client.patch(
-                f"/items/{item_key}",
-                headers={"If-Unmodified-Since-Version": str(version)},
-                json={"collections": collections},
-            )
+        def _build(item: dict) -> dict:
+            existing = list(item.get("collections", []))
+            if collection_key in existing:
+                return {}
+            return {"collections": existing + [collection_key]}
+
+        outcome = self._patch_item_rmw(item_key, _build)
+        collections = outcome["patch"].get("collections") or list(
+            outcome["item"].get("collections", [])
         )
-        resp.raise_for_status()
-
-        return {"item_key": item_key, "collections": collections}
+        return {
+            "item_key": item_key,
+            "collections": collections,
+            "status": "added" if outcome["status"] == "updated" else "already_member",
+            "version": outcome["version"],
+            "verified_via": "web_api",
+        }
 
     def update_item(self, item_key: str, fields: dict) -> dict:
         """Update metadata fields on an existing item.
 
-        Uses read-modify-write with version for optimistic locking.
+        Uses read-modify-write with the Web API item version for optimistic
+        locking. On HTTP 412 the item is re-read from the Web API and the same
+        field values are re-applied once (``_patch_item_rmw``); only the named
+        fields are written, so concurrent edits to other fields survive.
 
         Args:
             item_key: Zotero item key.
             fields: Dict of field names to new values.
 
         Returns:
-            Dict with key and version.
+            Dict with key, version (from ``Last-Modified-Version``), and
+            ``attempts`` (2 means a stale version was refreshed after a 412).
 
         Raises:
-            RuntimeError: On 412 version conflict.
+            ItemVersionConflictError: (a RuntimeError) if the retry also 412s.
         """
-        item = self._read_item(item_key)
-        version = item.get("version", 0)
-
-        resp = _retry_request(
-            lambda: self._web_client.patch(
-                f"/items/{item_key}",
-                headers={"If-Unmodified-Since-Version": str(version)},
-                json=fields,
-            )
-        )
-
-        if resp.status_code == 412:
-            raise RuntimeError(
-                f"Version conflict for item {item_key}. "
-                "The item was modified since it was read. Please retry."
-            )
-        resp.raise_for_status()
-
-        new_version = int(resp.headers.get("Last-Modified-Version", version))
-        logger.info("Updated item %s to version %d", item_key, new_version)
-        return {"key": item_key, "version": new_version}
+        outcome = self._patch_item_rmw(item_key, lambda _item: dict(fields))
+        logger.info("Updated item %s to version %s", item_key, outcome["version"])
+        return {"key": item_key, "version": outcome["version"], "attempts": outcome["attempts"]}
 
     def _library_version(self) -> str:
         """Fetch the current library version for If-Unmodified-Since-Version (ZOT-25).
@@ -2473,17 +2718,22 @@ class WebClient:
         updated: list[str] = []
         failed: list[str] = []
 
+        def _build(data: dict) -> dict:
+            tags = data.get("tags", [])
+            if not any(t.get("tag") == old_tag for t in tags):
+                return {}
+            return {"tags": [{"tag": new_tag} if t.get("tag") == old_tag else t for t in tags]}
+
         def _patch_item(item: dict) -> tuple[str, bool]:
             key = item["data"]["key"]
-            version = item["data"].get("version", 0)
-            tags = item["data"].get("tags", [])
-            new_tags = [{"tag": new_tag} if t["tag"] == old_tag else t for t in tags]
-            patch_resp = self._web_client.patch(
-                f"/items/{key}",
-                json={"tags": new_tags},
-                headers={"If-Unmodified-Since-Version": str(version)},
-            )
-            return key, patch_resp.status_code in (200, 204)
+            try:
+                # The listing above came from the Web API, so its version is
+                # the cloud version; a 412 re-reads and retries once.
+                self._patch_item_rmw(key, _build, item=item["data"])
+            except Exception as exc:
+                logger.warning("rename_tag: %s failed: %s", key, exc)
+                return key, False
+            return key, True
 
         with ThreadPoolExecutor(max_workers=5) as pool:
             futures = {pool.submit(_patch_item, item): item for item in items}
