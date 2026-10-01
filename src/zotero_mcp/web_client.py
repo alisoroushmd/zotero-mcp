@@ -18,6 +18,8 @@ import httpx
 from zotero_mcp import __version__
 
 if TYPE_CHECKING:
+    from collections.abc import Callable
+
     from zotero_mcp.local_client import LocalClient
 
 logger = logging.getLogger(__name__)
@@ -150,6 +152,384 @@ def _extract_arxiv_id(doi: str) -> str:
     return m.group(1) if m else ""
 
 
+# ---------------------------------------------------------------------------
+# Metadata normalization (ZOT-44)
+#
+# The resolver chain (translation server → PubMed → CrossRef) returns the same
+# work spelled differently depending on which source answers first: NLM stores
+# journal titles in sentence case with subtitles, CrossRef uses publisher Title
+# Case, preprint repositories are never recorded at all, and CrossRef dates
+# collapse to a bare year whenever the first date field carries only a year.
+# The helpers below normalize whatever the chain produced before it is written
+# to Zotero, so the same journal/preprint always lands under one spelling.
+# ---------------------------------------------------------------------------
+
+#: Tokens preserved verbatim by :func:`_normalize_publication_title`.
+_TITLE_KEEP_TOKENS = {
+    "npj",
+    "eClinicalMedicine",
+    "PLoS",
+    "JAMA",
+    "BMJ",
+    "BMC",
+    "IEEE",
+    "JMIR",
+    "JCO",
+    "NEJM",
+    "AI",
+    "JAMIA",
+    "AMIA",
+    "UMLS",
+    "HL7",
+    "ICD",
+    "CPT",
+    "GI",
+    "MICCAI",
+    "ACM",
+    "ESMO",
+    "ASCO",
+}
+
+#: Particles lowercased by :func:`_normalize_publication_title` unless first.
+_TITLE_LOWER_TOKENS = {
+    "a",
+    "an",
+    "the",
+    "and",
+    "or",
+    "of",
+    "for",
+    "in",
+    "on",
+    "at",
+    "to",
+    "with",
+    "from",
+    "by",
+    "as",
+    "vs",
+}
+
+#: Hand-verified canonical forms for names the generic rules get wrong.
+#: Keys are matched case-insensitively against both the raw name and the
+#: rule-generated output (see :func:`_normalize_publication_title`).
+_PUBLICATION_TITLE_OVERRIDES: dict[str, str] = {
+    "medRxiv : the preprint server for health sciences": "medRxiv",
+    "Lancet regional health. Americas": "The Lancet Regional Health: Americas",
+    "Cell reports. Medicine": "Cell Reports Medicine",
+    "JACC. Case reports": "JACC: Case Reports",
+    "Nature reviews. Disease primers": "Nature Reviews Disease Primers",
+    "Nature reviews. Gastroenterology & hepatology": (
+        "Nature Reviews Gastroenterology & Hepatology"
+    ),
+    "The Lancet. Digital Health": "The Lancet Digital Health",
+    "Mayo Clinic proceedings. Digital health": "Mayo Clinic Proceedings: Digital Health",
+    "BMJ (Clinical research ed.)": "BMJ",
+    "Lancet (London, England)": "The Lancet",
+    "EClinicalMedicine": "eClinicalMedicine",
+    "NPJ digital medicine": "npj Digital Medicine",
+    "NPJ precision oncology": "npj Precision Oncology",
+    "PloS one": "PLoS One",
+    "IEEE transactions on bio-medical engineering": ("IEEE Transactions on Biomedical Engineering"),
+    "AMIA ... Annual Symposium proceedings. AMIA Symposium": ("AMIA Annual Symposium Proceedings"),
+    "iGIE : innovation, investigation and insights": "iGIE",
+}
+
+
+def _override_key(name: str) -> str:
+    """Normalize a publication name for override lookup (case/space-insensitive)."""
+    return " ".join(name.lower().split())
+
+
+_PUBLICATION_TITLE_LOOKUP: dict[str, str] = {
+    _override_key(k): v for k, v in _PUBLICATION_TITLE_OVERRIDES.items()
+}
+
+# NLM appends a descriptive subtitle after a colon, e.g. "Digestive endoscopy :
+# official journal of the Japan Gastroenterological Endoscopy Society".
+_NLM_SUBTITLE_TAIL = (
+    r"(?:the\s+|an?\s+)?"
+    r"(?:official|open\s+access|international|peer-reviewed|publication|journal)\b"
+)
+_NLM_SUBTITLE_RE = re.compile(rf"\s*:\s*(?={_NLM_SUBTITLE_TAIL})", re.IGNORECASE)
+# NLM place-of-publication disambiguator, e.g. "(Weinheim, Baden-Wurttemberg, Germany)".
+_NLM_PLACE_RE = re.compile(r"\s*\([A-Z][^()]*,\s*[^()]*\)\s*$")
+_NLM_PLACE_NAMED_RE = re.compile(
+    r"\s*\((?:Philadelphia|Baltimore|New York|London|Clinical research)[^)]*\)\s*$",
+    re.IGNORECASE,
+)
+_SELF_ABBREV_RE = re.compile(r"\s*:\s*([A-Z][A-Z0-9]{2,9})\s*$")
+
+
+def _is_self_abbreviation(head: str, abbrev: str) -> bool:
+    """Check whether abbrev is the initialism of head (e.g. "… Association: JAMIA")."""
+    initials = "".join(
+        word[0]
+        for word in re.findall(r"[A-Za-z]+", head)
+        if word.lower() not in _TITLE_LOWER_TOKENS
+    ).upper()
+    return initials == abbrev.upper()
+
+
+def _strip_nlm_qualifiers(name: str) -> str:
+    """Strip NLM subtitles, place qualifiers and self-abbreviations from a name."""
+    stripped = _NLM_PLACE_NAMED_RE.sub("", name)
+    stripped = _NLM_SUBTITLE_RE.split(stripped, maxsplit=1)[0]
+    stripped = _NLM_PLACE_RE.sub("", stripped)
+    match = _SELF_ABBREV_RE.search(stripped)
+    if match and _is_self_abbreviation(stripped[: match.start()], match.group(1)):
+        stripped = stripped[: match.start()]
+    return stripped.strip().rstrip(":").strip()
+
+
+def _titlecase_publication(name: str) -> str:
+    """Apply Title Case with lowercase particles and verbatim acronym tokens."""
+    parts = re.split(r"(\s+|[-/])", name)
+    out: list[str] = []
+    first = True
+    for part in parts:
+        if not part.strip() or part in ("-", "/"):
+            out.append(part)
+            continue
+        core = part.strip(".,()")
+        is_brand = (
+            core in _TITLE_KEEP_TOKENS
+            or (core.isupper() and len(core) <= 5)
+            # mixed-case brand tokens such as "eClinicalMedicine" or "bioRxiv"
+            or (not core.islower() and not core.istitle() and core[:1].islower())
+        )
+        if is_brand:
+            out.append(part)
+        elif core.lower() in _TITLE_LOWER_TOKENS and not first:
+            out.append(part.lower())
+        else:
+            out.append(part[:1].upper() + part[1:] if part[:1].islower() else part)
+        first = False
+    return "".join(out)
+
+
+def _normalize_publication_title(name: str) -> str:
+    """Normalize a journal/container name to one canonical spelling.
+
+    Applies, in order: an explicit override table, NLM subtitle/place-qualifier/
+    self-abbreviation stripping, then Title Case with lowercase particles and
+    verbatim acronym or brand tokens. The override table is consulted again on
+    the rule output so hand-verified corrections win over the generic rules.
+
+    Args:
+        name: Publication/container name as returned by a metadata source.
+
+    Returns:
+        The canonical spelling, or the input unchanged if it is empty.
+    """
+    if not name or not name.strip():
+        return name
+    cleaned = " ".join(name.split())
+    override = _PUBLICATION_TITLE_LOOKUP.get(_override_key(cleaned))
+    if override:
+        return override
+    result = _titlecase_publication(_strip_nlm_qualifiers(cleaned))
+    return _PUBLICATION_TITLE_LOOKUP.get(_override_key(result), result)
+
+
+#: DOI prefix → preprint repository name (fallback when CrossRef has no institution).
+_REPOSITORY_DOI_PREFIXES: tuple[tuple[str, str], ...] = (
+    ("10.48550/arxiv", "arXiv"),
+    ("10.2139/ssrn", "SSRN"),
+)
+
+#: URL host suffix → preprint repository name (last-resort fallback).
+_REPOSITORY_HOSTS: tuple[tuple[str, str], ...] = (
+    ("arxiv.org", "arXiv"),
+    ("medrxiv.org", "medRxiv"),
+    ("biorxiv.org", "bioRxiv"),
+)
+
+
+def _repository_from_crossref(work: dict) -> str:
+    """Return the preprint server name from a CrossRef ``institution`` entry.
+
+    CrossRef's ``group-title`` on openRxiv records is the *subject collection*
+    ("Gastroenterology"), not the server — only ``institution`` is usable here.
+    """
+    institution = work.get("institution")
+    if isinstance(institution, dict):
+        institution = [institution]
+    if isinstance(institution, list):
+        for entry in institution:
+            if isinstance(entry, dict):
+                name = (entry.get("name") or "").strip()
+            else:
+                name = str(entry).strip()
+            if name:
+                return name
+    return ""
+
+
+def _repository_from_doi(doi: str) -> str:
+    """Return the preprint repository implied by a DOI prefix, or ''."""
+    lowered = (doi or "").strip().lower()
+    for prefix, name in _REPOSITORY_DOI_PREFIXES:
+        if lowered.startswith(prefix):
+            return name
+    return ""
+
+
+def _repository_from_url(url: str) -> str:
+    """Return the preprint repository implied by a URL host, or ''."""
+    if not url:
+        return ""
+    host = (urlparse(url).hostname or "").lower()
+    if not host:
+        return ""
+    for suffix, name in _REPOSITORY_HOSTS:
+        if host == suffix or host.endswith("." + suffix):
+            return name
+    return ""
+
+
+def _infer_repository(doi: str = "", url: str = "", work: dict | None = None) -> str:
+    """Infer a preprint's repository from CrossRef institution, DOI, then URL."""
+    if work is not None:
+        name = _repository_from_crossref(work)
+        if name:
+            return name
+    return _repository_from_doi(doi) or _repository_from_url(url)
+
+
+#: CrossRef date fields, most authoritative first; ties break toward the front.
+_CROSSREF_DATE_FIELDS = ("issued", "published-print", "published-online", "created")
+
+
+def _format_date_parts(parts: list) -> str:
+    """Format CrossRef ``date-parts`` as YYYY[-MM[-DD]] with zero-padded parts."""
+    formatted: list[str] = []
+    for index, part in enumerate(parts[:3]):
+        if part is None:
+            break
+        try:
+            value = int(part)
+        except (TypeError, ValueError):
+            break
+        formatted.append(str(value) if index == 0 else f"{value:02d}")
+    return "-".join(formatted)
+
+
+def _best_crossref_date(work: dict) -> str:
+    """Pick the most complete CrossRef date across all date-bearing fields.
+
+    CrossRef often carries a year-only ``published-print`` alongside a full
+    ``published-online``/``issued`` date. Taking the first field that exists
+    (the old behavior) silently discarded month and day.
+    """
+    best: list = []
+    for field in _CROSSREF_DATE_FIELDS:
+        date_obj = work.get(field) or {}
+        if not isinstance(date_obj, dict):
+            continue
+        date_parts = date_obj.get("date-parts") or [[]]
+        parts = date_parts[0] or []
+        if len(parts) > len(best):
+            best = list(parts)
+    return _format_date_parts(best)
+
+
+_MONTH_ABBREVS = {
+    "jan": 1,
+    "feb": 2,
+    "mar": 3,
+    "apr": 4,
+    "may": 5,
+    "jun": 6,
+    "jul": 7,
+    "aug": 8,
+    "sep": 9,
+    "oct": 10,
+    "nov": 11,
+    "dec": 12,
+}
+_MONTH_RE = re.compile(rf"\b({'|'.join(_MONTH_ABBREVS)})", re.IGNORECASE)
+
+
+def _normalize_month(value: str) -> str:
+    """Normalize a PubMed month ("Jan", "1", "01") to a zero-padded number."""
+    value = (value or "").strip()
+    if not value:
+        return ""
+    if value.isdigit():
+        return f"{int(value):02d}"
+    month = _MONTH_ABBREVS.get(value[:3].lower())
+    return f"{month:02d}" if month else value
+
+
+def _parse_medline_date(text: str) -> str:
+    """Parse a PubMed ``MedlineDate`` free-text range into YYYY[-MM].
+
+    PubMed omits ``Year``/``Month`` for irregular publication dates and instead
+    emits strings like "2015 Jan-Feb" or "1998 Nov-Dec" in ``MedlineDate``.
+
+    Args:
+        text: Raw MedlineDate text.
+
+    Returns:
+        "YYYY-MM" when a leading month is present, "YYYY" when only a year is,
+        or "" when no year can be found.
+    """
+    if not text:
+        return ""
+    year_match = re.search(r"\b(\d{4})\b", text)
+    if not year_match:
+        return ""
+    year = year_match.group(1)
+    month_match = _MONTH_RE.search(text)
+    if month_match:
+        return f"{year}-{_MONTH_ABBREVS[month_match.group(1).lower()]:02d}"
+    return year
+
+
+#: Fields a second source may backfill when the first result is sparse.
+_ENRICHABLE_FIELDS = (
+    "date",
+    "publicationTitle",
+    "repository",
+    "volume",
+    "issue",
+    "pages",
+    "abstractNote",
+    "DOI",
+    "ISSN",
+    "publisher",
+    "url",
+)
+
+#: Journal-only fields that must not be copied onto a preprint item.
+_PREPRINT_INCOMPATIBLE_FIELDS = frozenset({"publicationTitle", "volume", "issue", "pages", "ISSN"})
+
+#: Container-name fields normalized by :func:`_normalize_metadata`.
+_CONTAINER_FIELDS = ("publicationTitle", "bookTitle", "proceedingsTitle")
+
+
+def _normalize_metadata(metadata: dict) -> dict:
+    """Normalize a resolved item dict in place (container name + repository).
+
+    Applies to whichever source answered, including the translation server, so
+    the same work is spelled identically regardless of the resolution path.
+    """
+    if not isinstance(metadata, dict):
+        return metadata
+    for field in _CONTAINER_FIELDS:
+        value = metadata.get(field)
+        if isinstance(value, str) and value.strip():
+            metadata[field] = _normalize_publication_title(value)
+    if metadata.get("itemType") == "preprint" and not metadata.get("repository"):
+        repository = _infer_repository(
+            doi=metadata.get("DOI", "") or "", url=metadata.get("url", "") or ""
+        )
+        if repository:
+            metadata["repository"] = _normalize_publication_title(repository)
+    return metadata
+
+
 def _fetch_pdf_with_retry(
     url: str,
     *,
@@ -244,6 +624,184 @@ def _retry_request(
             response=resp,
         )
     return resp
+
+
+class ItemVersionConflictError(RuntimeError):
+    """A read-modify-write PATCH kept failing with HTTP 412 after a fresh re-read."""
+
+
+def _describe_write_error(exc: Exception) -> str:
+    """One-line, per-item reason for a failed write (bounded API body)."""
+    if isinstance(exc, httpx.HTTPStatusError):
+        body = (exc.response.text or "").strip().replace("\n", " ")[:200]
+        return f"HTTP {exc.response.status_code}: {body}".rstrip(": ")
+    return f"{exc.__class__.__name__}: {exc}"
+
+
+# -- Library-wide duplicate detection helpers (find_duplicates) --
+
+# Item types that are never bibliographic records. Child attachments/notes are
+# already excluded by /items/top, but standalone ones are top-level.
+_NON_BIBLIOGRAPHIC_TYPES = frozenset({"attachment", "note", "annotation"})
+_DEDUP_PAGE_SIZE = 100  # Zotero API max per page
+_DOI_PREFIX_RE = re.compile(r"^(?:https?://(?:dx\.)?doi\.org/|doi:\s*)", re.IGNORECASE)
+_EXTRA_DOI_RE = re.compile(r"^\s*DOI:\s*(\S+)\s*$", re.IGNORECASE | re.MULTILINE)
+_TITLE_STOPWORDS = frozenset(
+    {"a", "an", "and", "as", "at", "by", "for", "from", "in", "is", "of", "on", "the", "to", "with"}
+)
+# Titles shorter than this (in words) are too generic ("Editorial", "Reply to
+# letter") for similarity alone to mean "same work".
+_MIN_TITLE_WORDS = 3
+
+
+def _normalize_doi(doi: str) -> str:
+    """Canonicalize a DOI for equality tests: strip resolver prefixes, lowercase.
+
+    DOIs are case-insensitive; Zotero stores them verbatim, so ``10.1016/J.GIE...``
+    and ``https://doi.org/10.1016/j.gie...`` must compare equal.
+    """
+    return _DOI_PREFIX_RE.sub("", (doi or "").strip()).strip().lower()
+
+
+def _normalize_dedup_title(title: str) -> str:
+    """Lowercase, strip accents and punctuation, collapse whitespace."""
+    import unicodedata
+
+    t = unicodedata.normalize("NFKD", title or "")
+    t = "".join(ch for ch in t if not unicodedata.combining(ch)).lower()
+    t = re.sub(r"[^\w\s]", " ", t)
+    return re.sub(r"\s+", " ", t).strip()
+
+
+def _dedup_record(data: dict) -> dict:
+    """Project a raw Zotero item ``data`` dict to the fields dedup needs.
+
+    Item types without a DOI field (e.g. bookSection) keep it as a
+    ``DOI: ...`` line in Extra; that is read as a fallback.
+    """
+    doi = data.get("DOI") or ""
+    if not doi:
+        m = _EXTRA_DOI_RE.search(data.get("extra") or "")
+        doi = m.group(1) if m else ""
+    return {
+        "key": data.get("key", ""),
+        "title": data.get("title", ""),
+        "date": data.get("date", ""),
+        "item_type": data.get("itemType", ""),
+        "doi": _normalize_doi(doi),
+    }
+
+
+def _cluster_by_title(records: list[dict], threshold: float) -> list[dict]:
+    """Group records whose normalized titles are near-identical.
+
+    Runs over every parent record, DOI-bearing ones included, so the same
+    paper filed under two DOIs (dual publication, or preprint plus journal
+    version) is found. Pairs that share one DOI are skipped because the DOI
+    phase already reports them.
+
+    Candidate pairs come from blocking on the first and last three
+    non-stopword title tokens, so cost stays near-linear for a few thousand
+    items instead of O(n^2) SequenceMatcher calls. Within a block, a length
+    bound and ``quick_ratio`` prune before the full ratio. A pair whose
+    titles carry different numbers ("Global cancer statistics 2020" vs
+    "... 2022", "Part 1" vs "Part 2") is never grouped: those are distinct
+    works, however similar the wording.
+
+    Args:
+        records: Dicts from ``_dedup_record``.
+        threshold: Minimum SequenceMatcher ratio (0-1).
+
+    Returns:
+        Title-similarity group dicts, in first-seen order.
+    """
+    from difflib import SequenceMatcher
+
+    norms: list[str] = []
+    numbers: list[tuple[str, ...]] = []
+    blocks: dict[tuple, list[int]] = {}
+    for idx, rec in enumerate(records):
+        norm = _normalize_dedup_title(rec["title"])
+        norms.append(norm)
+        numbers.append(tuple(sorted(re.findall(r"\d+", norm))))
+        words = norm.split()
+        if len(words) < _MIN_TITLE_WORDS:
+            continue
+        tokens = [w for w in words if w not in _TITLE_STOPWORDS] or words
+        blocks.setdefault(("head", tuple(tokens[:3])), []).append(idx)
+        blocks.setdefault(("tail", tuple(tokens[-3:])), []).append(idx)
+
+    parent = list(range(len(records)))
+
+    def _find(i: int) -> int:
+        while parent[i] != i:
+            parent[i] = parent[parent[i]]
+            i = parent[i]
+        return i
+
+    edge_ratio: dict[tuple[int, int], float] = {}
+    seen: set[tuple[int, int]] = set()
+    for members in blocks.values():
+        if len(members) < 2:
+            continue
+        for pos, i in enumerate(members):
+            # One matcher per anchor: SequenceMatcher caches its analysis of
+            # seq2, so only seq1 is swapped per candidate.
+            sm = SequenceMatcher(None, autojunk=False)
+            sm.set_seq2(norms[i])
+            for j in members[pos + 1 :]:
+                pair = (i, j) if i < j else (j, i)
+                if pair in seen:
+                    continue
+                seen.add(pair)
+                if records[i]["doi"] and records[i]["doi"] == records[j]["doi"]:
+                    continue
+                if numbers[i] != numbers[j]:
+                    continue
+                a, b = norms[i], norms[j]
+                if 2 * min(len(a), len(b)) / (len(a) + len(b)) < threshold:
+                    continue
+                sm.set_seq1(b)
+                if sm.quick_ratio() < threshold:
+                    continue
+                ratio = sm.ratio()
+                if ratio >= threshold:
+                    edge_ratio[pair] = ratio
+                    parent[_find(i)] = _find(j)
+
+    clusters: dict[int, list[int]] = {_find(i): [] for i, _ in edge_ratio}
+    for idx in range(len(records)):
+        root = _find(idx)
+        if root in clusters:
+            clusters[root].append(idx)
+
+    groups: list[dict] = []
+    for members in sorted(clusters.values(), key=min):
+        member_set = set(members)
+        ratios = [r for (i, j), r in edge_ratio.items() if i in member_set and j in member_set]
+        dois = sorted({records[i]["doi"] for i in members if records[i]["doi"]})
+        groups.append(
+            {
+                "match_type": "title_similarity",
+                "similarity": round(min(ratios), 3),
+                # Two or more distinct DOIs behind one title is not proof of a
+                # duplicate record: it may be a dual publication (e.g. a joint
+                # society guideline in two journals) or a preprint plus its
+                # journal version. Flag it for review rather than merging.
+                "confidence": "possible_dual_publication" if len(dois) >= 2 else "likely_duplicate",
+                "dois": dois,
+                "items": [
+                    {
+                        "key": records[i]["key"],
+                        "title": records[i]["title"],
+                        "date": records[i]["date"],
+                        "doi": records[i]["doi"],
+                    }
+                    for i in members
+                ],
+            }
+        )
+    return groups
 
 
 class WebClient:
@@ -569,15 +1127,19 @@ class WebClient:
     # -- Read helpers for read-modify-write operations --
 
     def _read_item(self, item_key: str) -> dict:
-        """Read item for read-modify-write: tries local (fast), falls back to web."""
-        if self._local:
-            try:
-                result = self._local.get_item(item_key)
-                if isinstance(result, dict):
-                    return result
-            except RuntimeError:
-                pass  # Local unavailable, fall through to web
-        # Web API read
+        """Read item for read-modify-write: always via the Web API.
+
+        This MUST NOT read from the local API. The returned ``version`` is sent
+        back as ``If-Unmodified-Since-Version`` on the subsequent PATCH, and the
+        local database carries its *own* version counter that is unrelated to the
+        cloud library version (locally 0/1/2 while the cloud item sits at e.g.
+        8724). Reading locally therefore made every read-modify-write operation
+        fail with HTTP 412 whenever Zotero desktop was running — silently, since
+        callers such as ``batch_organize`` only surface a failed-key count. The
+        412 retry path re-reads through this same helper, so a local read made
+        the retry fail identically instead of recovering.
+        """
+        # Web API read — see docstring; the local fast path is not valid here.
         result = self.get_item(item_key)
         if isinstance(result, str):
             raise RuntimeError(f"Expected dict for item {item_key}, got BibTeX string")
@@ -659,125 +1221,154 @@ class WebClient:
 
         return None
 
+    def _top_items_page(
+        self, collection_key: str | None, start: int, limit: int
+    ) -> tuple[list[dict], int | None]:
+        """One page of top-level, non-attachment items via the Web API.
+
+        ``/items/top`` drops child attachments and notes server-side, and
+        ``itemType=-attachment`` drops standalone attachments (the API honors
+        only a single negated type, so notes are filtered by the caller).
+        Trashed items are excluded by default on these endpoints.
+
+        Returns:
+            (raw item list, ``Total-Results`` header value or None).
+        """
+        path = f"/collections/{collection_key}/items/top" if collection_key else "/items/top"
+        params = {"limit": limit, "start": start, "itemType": "-attachment", "format": "json"}
+        resp = self._read_get(path, params=params, timeout=SEARCH_TIMEOUT)
+        resp.raise_for_status()
+        total = resp.headers.get("Total-Results", "")
+        return resp.json(), int(total) if total.isdigit() else None
+
+    def _fetch_dedup_records(
+        self, collection_key: str | None, max_items: int
+    ) -> tuple[list[dict], dict]:
+        """Page through top-level items until ``max_items`` parent records.
+
+        ``max_items`` bounds *bibliographic* records, not raw API rows, so
+        attachments and notes can no longer consume the scan budget. Uses the
+        local desktop API when available (no rate limits) and restarts on the
+        Web API if any local page fails.
+
+        Returns:
+            (records from ``_dedup_record``, coverage dict with
+            ``scanned_items``, ``total_available``, ``truncated``, ``source``).
+        """
+        sources: list[tuple[str, Callable]] = []
+        if self._local is not None:
+            sources.append(("local", self._local.top_items_page))
+        sources.append(("web", self._top_items_page))
+
+        for name, fetch_page in sources:
+            records: list[dict] = []
+            total: int | None = None
+            truncated = False
+            start = 0
+            try:
+                while True:
+                    page, page_total = fetch_page(collection_key, start, _DEDUP_PAGE_SIZE)
+                    if page_total is not None:
+                        total = page_total
+                    for raw in page:
+                        data = raw.get("data", raw) if isinstance(raw, dict) else {}
+                        if (data.get("itemType") or "") in _NON_BIBLIOGRAPHIC_TYPES:
+                            continue
+                        if data.get("deleted") or data.get("parentItem"):
+                            continue
+                        if len(records) >= max_items:
+                            truncated = True
+                            break
+                        records.append(_dedup_record(data))
+                    start += len(page)
+                    if truncated or not page:
+                        break
+                    # Trust Total-Results when present (a server may cap pages
+                    # below the requested size); otherwise a short page ends it.
+                    if total is not None:
+                        if start >= total:
+                            break
+                    elif len(page) < _DEDUP_PAGE_SIZE:
+                        break
+            except (RuntimeError, httpx.HTTPError) as exc:
+                if name == "web":
+                    raise
+                logger.debug("find_duplicates: local scan failed (%s); using Web API", exc)
+                continue
+            return records, {
+                "scanned_items": len(records),
+                "total_available": total,
+                "truncated": truncated,
+                "source": name,
+            }
+        raise AssertionError("unreachable: the web source either returns or raises")
+
     def find_duplicates(
         self,
         collection_key: str | None = None,
-        limit: int = 100,
+        limit: int = 5000,
         title_threshold: float = 0.85,
     ) -> dict:
-        """Scan library for duplicate items.
+        """Scan the library (or one collection) for duplicate parent items.
 
-        Groups by exact DOI match, then clusters remaining items by
-        normalized title similarity.
+        Phase 1 groups records by normalized DOI (case-insensitive, resolver
+        prefixes stripped). Phase 2 clusters every parent record, DOI-bearing
+        ones included, by normalized title similarity. A title cluster whose
+        members carry two or more distinct DOIs is flagged
+        ``confidence: possible_dual_publication`` rather than reported as a
+        certain duplicate.
+
+        History (2026-10-01): the previous version fetched ``limit`` raw rows
+        in a single request (the API serves at most 100), let attachments
+        consume that budget before filtering them out, and ran title matching
+        only on DOI-less items. On a 1,474-item library with 1,636 attachments
+        it returned 0 groups while a known same-DOI pair was live.
 
         Args:
             collection_key: Optional collection to scope the scan.
-            limit: Max items to scan.
+            limit: Max parent (bibliographic) records to scan.
             title_threshold: Similarity ratio for title matching (0-1).
 
         Returns:
-            Dict with duplicate_groups, total_groups, total_duplicate_items.
+            Dict with duplicate_groups, total_groups, total_duplicate_items,
+            possible_dual_publication_groups, and scan coverage
+            (scanned_items, total_available, truncated, source).
         """
-        import re as _re
-        from difflib import SequenceMatcher
-
-        def _normalize(t: str) -> str:
-            t = t.lower().strip()
-            t = _re.sub(r"[^\w\s]", "", t)
-            t = _re.sub(r"\s+", " ", t)
-            return t
-
-        # Fetch items
-        if collection_key:
-            if self._local:
-                try:
-                    items = self._local.get_collection_items(collection_key, limit)
-                except RuntimeError:
-                    items = self.get_collection_items(collection_key, limit)
-            else:
-                items = self.get_collection_items(collection_key, limit)
-        else:
-            if self._local:
-                try:
-                    items = self._local.search_items("", limit)
-                except RuntimeError:
-                    items = self.search_items("", limit)
-            else:
-                items = self.search_items("", limit)
+        records, coverage = self._fetch_dedup_records(collection_key, limit)
 
         groups: list[dict] = []
 
-        # Phase 1: Group by exact DOI
+        # Phase 1: exact (normalized) DOI
         doi_map: dict[str, list[dict]] = {}
-        no_doi_items: list[dict] = []
-        for item in items:
-            doi = (item.get("DOI") or "").strip().lower()
-            if doi:
-                doi_map.setdefault(doi, []).append(item)
-            else:
-                no_doi_items.append(item)
-
+        for rec in records:
+            if rec["doi"]:
+                doi_map.setdefault(rec["doi"], []).append(rec)
         for doi, group_items in doi_map.items():
             if len(group_items) >= 2:
                 groups.append(
                     {
                         "match_type": "doi",
                         "doi": doi,
+                        "confidence": "duplicate",
                         "items": [
-                            {
-                                "key": i["key"],
-                                "title": i["title"],
-                                "date": i.get("date", ""),
-                            }
-                            for i in group_items
+                            {"key": r["key"], "title": r["title"], "date": r["date"]}
+                            for r in group_items
                         ],
                     }
                 )
 
-        # Phase 2: Cluster remaining items by title similarity
-        used: set[str] = set()
-        for i, item_a in enumerate(no_doi_items):
-            if item_a["key"] in used:
-                continue
-            norm_a = _normalize(item_a.get("title", ""))
-            if not norm_a:
-                continue
-            cluster = [item_a]
-            first_ratio = 0.0
-            for item_b in no_doi_items[i + 1 :]:
-                if item_b["key"] in used:
-                    continue
-                norm_b = _normalize(item_b.get("title", ""))
-                if not norm_b:
-                    continue
-                ratio = SequenceMatcher(None, norm_a, norm_b).ratio()
-                if ratio >= title_threshold:
-                    if not cluster[1:]:
-                        first_ratio = ratio
-                    cluster.append(item_b)
-                    used.add(item_b["key"])
-            if len(cluster) >= 2:
-                used.add(item_a["key"])
-                groups.append(
-                    {
-                        "match_type": "title_similarity",
-                        "similarity": round(first_ratio, 3),
-                        "items": [
-                            {
-                                "key": i["key"],
-                                "title": i["title"],
-                                "date": i.get("date", ""),
-                            }
-                            for i in cluster
-                        ],
-                    }
-                )
+        # Phase 2: title similarity across all parent records
+        title_groups = _cluster_by_title(records, title_threshold)
+        groups.extend(title_groups)
 
-        total_dup_items = sum(len(g["items"]) for g in groups)
         return {
             "duplicate_groups": groups,
             "total_groups": len(groups),
-            "total_duplicate_items": total_dup_items,
+            "total_duplicate_items": sum(len(g["items"]) for g in groups),
+            "possible_dual_publication_groups": sum(
+                1 for g in title_groups if g["confidence"] == "possible_dual_publication"
+            ),
+            **coverage,
         }
 
     def _extract_created_key(self, result: dict) -> str:
@@ -879,6 +1470,10 @@ class WebClient:
         Tries in order: Zotero translation server, PubMed efetch,
         CrossRef. Each fallback handles different identifier types
         and produces progressively less rich metadata.
+
+        Whichever source answers first, a sparse result is backfilled from at
+        most one further source (see :meth:`_enrich_metadata`), and the merged
+        result is normalized via :func:`_normalize_metadata`.
         """
         # Try Zotero translation server first (handles everything)
         try:
@@ -890,7 +1485,7 @@ class WebClient:
             resp.raise_for_status()
             items = resp.json()
             if items and len(items) > 0:
-                return items[0]
+                return self._finalize_metadata(items[0], identifier, "translate")
         except (httpx.ConnectError, httpx.HTTPStatusError):
             logger.info("Translation server unavailable, trying fallbacks")
         except Exception:
@@ -899,18 +1494,115 @@ class WebClient:
         # Fallback 1: PubMed efetch (biomedical content, includes preprints)
         metadata = self._resolve_via_pubmed(identifier)
         if metadata:
-            return metadata
+            return self._finalize_metadata(metadata, identifier, "pubmed")
 
         # Fallback 2: CrossRef (all DOI-registered content — books, CS, etc.)
         metadata = self._resolve_via_crossref(identifier)
         if metadata:
-            return metadata
+            return self._finalize_metadata(metadata, identifier, "crossref")
 
         raise RuntimeError(
             f"No metadata found for identifier '{identifier}'. "
             f"The Zotero translation server may be down. "
             f"Try adding the item manually in Zotero."
         )
+
+    #: Sources consulted for enrichment, in the same order as the resolver chain.
+    _ENRICHMENT_CHAIN = ("translate", "pubmed", "crossref")
+
+    def _finalize_metadata(self, metadata: dict, identifier: str, source: str) -> dict:
+        """Enrich a resolved result from one further source, then normalize it.
+
+        Args:
+            metadata: The metadata dict the winning source produced.
+            identifier: The identifier being resolved (for the enrichment query).
+            source: Name of the winning source ("translate"/"pubmed"/"crossref").
+
+        Returns:
+            The (possibly enriched) metadata dict, normalized in place.
+        """
+        if self._needs_enrichment(metadata):
+            self._enrich_metadata(metadata, identifier, source)
+        return _normalize_metadata(metadata)
+
+    @staticmethod
+    def _needs_enrichment(metadata: dict) -> bool:
+        """Check whether a resolved result is sparse enough to warrant a second source."""
+        date = str(metadata.get("date") or "")
+        if "-" not in date:  # missing entirely, or year-only
+            return True
+        if metadata.get("itemType") == "preprint":
+            return not metadata.get("repository")
+        if not metadata.get("publicationTitle"):
+            return True
+        return not all(metadata.get(field) for field in ("volume", "issue", "pages"))
+
+    def _enrich_metadata(self, metadata: dict, identifier: str, source: str) -> None:
+        """Backfill missing fields from at most one further resolution source.
+
+        Only fields that are absent (or, for ``date``, strictly less complete)
+        are filled — a populated field is never overwritten. Bounded to a single
+        extra lookup per create so one resolution cannot fan out, and any
+        network failure here leaves the original metadata untouched.
+        """
+        try:
+            index = self._ENRICHMENT_CHAIN.index(source)
+        except ValueError:  # pragma: no cover - defensive
+            return
+        next_sources = self._ENRICHMENT_CHAIN[index + 1 :]
+        if not next_sources:
+            return
+
+        resolver = {
+            "pubmed": self._resolve_via_pubmed,
+            "crossref": self._resolve_via_crossref,
+        }.get(next_sources[0])
+        if resolver is None:  # pragma: no cover - defensive
+            return
+
+        try:
+            extra = resolver(identifier)
+        except Exception as exc:  # enrichment is best-effort — never fail the create
+            logger.info("Enrichment via %s failed for %s: %s", next_sources[0], identifier, exc)
+            return
+        if not extra:
+            return
+
+        filled = self._merge_metadata(metadata, extra)
+        if filled:
+            logger.info(
+                "Enriched %s metadata from %s: %s",
+                source,
+                next_sources[0],
+                ", ".join(sorted(filled)),
+            )
+
+    @staticmethod
+    def _merge_metadata(metadata: dict, extra: dict) -> list[str]:
+        """Fill missing/less-complete fields of metadata from extra, in place.
+
+        Returns:
+            The names of the fields that were filled.
+        """
+        skip = (
+            _PREPRINT_INCOMPATIBLE_FIELDS if metadata.get("itemType") == "preprint" else frozenset()
+        )
+        filled: list[str] = []
+        for field in _ENRICHABLE_FIELDS:
+            value = extra.get(field)
+            if not value or field in skip:
+                continue
+            current = metadata.get(field)
+            if field == "date":
+                # A date is "less complete" when it carries fewer components.
+                if str(value).count("-") > str(current or "").count("-"):
+                    metadata[field] = value
+                    filled.append(field)
+                continue
+            if not current:
+                metadata[field] = value
+                filled.append(field)
+        return filled
 
     def _resolve_via_pubmed(self, identifier: str) -> dict | None:
         """Resolve PMID or DOI via PubMed efetch XML.
@@ -1023,7 +1715,7 @@ class WebClient:
         date = ""
         issn = ""
         if journal_el is not None:
-            journal_title = journal_el.findtext("Title", "")
+            journal_title = _normalize_publication_title(journal_el.findtext("Title", ""))
             ji = journal_el.find("JournalIssue")
             if ji is not None:
                 volume = ji.findtext("Volume", "")
@@ -1031,9 +1723,16 @@ class WebClient:
                 pub_date = ji.find("PubDate")
                 if pub_date is not None:
                     year = pub_date.findtext("Year", "")
-                    month = pub_date.findtext("Month", "")
-                    day = pub_date.findtext("Day", "")
-                    date = "-".join(p for p in [year, month, day] if p)
+                    if year:
+                        month = _normalize_month(pub_date.findtext("Month", ""))
+                        day = pub_date.findtext("Day", "")
+                        if day.isdigit():
+                            day = f"{int(day):02d}"
+                        date = "-".join(p for p in [year, month, day] if p)
+                    else:
+                        # Irregular publication dates carry no Year/Month —
+                        # PubMed emits free text like "2015 Jan-Feb" instead.
+                        date = _parse_medline_date(pub_date.findtext("MedlineDate", ""))
             issn_el = journal_el.find("ISSN")
             if issn_el is not None:
                 issn = issn_el.text or ""
@@ -1153,17 +1852,12 @@ class WebClient:
             if last:
                 creators.append({"creatorType": "author", "lastName": last, "firstName": first})
 
-        # Date -- prefer published-print, then published-online, then created
-        date = ""
-        for date_field in ["published-print", "published-online", "created"]:
-            date_obj = work.get(date_field, {})
-            parts = date_obj.get("date-parts", [[]])[0]
-            if parts:
-                date = "-".join(str(p) for p in parts)
-                break
+        # Date -- pick the most complete of issued/published-print/
+        # published-online/created rather than the first one that exists
+        date = _best_crossref_date(work)
 
         container = work.get("container-title", [])
-        publication_title = container[0] if container else ""
+        publication_title = _normalize_publication_title(container[0]) if container else ""
 
         # Abstract (CrossRef provides HTML, strip tags for plain text)
         abstract_html = work.get("abstract", "")
@@ -1185,6 +1879,13 @@ class WebClient:
             "date": date,
             "DOI": doi,
         }
+
+        if item_type == "preprint":
+            # CrossRef records the server in `institution`; `group-title` is the
+            # subject collection ("Gastroenterology") and must not be used here.
+            repository = _infer_repository(doi=doi, url=work.get("URL", "") or "", work=work)
+            if repository:
+                result["repository"] = repository
 
         if publication_title:
             if item_type == "bookSection":
@@ -1277,6 +1978,12 @@ class WebClient:
                 "websiteTitle": "",
             }
 
+        # Ensure the URL is preserved before normalizing — a preprint's
+        # repository is inferred from its DOI or host (ZOT-44).
+        if not metadata.get("url"):
+            metadata["url"] = url
+        _normalize_metadata(metadata)
+
         # Override title if provided
         if title:
             metadata["title"] = title
@@ -1293,10 +2000,6 @@ class WebClient:
                     "match_type": "doi",
                     "message": f"Item already exists in library with DOI {doi}",
                 }
-
-        # Ensure URL is preserved on the item
-        if "url" not in metadata:
-            metadata["url"] = url
 
         self._apply_collections_and_tags(metadata, collection_keys, tags)
 
@@ -1493,8 +2196,10 @@ class WebClient:
     ) -> dict:
         """Add tags and/or collection to multiple items in one operation.
 
-        Reads each item locally, merges tags/collection, PATCHes via Web API.
-        Uses parallel fetching for performance.
+        Each item goes through ``_patch_item_rmw``: a Web API read (never
+        the local desktop copy, whose version can lag the cloud by thousands),
+        a merge of the new tags/collection, and a versioned PATCH that is
+        re-read and retried once on HTTP 412.
 
         Args:
             item_keys: List of Zotero item keys to organize.
@@ -1502,98 +2207,148 @@ class WebClient:
             collection_key: Optional collection to add all items to.
 
         Returns:
-            Dict with updated count, failed keys, and skipped keys.
+            Dict with counts, ``updated_keys``, ``skipped_keys`` (already in
+            the desired state), ``failed_keys``, and ``errors`` mapping each
+            failed key to the reason, so a caller can tell exactly which
+            writes did not land and why.
         """
-        from concurrent.futures import ThreadPoolExecutor, as_completed
+        from concurrent.futures import ThreadPoolExecutor
 
-        results: dict = {"updated": [], "failed": [], "skipped": []}
-
-        # Parallel read from local API
-        items: dict[str, dict] = {}
-        with ThreadPoolExecutor(max_workers=3) as pool:
-            futures = {pool.submit(self._read_item, key): key for key in item_keys}
-            for future in as_completed(futures):
-                key = futures[future]
-                try:
-                    items[key] = future.result()
-                except Exception:
-                    results["failed"].append(key)
-
-        # Apply tags and collection to each item
-        for key, item in items.items():
-            version = item.get("version", 0)
+        def _build(item: dict) -> dict:
             patch: dict = {}
-
             if tags:
                 existing_tags = item.get("tags", [])
                 existing_tag_names = {t.get("tag", "") for t in existing_tags}
                 new_tags = [{"tag": t} for t in tags if t not in existing_tag_names]
                 if new_tags:
                     patch["tags"] = existing_tags + new_tags
-
             if collection_key:
                 existing_collections = item.get("collections", [])
                 if collection_key not in existing_collections:
                     patch["collections"] = existing_collections + [collection_key]
+            return patch
 
-            if not patch:
-                results["skipped"].append(key)
-                continue
-
+        def _one(key: str) -> tuple[str, str, str]:
             try:
-                resp = self._web_client.patch(
-                    f"/items/{key}",
-                    headers={"If-Unmodified-Since-Version": str(version)},
-                    json=patch,
-                )
-                if resp.status_code == 412:
-                    # Version conflict — re-read and retry once
-                    item = self._read_item(key)
-                    version = item.get("version", 0)
-                    new_patch: dict = {}
-                    if tags:
-                        existing_tags = item.get("tags", [])
-                        existing_tag_names = {t.get("tag", "") for t in existing_tags}
-                        new_tags = [{"tag": t} for t in tags if t not in existing_tag_names]
-                        if new_tags:
-                            new_patch["tags"] = existing_tags + new_tags
-                    if collection_key:
-                        existing_collections = item.get("collections", [])
-                        if collection_key not in existing_collections:
-                            new_patch["collections"] = existing_collections + [collection_key]
-                    if new_patch:
-                        resp = self._web_client.patch(
-                            f"/items/{key}",
-                            headers={"If-Unmodified-Since-Version": str(version)},
-                            json=new_patch,
-                        )
-                        resp.raise_for_status()
-                        results["updated"].append(key)
-                    else:
-                        results["skipped"].append(key)
-                elif resp.status_code == 429:
-                    retry_after = _parse_retry_after(resp.headers.get("Retry-After"), 5.0)
-                    time.sleep(min(retry_after, 10))
-                    resp = self._web_client.patch(
-                        f"/items/{key}",
-                        headers={"If-Unmodified-Since-Version": str(version)},
-                        json=patch,
-                    )
-                    resp.raise_for_status()
-                    results["updated"].append(key)
+                outcome = self._patch_item_rmw(key, _build)
+            except Exception as exc:
+                logger.warning("batch_organize: %s failed: %s", key, exc)
+                return key, "failed", _describe_write_error(exc)
+            return key, outcome["status"], ""
+
+        updated: list[str] = []
+        skipped: list[str] = []
+        failed: list[str] = []
+        errors: dict[str, str] = {}
+        with ThreadPoolExecutor(max_workers=3) as pool:
+            # pool.map preserves input order in the reported key lists.
+            for key, status, error in pool.map(_one, item_keys):
+                if status == "updated":
+                    updated.append(key)
+                elif status == "unchanged":
+                    skipped.append(key)
                 else:
-                    resp.raise_for_status()
-                    results["updated"].append(key)
-            except Exception:
-                results["failed"].append(key)
+                    failed.append(key)
+                    errors[key] = error
 
         return {
-            "updated_count": len(results["updated"]),
-            "failed_count": len(results["failed"]),
-            "skipped_count": len(results["skipped"]),
-            "updated_keys": results["updated"],
-            "failed_keys": results["failed"],
+            "updated_count": len(updated),
+            "failed_count": len(failed),
+            "skipped_count": len(skipped),
+            "updated_keys": updated,
+            "skipped_keys": skipped,
+            "failed_keys": failed,
+            "errors": errors,
         }
+
+    def _patch_item_rmw(
+        self,
+        item_key: str,
+        build_patch: Callable[[dict], dict],
+        item: dict | None = None,
+    ) -> dict:
+        """Versioned read-modify-write of one item, with one retry on HTTP 412.
+
+        The version sent as ``If-Unmodified-Since-Version`` always comes from
+        a Web API read of the item (``_read_item``) or from a caller-supplied
+        ``item`` that itself came from the Web API. On 412 the item is re-read
+        from the Web API, the patch is rebuilt against the fresh state, and
+        the PATCH is retried once. If the fresh state already satisfies the
+        change, nothing is written.
+
+        History: the local desktop API (ZOT-44) and the ``get_item`` tool's
+        local-first read both return the desktop's last-synced version, seen
+        on 2026-09-19 as 2015 against a cloud version of 11549, which the API
+        rejects with 412.
+
+        Args:
+            item_key: Zotero item key.
+            build_patch: Maps the current item data to the PATCH body; an
+                empty dict means "already in the desired state".
+            item: Optional pre-read Web API item data for the first attempt.
+
+        Returns:
+            Dict with ``status`` ("updated" or "unchanged"), ``version`` (the
+            library version after the write, or the item version if
+            unchanged), ``item`` (data the patch was built from), ``patch``,
+            and ``attempts``.
+
+        Raises:
+            ItemVersionConflictError: if the retry also returns 412.
+            httpx.HTTPStatusError: on any other non-2xx response.
+        """
+        sent_versions: list[str] = []
+        for attempt in (1, 2):
+            if item is None or attempt == 2:
+                item = self._read_item(item_key)
+            raw_version = item.get("version")
+            if raw_version in (None, ""):
+                raise RuntimeError(
+                    f"Zotero Web API returned no version for item {item_key}; "
+                    "refusing to write without optimistic locking."
+                )
+            version = str(raw_version)
+            patch = build_patch(item)
+            if not patch:
+                return {
+                    "status": "unchanged",
+                    "version": int(version),
+                    "item": item,
+                    "patch": {},
+                    "attempts": attempt,
+                }
+            sent_versions.append(version)
+            resp = _retry_request(
+                lambda v=version, p=patch: self._web_client.patch(
+                    f"/items/{item_key}",
+                    headers={"If-Unmodified-Since-Version": v},
+                    json=p,
+                )
+            )
+            if resp.status_code == 412:
+                logger.warning(
+                    "PATCH %s returned 412 with version %s (attempt %d); re-reading from Web API",
+                    item_key,
+                    version,
+                    attempt,
+                )
+                continue
+            resp.raise_for_status()
+            new_version = resp.headers.get("Last-Modified-Version", "")
+            return {
+                "status": "updated",
+                "version": int(new_version) if new_version.isdigit() else int(version),
+                "item": item,
+                "patch": patch,
+                "attempts": attempt,
+            }
+        raise ItemVersionConflictError(
+            f"Version conflict for item {item_key}: the Zotero Web API returned "
+            f"HTTP 412 twice (sent versions {', '.join(sent_versions)}), even after "
+            "re-reading the item from the Web API. The item is being modified "
+            "concurrently (for example by a Zotero desktop sync). Nothing was "
+            "written; retry later."
+        )
 
     def create_collection(self, name: str, parent_key: str | None = None) -> dict:
         """Create a new collection (folder) in Zotero.
@@ -1620,66 +2375,63 @@ class WebClient:
     def add_to_collection(self, item_key: str, collection_key: str) -> dict:
         """Add an existing item to a collection.
 
-        Reads item from local API, appends collection, PATCHes via Web API.
+        Reads the item from the Web API, appends the collection, and PATCHes
+        with the cloud version; a 412 triggers one re-read and retry (see
+        ``_patch_item_rmw``).
 
         Args:
             item_key: Zotero item key.
             collection_key: Collection key to add the item to.
 
         Returns:
-            Dict with item_key and updated collections list.
+            Dict with item_key, the item's collections after the write (as
+            confirmed against the Web API, not the local desktop copy),
+            ``status`` ("added" or "already_member"), and ``version``.
+
+        Raises:
+            ItemVersionConflictError: if the PATCH 412s again after a re-read.
         """
-        item = self._read_item(item_key)
-        version = item.get("version", 0)
-        collections = list(set(item.get("collections", []) + [collection_key]))
 
-        resp = _retry_request(
-            lambda: self._web_client.patch(
-                f"/items/{item_key}",
-                headers={"If-Unmodified-Since-Version": str(version)},
-                json={"collections": collections},
-            )
+        def _build(item: dict) -> dict:
+            existing = list(item.get("collections", []))
+            if collection_key in existing:
+                return {}
+            return {"collections": existing + [collection_key]}
+
+        outcome = self._patch_item_rmw(item_key, _build)
+        collections = outcome["patch"].get("collections") or list(
+            outcome["item"].get("collections", [])
         )
-        resp.raise_for_status()
-
-        return {"item_key": item_key, "collections": collections}
+        return {
+            "item_key": item_key,
+            "collections": collections,
+            "status": "added" if outcome["status"] == "updated" else "already_member",
+            "version": outcome["version"],
+            "verified_via": "web_api",
+        }
 
     def update_item(self, item_key: str, fields: dict) -> dict:
         """Update metadata fields on an existing item.
 
-        Uses read-modify-write with version for optimistic locking.
+        Uses read-modify-write with the Web API item version for optimistic
+        locking. On HTTP 412 the item is re-read from the Web API and the same
+        field values are re-applied once (``_patch_item_rmw``); only the named
+        fields are written, so concurrent edits to other fields survive.
 
         Args:
             item_key: Zotero item key.
             fields: Dict of field names to new values.
 
         Returns:
-            Dict with key and version.
+            Dict with key, version (from ``Last-Modified-Version``), and
+            ``attempts`` (2 means a stale version was refreshed after a 412).
 
         Raises:
-            RuntimeError: On 412 version conflict.
+            ItemVersionConflictError: (a RuntimeError) if the retry also 412s.
         """
-        item = self._read_item(item_key)
-        version = item.get("version", 0)
-
-        resp = _retry_request(
-            lambda: self._web_client.patch(
-                f"/items/{item_key}",
-                headers={"If-Unmodified-Since-Version": str(version)},
-                json=fields,
-            )
-        )
-
-        if resp.status_code == 412:
-            raise RuntimeError(
-                f"Version conflict for item {item_key}. "
-                "The item was modified since it was read. Please retry."
-            )
-        resp.raise_for_status()
-
-        new_version = int(resp.headers.get("Last-Modified-Version", version))
-        logger.info("Updated item %s to version %d", item_key, new_version)
-        return {"key": item_key, "version": new_version}
+        outcome = self._patch_item_rmw(item_key, lambda _item: dict(fields))
+        logger.info("Updated item %s to version %s", item_key, outcome["version"])
+        return {"key": item_key, "version": outcome["version"], "attempts": outcome["attempts"]}
 
     def _library_version(self) -> str:
         """Fetch the current library version for If-Unmodified-Since-Version (ZOT-25).
@@ -1706,39 +2458,116 @@ class WebClient:
         return version
 
     def trash_items(self, item_keys: list[str]) -> dict:
-        """Move items to Zotero trash (reversible).
+        """Move items to the Zotero trash (reversible).
 
-        Uses DELETE /items?itemKey=KEY1,KEY2 with version header.
-        Chunks into batches of 50 (Zotero API limit).
+        Sets ``deleted: true`` on each item through a batched ``POST /items``
+        write (up to 50 items per request, each object carrying ``key``,
+        ``version`` and ``deleted``). That is exactly what Zotero desktop does
+        when the user presses Delete: the record stays in the library flagged as
+        trashed and can be restored from the Trash view. Items that are already
+        in the trash are reported as trashed (the API returns them as
+        ``unchanged``); keys the API does not know are reported as failed.
+
+        This method never issues an HTTP ``DELETE``. In the Zotero Web API,
+        ``DELETE /items?itemKey=...`` is *permanent* deletion with no trash step.
+        The only permanent path in this client is :meth:`empty_trash`.
+
+        History (2026-09-16): the previous implementation used ``DELETE /items``
+        while the MCP tool advertised itself as reversible; 909 attachment
+        records were permanently removed that way.
 
         Args:
             item_keys: List of Zotero item keys to trash.
 
         Returns:
-            Dict with trashed and failed key lists.
+            Dict with ``trashed`` and ``failed`` key lists plus an ``errors``
+            mapping of failed key -> reason.
         """
         trashed: list[str] = []
         failed: list[str] = []
+        errors: dict[str, str] = {}
+
+        keys = [k.strip() for k in item_keys if k and k.strip()]
+        if not keys:
+            return {"trashed": trashed, "failed": failed, "errors": errors}
 
         version = self._library_version()
 
-        # Chunk into batches of 50
-        for i in range(0, len(item_keys), 50):
-            batch = item_keys[i : i + 50]
-            key_param = ",".join(k.strip() for k in batch)
-            try:
-                resp = self._web_client.delete(
-                    "/items",
-                    params={"itemKey": key_param},
-                    headers={"If-Unmodified-Since-Version": str(version)},
-                )
-                resp.raise_for_status()
-                version = resp.headers.get("Last-Modified-Version", version)
-                trashed.extend(batch)
-            except Exception:
-                failed.extend(batch)
+        for i in range(0, len(keys), 50):
+            batch = keys[i : i + 50]
 
-        return {"trashed": trashed, "failed": failed}
+            # Read current per-item versions; the write below is a
+            # read-modify-write and each object must carry its own version.
+            try:
+                read_resp = self._read_get(
+                    "/items",
+                    params={
+                        "itemKey": ",".join(batch),
+                        "format": "json",
+                        "includeTrashed": 1,
+                        "limit": 50,
+                    },
+                )
+                read_resp.raise_for_status()
+                versions = {
+                    it["data"]["key"]: it["data"].get("version", 0)
+                    for it in read_resp.json()
+                    if isinstance(it, dict) and "data" in it
+                }
+            except Exception as exc:
+                logger.warning("trash_items: could not read versions for batch: %s", exc)
+                for k in batch:
+                    failed.append(k)
+                    errors[k] = f"version read failed: {exc}"
+                continue
+
+            payload: list[dict] = []
+            for k in batch:
+                if k in versions:
+                    payload.append({"key": k, "version": versions[k], "deleted": True})
+                else:
+                    failed.append(k)
+                    errors[k] = "not found in library"
+            if not payload:
+                continue
+
+            def _write(ver: str, body: list[dict] = payload) -> httpx.Response:
+                return self._web_client.post(
+                    "/items",
+                    json=body,
+                    headers={"If-Unmodified-Since-Version": str(ver)},
+                )
+
+            try:
+                resp = _write(version)
+                if resp.status_code == 412:
+                    # Library moved on under us (e.g. desktop sync); refresh the
+                    # library version once and retry this batch.
+                    version = self._library_version()
+                    resp = _write(version)
+                resp.raise_for_status()
+                body = resp.json()
+                version = resp.headers.get("Last-Modified-Version", version)
+            except Exception as exc:
+                logger.warning("trash_items: batch write failed: %s", exc)
+                for obj in payload:
+                    failed.append(obj["key"])
+                    errors[obj["key"]] = f"write failed: {exc}"
+                continue
+
+            for idx in body.get("successful", {}):
+                trashed.append(payload[int(idx)]["key"])
+            for idx in body.get("unchanged", {}):
+                trashed.append(payload[int(idx)]["key"])  # already in trash
+            for idx, err in body.get("failed", {}).items():
+                k = payload[int(idx)]["key"]
+                failed.append(k)
+                msg = err.get("message", "") if isinstance(err, dict) else str(err)
+                code = err.get("code", "") if isinstance(err, dict) else ""
+                errors[k] = f"{code} {msg}".strip() or "rejected by API"
+
+        logger.info("trash_items: %d trashed, %d failed", len(trashed), len(failed))
+        return {"trashed": trashed, "failed": failed, "errors": errors}
 
     def empty_trash(self) -> dict:
         """Permanently delete all items in Zotero trash.
@@ -1889,17 +2718,22 @@ class WebClient:
         updated: list[str] = []
         failed: list[str] = []
 
+        def _build(data: dict) -> dict:
+            tags = data.get("tags", [])
+            if not any(t.get("tag") == old_tag for t in tags):
+                return {}
+            return {"tags": [{"tag": new_tag} if t.get("tag") == old_tag else t for t in tags]}
+
         def _patch_item(item: dict) -> tuple[str, bool]:
             key = item["data"]["key"]
-            version = item["data"].get("version", 0)
-            tags = item["data"].get("tags", [])
-            new_tags = [{"tag": new_tag} if t["tag"] == old_tag else t for t in tags]
-            patch_resp = self._web_client.patch(
-                f"/items/{key}",
-                json={"tags": new_tags},
-                headers={"If-Unmodified-Since-Version": str(version)},
-            )
-            return key, patch_resp.status_code in (200, 204)
+            try:
+                # The listing above came from the Web API, so its version is
+                # the cloud version; a 412 re-reads and retries once.
+                self._patch_item_rmw(key, _build, item=item["data"])
+            except Exception as exc:
+                logger.warning("rename_tag: %s failed: %s", key, exc)
+                return key, False
+            return key, True
 
         with ThreadPoolExecutor(max_workers=5) as pool:
             futures = {pool.submit(_patch_item, item): item for item in items}

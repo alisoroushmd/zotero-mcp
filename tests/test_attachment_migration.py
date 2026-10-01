@@ -83,7 +83,7 @@ def _mock_items_page(items, total=None):
     """Mock GET /items so a single page satisfies the paginating inventory.
 
     Also carries ``Last-Modified-Version``: ``trash_items`` probes the same
-    endpoint for the library version before issuing its DELETE.
+    endpoint for the library version before its deleted:true write.
     """
     respx.get(f"{BASE}/items").mock(
         return_value=httpx.Response(
@@ -457,18 +457,56 @@ def test_dry_run_writes_nothing_and_calls_nothing(tmp_path):
 # --------------------------------------------------------------------------
 
 
-def _mock_create_linked(key="NEWLINK1"):
-    return respx.post(f"{BASE}/items").mock(
-        return_value=httpx.Response(
+def _items_post_handler(key="NEWLINK1"):
+    """Answer POST /items for both linked-file creation and deleted:true trash writes.
+
+    ``trash_items`` sets ``deleted: true`` through the same batched POST /items
+    endpoint used for creation (it must never issue a permanent DELETE), so one
+    route has to serve both. The payload shape tells them apart.
+    """
+
+    def _handle(request: httpx.Request) -> httpx.Response:
+        payload = json.loads(request.content)
+        if payload and payload[0].get("deleted") is True:
+            return httpx.Response(
+                200,
+                json={
+                    "successful": {str(i): {"key": o["key"]} for i, o in enumerate(payload)},
+                    "unchanged": {},
+                    "failed": {},
+                },
+                headers={"Last-Modified-Version": "10"},
+            )
+        return httpx.Response(
             200, json={"successful": {"0": {"key": key, "data": {"key": key, "version": 2}}}}
         )
-    )
+
+    return _handle
+
+
+def _mock_create_linked(key="NEWLINK1"):
+    return respx.post(f"{BASE}/items").mock(side_effect=_items_post_handler(key))
 
 
 def _mock_trash_ok():
-    respx.get(f"{BASE}/items").mock(
-        return_value=httpx.Response(200, json=[], headers={"Last-Modified-Version": "9"})
-    )
+    """Serve the reads trash_items needs and return a DELETE route that must stay unused.
+
+    GET /items answers both the library-version probe (``limit=0``) and the
+    per-item version lookup (``itemKey=...``). The returned DELETE route exists
+    only so tests can assert it was never called.
+    """
+
+    def _get(request: httpx.Request) -> httpx.Response:
+        params = request.url.params
+        if "itemKey" in params:
+            body = [
+                {"key": k, "version": 1, "data": {"key": k, "version": 1}}
+                for k in params["itemKey"].split(",")
+            ]
+            return httpx.Response(200, json=body, headers={"Last-Modified-Version": "9"})
+        return httpx.Response(200, json=[], headers={"Last-Modified-Version": "9"})
+
+    respx.get(f"{BASE}/items").mock(side_effect=_get)
     return respx.delete(f"{BASE}/items").mock(
         return_value=httpx.Response(204, headers={"Last-Modified-Version": "10"})
     )
@@ -494,8 +532,12 @@ def test_apply_copies_local_file_and_creates_link(tmp_path):
     assert result.outcomes[0].new_attachment_key == "NEWLINK1"
     assert result.outcomes[0].sha256 == hashlib.sha256(PDF_BYTES).hexdigest()
     assert result.trashed == ["LOCAL001"]
-    assert create.call_count == 1
-    assert delete.call_count == 1
+    # One POST creates the linked attachment, a second POST sets deleted:true
+    # on the original. Trashing must never be a permanent HTTP DELETE.
+    assert create.call_count == 2
+    assert delete.call_count == 0
+    trash_payload = json.loads(create.calls[1].request.content)
+    assert trash_payload == [{"key": "LOCAL001", "version": 1, "deleted": True}]
 
     body = json.loads(create.calls[0].request.content)[0]
     assert body["linkMode"] == "linked_file"
@@ -833,8 +875,10 @@ def test_cli_empty_trash_uses_persisted_keys_across_two_invocations(_isolated_co
     state = json.loads(state_path.read_text())
     assert state["library_user_id"] == USER_ID
     assert state["trashed_attachment_keys"] == ["LOCAL001"]
-    assert create.call_count == 1
-    assert trash.call_count == 1
+    # POST #1 creates the linked attachment; POST #2 sets deleted:true on the
+    # original. The permanent DELETE /items route must never be used for trashing.
+    assert create.call_count == 2
+    assert trash.call_count == 0
 
     respx.get(f"{BASE}/items/trash").mock(
         return_value=httpx.Response(

@@ -22,7 +22,7 @@ from pydantic import Field
 from zotero_mcp.capabilities import check_capabilities, format_status
 from zotero_mcp.config import get_config
 from zotero_mcp.local_client import LocalClient
-from zotero_mcp.web_client import WebClient, _is_preprint_doi
+from zotero_mcp.web_client import ItemVersionConflictError, WebClient, _is_preprint_doi
 
 if TYPE_CHECKING:
     from collections.abc import Callable, Iterable, Iterator
@@ -213,6 +213,12 @@ def _validate_key(value: str, name: str = "key") -> None:
 def _clamp_limit(value: str | int, lo: int = 1, hi: int = 100) -> int:
     """Clamp a limit parameter to a safe range."""
     return max(lo, min(hi, int(value)))
+
+
+# find_duplicates pages through the library 100 records at a time, so its
+# limit is a scan bound rather than a page size (the 100 cap silently capped
+# library-wide scans at one page).
+_MAX_DEDUP_SCAN = 20000
 
 
 def _cap_list(result, limit: int):
@@ -482,6 +488,8 @@ def _handle_tool_errors(fn):
       the caller can act on Zotero's explanation, e.g. "item version mismatch")
     - ``httpx.TimeoutException`` -> ``timeout``
     - any other ``httpx.HTTPError`` (connect/read/DNS/protocol) -> ``network_error``
+    - ``ItemVersionConflictError`` -> ``version_conflict`` (412 persisted after
+      a Web API re-read; message names the item)
     - ``RuntimeError`` -> ``unavailable`` (config / mode-unavailable)
     - ``KeyError``/``IndexError``/``TypeError``/``AttributeError`` ->
       ``internal_error`` (an unexpected API response shape, not the user's fault)
@@ -526,6 +534,10 @@ def _handle_tool_errors(fn):
                     f"({exc.__class__.__name__}). Check your connection and retry.",
                 )
             )
+        except ItemVersionConflictError as exc:
+            # Persistent 412 after a Web API re-read: not "unavailable", and the
+            # message names the item so the caller can retry just that one.
+            return json.dumps(_error_response("version_conflict", str(exc), status_code=412))
         except RuntimeError as exc:
             return json.dumps(_error_response("unavailable", str(exc)))
         except (KeyError, IndexError, TypeError, AttributeError) as exc:
@@ -639,7 +651,11 @@ def search_items(
     description=(
         "Get detailed metadata for a single Zotero item by its key. Use this when "
         "you need full bibliographic details (title, authors, DOI, abstract, dates) "
-        "for a specific item. Set format='bibtex' for BibTeX export."
+        "for a specific item. Set format='bibtex' for BibTeX export. "
+        "By default this reads Zotero desktop's local copy when available, which "
+        "lags the cloud until desktop syncs (stale version, collections, tags). "
+        "Set source='web' to read the authoritative cloud record, e.g. to verify "
+        "a write such as add_to_collection or update_item."
     ),
     annotations=_RR,
 )
@@ -648,10 +664,14 @@ def get_item(
     item_key: str,
     format: Literal["json", "bibtex"] = "json",
     response_format: Literal["json", "markdown"] = "json",
+    source: Literal["auto", "web"] = "auto",
 ) -> str:
     """Get full metadata or BibTeX for one item by its key."""
     _validate_key(item_key, "item_key")
-    result = _read_local_or_web("get_item", item_key.strip(), fmt=format)
+    if source == "web":
+        result = _get_web().get_item(item_key.strip(), fmt=format)
+    else:
+        result = _read_local_or_web("get_item", item_key.strip(), fmt=format)
     if isinstance(result, str):
         return result
     return _render(result, response_format)
@@ -1266,7 +1286,10 @@ def create_note(
     description=(
         "Add tags and/or move multiple items to a collection in one operation. "
         "Use this for bulk organization — e.g. tagging a set of search results or "
-        "grouping papers into a collection. Handles rate limiting and version conflicts."
+        "grouping papers into a collection. Handles rate limiting and version "
+        "conflicts (one re-read and retry on HTTP 412). Returns updated_keys, "
+        "skipped_keys (already organized), failed_keys, and an errors map giving "
+        "the reason for each failed key."
     ),
 )
 @_handle_tool_errors
@@ -1285,15 +1308,22 @@ def batch_organize(
 @mcp.tool(
     annotations=_RR,
     description=(
-        "Scan the Zotero library for duplicate items using DOI match and title "
-        "similarity (>85%). Use this when the user wants to clean up their library "
-        "or after bulk imports. Optionally scoped to a single collection."
+        "Scan the Zotero library for duplicate items using DOI match "
+        "(case-insensitive) and title similarity (>=85%, across all items, "
+        "DOI-bearing included). Use this when the user wants to clean up their "
+        "library or after bulk imports. Optionally scoped to a single collection. "
+        "limit bounds parent records scanned (attachments/notes excluded; "
+        "default 5000, max 20000); check 'truncated' and 'scanned_items' in the "
+        "result for coverage. Title groups whose items carry different DOIs are "
+        "marked confidence='possible_dual_publication' (same work in two "
+        "journals, or preprint plus journal version): verify before merging. "
+        "Titles that differ only in a number (year, part) are never grouped."
     ),
 )
 @_handle_tool_errors
-def find_duplicates(collection_key: str | None = None, limit: str | int = 100) -> str:
+def find_duplicates(collection_key: str | None = None, limit: str | int = 5000) -> str:
     """Find duplicate items in the library or a collection."""
-    limit_int = _clamp_limit(limit)
+    limit_int = _clamp_limit(limit, hi=_MAX_DEDUP_SCAN)
     if collection_key:
         _validate_key(collection_key, "collection_key")
         collection_key = collection_key.strip()
@@ -1411,6 +1441,21 @@ _ALLOWED_UPDATE_FIELDS = {
     "numPages",
     "edition",
     "numberOfVolumes",
+    # Valid in the Zotero global schema (v44, checked 2026-10-01):
+    # journalAbbreviation, seriesText, PMID and PMCID (journalArticle only),
+    # section (newspaperArticle, bill, statute), seriesNumber (book,
+    # bookSection, preprint, ...). The API rejects a field that is invalid
+    # for the item's type with HTTP 400; for other types PMID/PMCID belong in
+    # Extra as "PMID: <id>" lines.
+    "journalAbbreviation",
+    "seriesText",
+    "section",
+    "seriesNumber",
+    "PMID",
+    "PMCID",
+    # citationKey is deliberately absent even though schema v44 defines it:
+    # Better BibTeX pins keys through a "Citation Key:" line in Extra, and a
+    # native citationKey written here would diverge from the pinned key.
 }
 
 
@@ -1419,7 +1464,11 @@ _ALLOWED_UPDATE_FIELDS = {
     description=(
         "Update metadata fields on an existing Zotero item. Use this to correct "
         "titles, authors, dates, DOIs, or other bibliographic fields. "
-        "Uses optimistic locking to prevent overwriting concurrent changes."
+        "Uses optimistic locking to prevent overwriting concurrent changes. "
+        "PMID, PMCID, and journalAbbreviation are journalArticle fields; for "
+        "other item types put PMID/PMCID in 'extra' as 'PMID: <id>' lines "
+        "(preserve existing Extra lines such as 'Citation Key:'). citationKey "
+        "is not writable here: Better BibTeX pins keys via Extra."
     ),
 )
 @_handle_tool_errors
@@ -1431,9 +1480,15 @@ def update_item(item_key: str, fields: dict | str) -> str:
         raise ValueError("fields must not be empty")
     disallowed = set(fields.keys()) - _ALLOWED_UPDATE_FIELDS
     if disallowed:
+        hint = ""
+        if "citationKey" in disallowed:
+            hint = (
+                " citationKey is managed by Better BibTeX through a 'Citation Key:' "
+                "line in 'extra'; edit that line instead."
+            )
         raise ValueError(
             f"Fields not allowed for update: {', '.join(sorted(disallowed))}. "
-            f"Allowed fields: {', '.join(sorted(_ALLOWED_UPDATE_FIELDS))}"
+            f"Allowed fields: {', '.join(sorted(_ALLOWED_UPDATE_FIELDS))}.{hint}"
         )
     result = _get_web().update_item(item_key.strip(), fields)
     return json.dumps(result, ensure_ascii=False)
@@ -1442,9 +1497,11 @@ def update_item(item_key: str, fields: dict | str) -> str:
 @mcp.tool(
     annotations=_DR,
     description=(
-        "Move Zotero items to trash (reversible). Use this when the user wants to "
-        "delete papers. Accepts one or more item keys. Items can be restored from "
-        "trash in Zotero. Confirm with user before trashing."
+        "Move Zotero items to trash (reversible). Sets each item's deleted flag "
+        "via the Web API, exactly like pressing Delete in Zotero desktop; nothing "
+        "is permanently removed. Accepts one or more item keys. Items can be "
+        "restored from the Trash in Zotero; only empty_trash is permanent. "
+        "Confirm with user before trashing."
     ),
 )
 @_handle_tool_errors
